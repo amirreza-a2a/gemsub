@@ -22,6 +22,7 @@ func main() {
 	configPath := flag.String("config", "./config.json", "path to config file")
 	headless := flag.Bool("headless", false, "run without the TUI (daemon + sub server only)")
 	probeLimit := flag.Int("limit", 0, "limit number of parsed candidates to probe per cycle (0 = unlimited)")
+	publish := flag.Bool("publish", false, "enable git publishing after test cycles (overrides config)")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -34,6 +35,11 @@ func main() {
 	if *probeLimit > 0 {
 		cfg.ProbeLimit = *probeLimit
 	}
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "publish" {
+			cfg.Publishing.Enabled = *publish
+		}
+	})
 
 	st := store.New(cfg.StateFile, cfg.Test.MaxInconclusiveCycles)
 	if err := st.Load(); err != nil {

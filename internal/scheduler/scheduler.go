@@ -12,6 +12,7 @@ import (
 
 	"gemsub/internal/config"
 	"gemsub/internal/parser"
+	"gemsub/internal/publisher"
 	"gemsub/internal/source"
 	"gemsub/internal/store"
 	"gemsub/internal/tester"
@@ -20,6 +21,7 @@ import (
 type Scheduler struct {
 	cfg *config.Config
 	st  *store.Store
+	pub *publisher.Publisher
 
 	// Trigger lets anything (TUI, signal handler, ...) request an
 	// immediate cycle instead of waiting for the interval. Buffered
@@ -28,11 +30,21 @@ type Scheduler struct {
 }
 
 func New(cfg *config.Config, st *store.Store) *Scheduler {
+	var pub *publisher.Publisher
+	if cfg.Publishing.Enabled {
+		pub = publisher.New(&cfg.Publishing, st)
+	}
 	return &Scheduler{
 		cfg:     cfg,
 		st:      st,
+		pub:     pub,
 		Trigger: make(chan struct{}, 1),
 	}
+}
+
+// SetPublisher allows configuring a custom publisher (e.g. for testing).
+func (s *Scheduler) SetPublisher(pub *publisher.Publisher) {
+	s.pub = pub
 }
 
 // Run blocks until ctx is cancelled, running one cycle immediately
@@ -117,4 +129,10 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 	stats := s.st.Stats()
 	log.Printf("scheduler: cycle done in %s — %d passed, %d failed, %d inconclusive (%d servable to throne)",
 		time.Since(cycleStart).Round(time.Second), stats.Passed, stats.Failed, stats.Inconclusive, stats.Servable)
+
+	if s.pub != nil {
+		if err := s.pub.Publish(ctx); err != nil {
+			log.Printf("scheduler: publish failed: %v", err)
+		}
+	}
 }

@@ -100,3 +100,39 @@ func TestMaxRetries_NegativeReturnsError(t *testing.T) {
 		t.Fatal("expected validation error for negative max_retries")
 	}
 }
+
+func TestPublishing_DefaultsAndValidation(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	cfgMap["publishing"] = map[string]interface{}{
+		"enabled":    true,
+		"repository": "~/gemsub-subscriptions",
+	}
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.Publishing.Enabled {
+		t.Errorf("expected Publishing.Enabled=true")
+	}
+	if cfg.Publishing.Branch != "main" {
+		t.Errorf("expected default branch 'main', got %q", cfg.Publishing.Branch)
+	}
+	if cfg.Publishing.RemoteURL != "git@github.com:amirreza-a2a/gemsub-subscriptions.git" {
+		t.Errorf("expected default RemoteURL, got %q", cfg.Publishing.RemoteURL)
+	}
+	if cfg.Publishing.Repository != "~/gemsub-subscriptions" {
+		t.Errorf("expected repository '~/gemsub-subscriptions', got %q", cfg.Publishing.Repository)
+	}
+
+	// Missing repository when enabled
+	cfgMap["publishing"] = map[string]interface{}{
+		"enabled": true,
+	}
+	pathMissingRepo := writeTestConfig(t, dir, cfgMap)
+	if _, err := config.Load(pathMissingRepo); err == nil {
+		t.Fatal("expected error when publishing is enabled without repository")
+	}
+}

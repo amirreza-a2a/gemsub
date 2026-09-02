@@ -32,14 +32,22 @@ type ServeConfig struct {
 	Format string `json:"format"` // "raw" or "base64"
 }
 
+type PublishingConfig struct {
+	Enabled    bool   `json:"enabled"`
+	Repository string `json:"repository"`
+	Branch     string `json:"branch,omitempty"`
+	RemoteURL  string `json:"remote_url,omitempty"`
+}
+
 type Config struct {
-	Sources          []string    `json:"sources"`
-	FetchIntervalRaw string      `json:"fetch_interval"`
-	Test             TestConfig  `json:"test"`
-	Serve            ServeConfig `json:"serve"`
-	StateFile        string      `json:"state_file"`
-	Headless         bool        `json:"headless"`
-	ProbeLimit       int         `json:"probe_limit,omitempty"`
+	Sources          []string         `json:"sources"`
+	FetchIntervalRaw string           `json:"fetch_interval"`
+	Test             TestConfig       `json:"test"`
+	Serve            ServeConfig      `json:"serve"`
+	Publishing       PublishingConfig `json:"publishing,omitempty"`
+	StateFile        string           `json:"state_file"`
+	Headless         bool             `json:"headless"`
+	ProbeLimit       int              `json:"probe_limit,omitempty"`
 
 	// Parsed fields, populated by Validate.
 	FetchInterval time.Duration `json:"-"`
@@ -159,6 +167,16 @@ func (c *Config) Validate() error {
 
 	if c.StateFile == "" {
 		c.StateFile = "./gemsub_state.json"
+	}
+
+	if c.Publishing.Branch == "" {
+		c.Publishing.Branch = "main"
+	}
+	if c.Publishing.RemoteURL == "" {
+		c.Publishing.RemoteURL = "git@github.com:amirreza-a2a/gemsub-subscriptions.git"
+	}
+	if c.Publishing.Enabled && c.Publishing.Repository == "" {
+		return fmt.Errorf("publishing.repository must not be empty when publishing is enabled")
 	}
 
 	return nil

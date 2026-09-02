@@ -23,6 +23,11 @@
     "path": "/sub",
     "format": "base64"
   },
+  "publishing": {
+    "enabled": false,
+    "repository": "~/gemsub-subscriptions",
+    "branch": "main"
+  },
   "state_file": "./gemsub_state.json",
   "headless": false
 }
