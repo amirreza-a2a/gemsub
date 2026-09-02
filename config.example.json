@@ -1,0 +1,23 @@
+{
+  "sources": [
+    "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/githubmirror/1.txt"
+  ],
+  "fetch_interval": "3h",
+  "test": {
+    "target_url": "https://gemini.google.com/",
+    "block_phrases": [
+      "isn't currently supported in your country",
+      "not available in your country",
+      "not available in your region"
+    ],
+    "timeout": "10s",
+    "concurrency": 40
+  },
+  "serve": {
+    "listen": "127.0.0.1:8765",
+    "path": "/sub",
+    "format": "base64"
+  },
+  "state_file": "./gemsub_state.json",
+  "headless": false
+}
