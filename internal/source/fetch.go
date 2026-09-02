@@ -38,28 +38,45 @@ func FetchAll(urls []string) (links []string, errs []error) {
 }
 
 func fetchOne(u string) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, u, nil)
-	if err != nil {
-		return "", err
-	}
-	// Some hosts (GitHub raw included) are picky about a missing UA.
-	req.Header.Set("User-Agent", "gemsub/1.0")
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(1 * time.Second)
+		}
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			return "", err // not retryable
+		}
+		req.Header.Set("User-Agent", "gemsub/1.0")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			lastErr = err // network/TLS error → transient, retry
+			continue
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
-	}
+		if resp.StatusCode == http.StatusOK {
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20)) // 32MB safety cap
+			resp.Body.Close()
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			return string(body), nil
+		}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20)) // 32MB safety cap
-	if err != nil {
-		return "", err
+		resp.Body.Close()
+		statusErr := fmt.Errorf("unexpected status %d", resp.StatusCode)
+
+		// Only retry transient HTTP statuses: 429 and 5xx.
+		// Permanent client errors (400, 401, 403, 404, etc.) are not retried.
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			lastErr = statusErr
+			continue
+		}
+		return "", statusErr // permanent error, no retry
 	}
-	return string(body), nil
+	return "", lastErr
 }
 
 // splitLinks handles both plain link-per-line subscriptions and

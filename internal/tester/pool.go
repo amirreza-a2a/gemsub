@@ -4,36 +4,54 @@ import (
 	"context"
 	"sync"
 
+	"golang.org/x/time/rate"
+
 	"gemsub/internal/config"
 	"gemsub/internal/parser"
 	"gemsub/internal/store"
 )
 
-// RunPool probes every candidate with at most cfg.Concurrency probes
-// in flight at once, calling onResult for each as it completes (so
-// the caller can stream results into the store instead of waiting
-// for the whole batch).
-func RunPool(ctx context.Context, candidates []parser.Candidate, cfg *config.TestConfig, onResult func(store.Result)) {
+// ProbeRunner is a function that executes a probe on a candidate.
+type ProbeRunner func(ctx context.Context, cand parser.Candidate, cfg *config.TestConfig, limiter *rate.Limiter) store.Result
+
+// RunPool probes every candidate with at most cfg.Concurrency probes in flight at once,
+// throttled by a shared probe-attempt rate limiter when configured.
+// It returns true if all candidates were dispatched and finished, or false if the context was cancelled.
+func RunPool(ctx context.Context, candidates []parser.Candidate, cfg *config.TestConfig, onResult func(store.Result)) bool {
+	return RunPoolWithRunner(ctx, candidates, cfg, Probe, onResult)
+}
+
+// RunPoolWithRunner runs the pool using a custom probe runner function.
+func RunPoolWithRunner(ctx context.Context, candidates []parser.Candidate, cfg *config.TestConfig, runner ProbeRunner, onResult func(store.Result)) bool {
+	var limiter *rate.Limiter
+	if cfg.RateLimitRPS > 0 {
+		// Conservative burst of 2 to smooth traffic and prevent CDN/proxy hammering.
+		// The average rate is cfg.RateLimitRPS tokens/sec; burst controls the max
+		// tokens that can be consumed without waiting.
+		const rateLimitBurst = 2
+		limiter = rate.NewLimiter(rate.Limit(cfg.RateLimitRPS), rateLimitBurst)
+	}
+
 	sem := make(chan struct{}, cfg.Concurrency)
 	var wg sync.WaitGroup
+	defer wg.Wait() // Always wait for in-flight workers to complete before returning
 
 	for _, cand := range candidates {
 		select {
 		case <-ctx.Done():
-			return
-		default:
+			return false
+		case sem <- struct{}{}:
 		}
 
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(c parser.Candidate) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			result := Probe(ctx, c, cfg)
+			result := runner(ctx, c, cfg, limiter)
 			onResult(result)
 		}(cand)
 	}
 
-	wg.Wait()
+	return true
 }

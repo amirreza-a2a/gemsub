@@ -1,0 +1,14 @@
+# Binaries
+/gemsub
+
+# Runtime state files
+/gemsub_state.json
+/gemsub_state.json.tmp
+/test_state.json
+/test_state.json.tmp
+
+# Local configurations (keep config.example.json)
+/config.json
+
+# Test configurations (ephemeral)
+/test-config.json

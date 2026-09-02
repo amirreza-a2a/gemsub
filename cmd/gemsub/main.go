@@ -21,6 +21,7 @@ import (
 func main() {
 	configPath := flag.String("config", "./config.json", "path to config file")
 	headless := flag.Bool("headless", false, "run without the TUI (daemon + sub server only)")
+	probeLimit := flag.Int("limit", 0, "limit number of parsed candidates to probe per cycle (0 = unlimited)")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -30,8 +31,11 @@ func main() {
 	if *headless {
 		cfg.Headless = true
 	}
+	if *probeLimit > 0 {
+		cfg.ProbeLimit = *probeLimit
+	}
 
-	st := store.New(cfg.StateFile)
+	st := store.New(cfg.StateFile, cfg.Test.MaxInconclusiveCycles)
 	if err := st.Load(); err != nil {
 		log.Printf("warning: could not load previous state: %v", err)
 	}

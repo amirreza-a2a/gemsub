@@ -9,13 +9,21 @@ import (
 )
 
 type TestConfig struct {
-	TargetURL    string   `json:"target_url"`
-	BlockPhrases []string `json:"block_phrases"`
-	TimeoutRaw   string   `json:"timeout"`
-	Concurrency  int      `json:"concurrency"`
+	TargetURL             string   `json:"target_url"`
+	BlockPhrases          []string `json:"block_phrases"`
+	TimeoutRaw            string   `json:"timeout"`
+	DialTimeoutRaw        string   `json:"dial_timeout,omitempty"`
+	Concurrency           int      `json:"concurrency"`
+	RateLimitRPS          int      `json:"rate_limit_rps,omitempty"`
+	MaxRetriesRaw         *int     `json:"max_retries,omitempty"` // nil = omitted → default 2; 0 = no retries
+	RetryBackoffRaw       string   `json:"retry_backoff,omitempty"`
+	MaxInconclusiveCycles int      `json:"max_inconclusive_cycles,omitempty"`
 
 	// Parsed fields, populated by Validate.
-	Timeout time.Duration `json:"-"`
+	Timeout      time.Duration `json:"-"`
+	DialTimeout  time.Duration `json:"-"`
+	RetryBackoff time.Duration `json:"-"`
+	MaxRetries   int           `json:"-"` // Resolved retry count: 0 = exactly one attempt
 }
 
 type ServeConfig struct {
@@ -31,6 +39,7 @@ type Config struct {
 	Serve            ServeConfig `json:"serve"`
 	StateFile        string      `json:"state_file"`
 	Headless         bool        `json:"headless"`
+	ProbeLimit       int         `json:"probe_limit,omitempty"`
 
 	// Parsed fields, populated by Validate.
 	FetchInterval time.Duration `json:"-"`
@@ -86,6 +95,48 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("test.timeout must be positive")
 	}
 	c.Test.Timeout = timeout
+
+	if c.Test.DialTimeoutRaw == "" {
+		c.Test.DialTimeout = 4 * time.Second
+	} else {
+		dialTimeout, err := time.ParseDuration(c.Test.DialTimeoutRaw)
+		if err != nil {
+			return fmt.Errorf("test.dial_timeout: %w", err)
+		}
+		if dialTimeout <= 0 {
+			return fmt.Errorf("test.dial_timeout must be positive")
+		}
+		c.Test.DialTimeout = dialTimeout
+	}
+
+	if c.Test.RetryBackoffRaw == "" {
+		c.Test.RetryBackoff = 1 * time.Second
+	} else {
+		retryBackoff, err := time.ParseDuration(c.Test.RetryBackoffRaw)
+		if err != nil {
+			return fmt.Errorf("test.retry_backoff: %w", err)
+		}
+		if retryBackoff <= 0 {
+			return fmt.Errorf("test.retry_backoff must be positive")
+		}
+		c.Test.RetryBackoff = retryBackoff
+	}
+
+	if c.Test.MaxRetriesRaw == nil {
+		c.Test.MaxRetries = 2 // backward-compatible default
+	} else if *c.Test.MaxRetriesRaw < 0 {
+		return fmt.Errorf("test.max_retries must not be negative, got %d", *c.Test.MaxRetriesRaw)
+	} else {
+		c.Test.MaxRetries = *c.Test.MaxRetriesRaw
+	}
+
+	if c.Test.MaxInconclusiveCycles <= 0 {
+		c.Test.MaxInconclusiveCycles = 2
+	}
+
+	if c.Test.RateLimitRPS < 0 {
+		c.Test.RateLimitRPS = 0
+	}
 
 	if c.Test.Concurrency <= 0 {
 		c.Test.Concurrency = 20

@@ -56,6 +56,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"ok\n" +
 			"passed: " + strconv.Itoa(stats.Passed) + "\n" +
 			"failed: " + strconv.Itoa(stats.Failed) + "\n" +
+			"inconclusive: " + strconv.Itoa(stats.Inconclusive) + "\n" +
+			"servable: " + strconv.Itoa(stats.Servable) + "\n" +
 			"cycles: " + strconv.Itoa(stats.CycleCount) + "\n",
 	))
 }

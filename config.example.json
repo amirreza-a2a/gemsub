@@ -11,7 +11,12 @@
       "not available in your region"
     ],
     "timeout": "10s",
-    "concurrency": 40
+    "dial_timeout": "4s",
+    "concurrency": 40,
+    "rate_limit_rps": 20,
+    "max_retries": 2,
+    "retry_backoff": "1s",
+    "max_inconclusive_cycles": 2
   },
   "serve": {
     "listen": "127.0.0.1:8765",

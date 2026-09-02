@@ -32,6 +32,7 @@ import (
 type Candidate struct {
 	Link     string
 	Outbound option.Outbound
+	Warnings []string
 }
 
 // Parse dispatches on scheme and returns a ready-to-test Candidate.
@@ -39,15 +40,16 @@ func Parse(link string) (Candidate, error) {
 	link = strings.TrimSpace(link)
 
 	var outbound option.Outbound
+	var warnings []string
 	var err error
 
 	switch {
 	case strings.HasPrefix(link, "vmess://"):
 		outbound, err = parseVMess(link)
 	case strings.HasPrefix(link, "vless://"):
-		outbound, err = parseURIStyle(link, "vless")
+		outbound, warnings, err = parseURIStyle(link, "vless")
 	case strings.HasPrefix(link, "trojan://"):
-		outbound, err = parseURIStyle(link, "trojan")
+		outbound, warnings, err = parseURIStyle(link, "trojan")
 	case strings.HasPrefix(link, "ss://"):
 		outbound, err = parseShadowsocks(link)
 	default:
@@ -58,7 +60,7 @@ func Parse(link string) (Candidate, error) {
 	}
 
 	outbound.Tag = "probe"
-	return Candidate{Link: link, Outbound: outbound}, nil
+	return Candidate{Link: link, Outbound: outbound, Warnings: warnings}, nil
 }
 
 // --- vmess ---
@@ -123,26 +125,26 @@ func parseVMess(link string) (option.Outbound, error) {
 
 	return option.Outbound{
 		Type:    "vmess",
-		Options: opts,
+		Options: &opts,
 	}, nil
 }
 
 // --- vless / trojan (both URI-style: scheme://user@host:port?params#remark) ---
 
-func parseURIStyle(link, scheme string) (option.Outbound, error) {
+func parseURIStyle(link, scheme string) (option.Outbound, []string, error) {
 	u, err := url.Parse(link)
 	if err != nil {
-		return option.Outbound{}, fmt.Errorf("%s: %w", scheme, err)
+		return option.Outbound{}, nil, fmt.Errorf("%s: %w", scheme, err)
 	}
 
 	host := u.Hostname()
 	portStr := u.Port()
 	if host == "" || portStr == "" {
-		return option.Outbound{}, fmt.Errorf("%s: missing host or port", scheme)
+		return option.Outbound{}, nil, fmt.Errorf("%s: missing host or port", scheme)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return option.Outbound{}, fmt.Errorf("%s: port: %w", scheme, err)
+		return option.Outbound{}, nil, fmt.Errorf("%s: port: %w", scheme, err)
 	}
 
 	userinfo := ""
@@ -152,7 +154,7 @@ func parseURIStyle(link, scheme string) (option.Outbound, error) {
 
 	q := u.Query()
 	server := option.ServerOptions{Server: host, ServerPort: uint16(port)}
-	tls := buildTLS(q, host)
+	tls, warnings := buildTLS(q, host)
 	transport := buildTransport(q.Get("type"), q.Get("path"), q.Get("host"))
 
 	switch scheme {
@@ -167,8 +169,8 @@ func parseURIStyle(link, scheme string) (option.Outbound, error) {
 
 		return option.Outbound{
 			Type:    "vless",
-			Options: opts,
-		}, nil
+			Options: &opts,
+		}, warnings, nil
 
 	case "trojan":
 		opts := option.TrojanOutboundOptions{
@@ -180,17 +182,17 @@ func parseURIStyle(link, scheme string) (option.Outbound, error) {
 
 		return option.Outbound{
 			Type:    "trojan",
-			Options: opts,
-		}, nil
+			Options: &opts,
+		}, warnings, nil
 	}
 
-	return option.Outbound{}, fmt.Errorf("unreachable scheme %q", scheme)
+	return option.Outbound{}, nil, fmt.Errorf("unreachable scheme %q", scheme)
 }
 
-func buildTLS(q url.Values, host string) *option.OutboundTLSOptions {
+func buildTLS(q url.Values, host string) (*option.OutboundTLSOptions, []string) {
 	security := strings.ToLower(q.Get("security"))
 	if security != "tls" && security != "reality" {
-		return nil
+		return nil, nil
 	}
 
 	sni := q.Get("sni")
@@ -203,7 +205,14 @@ func buildTLS(q url.Values, host string) *option.OutboundTLSOptions {
 		ServerName: sni,
 	}
 
-	if fp := q.Get("fp"); fp != "" {
+	var warnings []string
+
+	fp := q.Get("fp")
+	if fp != "" {
+		if strings.EqualFold(fp, "unsafe") || strings.EqualFold(fp, "random") {
+			warnings = append(warnings, fmt.Sprintf("reality/tls: unsupported fp=%s, normalized uTLS fingerprint to chrome", fp))
+			fp = "chrome"
+		}
 		tls.UTLS = &option.OutboundUTLSOptions{
 			Enabled:     true,
 			Fingerprint: fp,
@@ -211,6 +220,13 @@ func buildTLS(q url.Values, host string) *option.OutboundTLSOptions {
 	}
 
 	if security == "reality" {
+		if tls.UTLS == nil {
+			tls.UTLS = &option.OutboundUTLSOptions{
+				Enabled:     true,
+				Fingerprint: "chrome",
+			}
+			warnings = append(warnings, "reality: missing fp query parameter, defaulted uTLS fingerprint to chrome")
+		}
 		tls.Reality = &option.OutboundRealityOptions{
 			Enabled:   true,
 			PublicKey: q.Get("pbk"),
@@ -218,7 +234,7 @@ func buildTLS(q url.Values, host string) *option.OutboundTLSOptions {
 		}
 	}
 
-	return tls
+	return tls, warnings
 }
 
 // --- shadowsocks ---
@@ -288,7 +304,7 @@ func parseShadowsocks(link string) (option.Outbound, error) {
 
 	return option.Outbound{
 		Type:    "shadowsocks",
-		Options: opts,
+		Options: &opts,
 	}, nil
 }
 

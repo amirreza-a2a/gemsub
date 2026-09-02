@@ -76,28 +76,45 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 		}
 		candidates = append(candidates, cand)
 	}
-	log.Printf("scheduler: %d candidates parsed", len(candidates))
+	totalParsed := len(candidates)
+	if s.cfg.ProbeLimit > 0 && len(candidates) > s.cfg.ProbeLimit {
+		candidates = candidates[:s.cfg.ProbeLimit]
+	}
+	log.Printf("scheduler: selected %d of %d parsed candidates for probing", len(candidates), totalParsed)
 
 	// Drop stale results for links no longer present in this cycle's
 	// source, so a config removed upstream also disappears from what
 	// we serve to Throne.
 	s.st.StartCycle(linkSet)
 
-	var passed, failed int64
-	tester.RunPool(ctx, candidates, &s.cfg.Test, func(r store.Result) {
-		s.st.Put(r)
-		if r.Passed {
+	var passed, failed, inconclusive int64
+	completed := tester.RunPool(ctx, candidates, &s.cfg.Test, func(r store.Result) {
+		s.st.PutWithTransition(r)
+		switch r.Status {
+		case store.StatusPassed:
 			atomic.AddInt64(&passed, 1)
-		} else {
+		case store.StatusFailed:
 			atomic.AddInt64(&failed, 1)
+		case store.StatusInconclusive:
+			atomic.AddInt64(&inconclusive, 1)
 		}
 	})
+
+	if !completed || ctx.Err() != nil {
+		log.Printf("scheduler: cycle cancelled/interrupted after %s; saving partial state without incrementing cycle_count",
+			time.Since(cycleStart).Round(time.Second))
+		if err := s.st.Save(); err != nil {
+			log.Printf("scheduler: save state failed: %v", err)
+		}
+		return
+	}
 
 	s.st.FinishCycle()
 	if err := s.st.Save(); err != nil {
 		log.Printf("scheduler: save state failed: %v", err)
 	}
 
-	log.Printf("scheduler: cycle done in %s — %d passed, %d failed",
-		time.Since(cycleStart).Round(time.Second), passed, failed)
+	stats := s.st.Stats()
+	log.Printf("scheduler: cycle done in %s — %d passed, %d failed, %d inconclusive (%d servable to throne)",
+		time.Since(cycleStart).Round(time.Second), stats.Passed, stats.Failed, stats.Inconclusive, stats.Servable)
 }
