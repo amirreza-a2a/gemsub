@@ -43,37 +43,31 @@ func TestNormalizeText(t *testing.T) {
 }
 
 func TestClassifyDialError(t *testing.T) {
-	// Proxy/tunnel 429
 	res429 := tester.ClassifyDialError(errors.New("request failed: unexpected HTTP response status: 429"))
 	if res429.Category != store.ErrProxyRateLimited || !res429.Retryable || res429.Status != store.StatusInconclusive {
 		t.Errorf("expected retryable proxy rate limited, got %+v", res429)
 	}
 
-	// Proxy/tunnel 503
 	res503 := tester.ClassifyDialError(errors.New("request failed: unexpected HTTP response status: 503"))
 	if res503.Category != store.ErrProxyError || !res503.Retryable || res503.Status != store.StatusInconclusive {
 		t.Errorf("expected retryable proxy 503 error, got %+v", res503)
 	}
 
-	// Proxy 403
 	res403 := tester.ClassifyDialError(errors.New("request failed: unexpected HTTP response status: 403"))
 	if res403.Category != store.ErrProxyError || res403.Retryable || res403.Status != store.StatusFailed {
 		t.Errorf("expected non-retryable proxy 403 error, got %+v", res403)
 	}
 
-	// Connection refused
 	resRefused := tester.ClassifyDialError(errors.New("dial tcp: connection refused"))
 	if resRefused.Category != store.ErrConnRefused || resRefused.Retryable || resRefused.Status != store.StatusFailed {
 		t.Errorf("expected non-retryable conn refused, got %+v", resRefused)
 	}
 
-	// Timeout
 	resTimeout := tester.ClassifyDialError(errors.New("dial tcp: i/o timeout"))
 	if resTimeout.Category != store.ErrTimeout || resTimeout.Retryable || resTimeout.Status != store.StatusFailed {
 		t.Errorf("expected non-retryable timeout, got %+v", resTimeout)
 	}
 
-	// Reality failure
 	resReality := tester.ClassifyDialError(errors.New("reality verification failed"))
 	if resReality.Category != store.ErrReality || resReality.Retryable || resReality.Status != store.StatusFailed {
 		t.Errorf("expected non-retryable reality error, got %+v", resReality)
@@ -115,7 +109,56 @@ func TestClassifyResponse_HttpStatusMatrix(t *testing.T) {
 	}
 }
 
-// --- Gemini Positive Validation Tests ---
+func TestClassifyResponse_WIZGlobalData_GeoBlocking(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Server": []string{"ESF"}},
+	}
+
+	// RU restriction test case
+	bodyBlockedRU := []byte(`<!doctype html><html><head><title>Google Gemini</title>
+<script>window.WIZ_global_data = {"vXmutd":"%.@.\"RU\",\"ZZ\",\"2u255g\\u003d\\u003d\"]"};</script>
+</head><body><div id="bardchatui"></div></body></html>`)
+
+	resRU := tester.ClassifyResponse(resp, bodyBlockedRU, nil)
+	if resRU.Status != store.StatusFailed || resRU.Category != store.ErrRegionBlocked {
+		t.Errorf("expected blocked country RU to fail with ErrRegionBlocked, got status=%s category=%s",
+			resRU.Status, resRU.Category)
+	}
+
+	// IR restriction test case
+	bodyBlockedIR := []byte(`<!doctype html><html><head><title>Google Gemini</title>
+<script>window.WIZ_global_data = {"vXmutd":"%.@.\"IR\",\"ZZ\",\"Kgm6wTkAEZgAAAAAA9EAUA\\u003d\\u003d\"]"};</script>
+</head><body><div id="bardchatui"></div></body></html>`)
+
+	resIR := tester.ClassifyResponse(resp, bodyBlockedIR, nil)
+	if resIR.Status != store.StatusFailed || resIR.Category != store.ErrRegionBlocked {
+		t.Errorf("expected blocked country IR to fail with ErrRegionBlocked, got status=%s category=%s",
+			resIR.Status, resIR.Category)
+	}
+
+	// Explicit restriction flag test case
+	bodyBlockedFlag := []byte(`<!doctype html><html><head><title>Google Gemini</title>
+<script>window.WIZ_global_data = {"status":"LOCATION_REJECTED"};</script>
+</head><body><div id="bardchatui"></div></body></html>`)
+
+	resFlag := tester.ClassifyResponse(resp, bodyBlockedFlag, nil)
+	if resFlag.Status != store.StatusFailed || resFlag.Category != store.ErrRegionBlocked {
+		t.Errorf("expected LOCATION_REJECTED to fail with ErrRegionBlocked, got status=%s category=%s",
+			resFlag.Status, resFlag.Category)
+	}
+
+	// Allowed country test case (US)
+	bodyCleanUS := []byte(`<!doctype html><html><head><title>Google Gemini</title>
+<script>window.WIZ_global_data = {"vXmutd":"%.@.\"US\",\"ZZ\",\"2u255g\\u003d\\u003d\"]"};</script>
+</head><body><div id="bardchatui"></div></body></html>`)
+
+	resUS := tester.ClassifyResponse(resp, bodyCleanUS, nil)
+	if resUS.Status != store.StatusPassed {
+		t.Errorf("expected clean country US to pass, got status=%s category=%s reason=%q",
+			resUS.Status, resUS.Category, resUS.Reason)
+	}
+}
 
 func TestClassifyResponse_RealisticGeminiLanding_Passes(t *testing.T) {
 	blockPhrases := []string{
@@ -124,7 +167,6 @@ func TestClassifyResponse_RealisticGeminiLanding_Passes(t *testing.T) {
 		"not available in your region",
 	}
 
-	// Realistic Gemini landing page: ESF server header + title + body brand signals
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Server": []string{"ESF"}},
@@ -149,7 +191,6 @@ func TestClassifyResponse_RealisticGeminiLanding_Passes(t *testing.T) {
 func TestClassifyResponse_GeminiWithGoogleCookieNoBrandInTitle_Passes(t *testing.T) {
 	blockPhrases := []string{"not available in your country"}
 
-	// Google server with cookie, brand in body but not in title
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header: http.Header{
@@ -177,7 +218,6 @@ func TestClassifyResponse_RegionalBlock_UnicodeApostrophe_Fails(t *testing.T) {
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Server": []string{"ESF"}},
 	}
-	// The exact regional block message with Unicode right single quotation mark (U+2019)
 	body := []byte("<!doctype html><html><head><title>Google Gemini</title></head>\n<body><p>Gemini isn\u2019t currently supported in your country. Stay tuned!</p></body></html>")
 
 	res := tester.ClassifyResponse(resp, body, blockPhrases)
@@ -190,7 +230,6 @@ func TestClassifyResponse_RegionalBlock_UnicodeApostrophe_Fails(t *testing.T) {
 func TestClassifyResponse_FalsePositive_HoroscopeSite_Fails(t *testing.T) {
 	blockPhrases := []string{"not available in your country"}
 
-	// Non-Google server, title contains "Gemini", body mentions "gemini" — should NOT pass
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Server": []string{"nginx/1.24.0"}},
@@ -208,7 +247,6 @@ func TestClassifyResponse_FalsePositive_HoroscopeSite_Fails(t *testing.T) {
 func TestClassifyResponse_FalsePositive_CaptivePortal_Fails(t *testing.T) {
 	blockPhrases := []string{"not available in your country"}
 
-	// Captive portal with RouterOS and mentioning "Gemini Cafe"
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Server": []string{"RouterOS"}},
@@ -226,7 +264,6 @@ func TestClassifyResponse_FalsePositive_CaptivePortal_Fails(t *testing.T) {
 func TestClassifyResponse_StrippedHeaders_WithAppMarkers_Passes(t *testing.T) {
 	blockPhrases := []string{"not available in your country"}
 
-	// Proxy stripped Google headers, but body has title + distinctive app markers
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Server": []string{"nginx"}},
@@ -244,7 +281,6 @@ func TestClassifyResponse_StrippedHeaders_WithAppMarkers_Passes(t *testing.T) {
 func TestClassifyResponse_TitleGeminiAlone_NoAppMarkers_Fails(t *testing.T) {
 	blockPhrases := []string{"not available in your country"}
 
-	// Title says "Gemini" but no Google origin and no app markers — should fail
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Server": []string{"Apache/2.4"}},
@@ -259,31 +295,40 @@ func TestClassifyResponse_TitleGeminiAlone_NoAppMarkers_Fails(t *testing.T) {
 	}
 }
 
-// --- Rate Limiting Burst Test ---
-
 func TestRateLimiter_BurstControlled(t *testing.T) {
-	// Deterministically verify that with burst=2 and a low refill rate (e.g. 1 token per 1000s),
-	// exactly 2 tokens can be consumed immediately, and the 3rd attempt is rejected.
 	const rateLimitBurst = 2
 	limiter := rate.NewLimiter(rate.Limit(0.001), rateLimitBurst)
 
-	// Consume first token (should succeed)
 	if !limiter.Allow() {
 		t.Errorf("expected 1st token to be allowed")
 	}
-
-	// Consume second token (should succeed)
 	if !limiter.Allow() {
 		t.Errorf("expected 2nd token to be allowed")
 	}
-
-	// Third attempt within burst window (must fail)
 	if limiter.Allow() {
 		t.Errorf("expected 3rd token to be rejected by burst limit of %d", rateLimitBurst)
 	}
-
-	// Fourth attempt (must fail)
 	if limiter.Allow() {
 		t.Errorf("expected 4th token to be rejected by burst limit of %d", rateLimitBurst)
+	}
+}
+
+func TestClassifyResponse_RealGeminiPageWithAdminUrl_Passes(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Server": []string{"ESF"}},
+	}
+	// Real Gemini responses contain the ServiceNotAllowed admin URL in WIZ_global_data.
+	bodyWithAdminLink := []byte(`<!doctype html><html><head><title>Google Gemini</title>
+<script>window.WIZ_global_data = {
+	"vXmutd":"%.@.\"US\",\"ZZ\",\"Kgm6wTkAEZgAAAAAA9EAUA\\u003d\\u003d\"]",
+	"adminUrl":"https://admin.google.com/ServiceNotAllowed?application=47208553126"
+};</script>
+</head><body><div id="bardchatui"></div></body></html>`)
+
+	res := tester.ClassifyResponse(resp, bodyWithAdminLink, nil)
+	if res.Status != store.StatusPassed {
+		t.Errorf("expected real Gemini page with admin fallback URL to pass, got status=%s category=%s reason=%q",
+			res.Status, res.Category, res.Reason)
 	}
 }

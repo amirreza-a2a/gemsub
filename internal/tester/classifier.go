@@ -4,10 +4,29 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"gemsub/internal/store"
 )
+
+var (
+	// Flexible regex matching the ISO country code inside the vXmutd field of WIZ_global_data.
+	countryCodeRegex = regexp.MustCompile(`"vXmutd"\s*:\s*"(?:\\.|[^"\\])*?\\?"([A-Z]{2})\\?"`)
+
+	// Matches explicit Gemini restriction flags in client state.
+	locationBlockRegex = regexp.MustCompile(`"LOCATION_REJECTED"|"no_access"|"GEO_RESTRICTED"`)
+)
+
+// List of ISO country codes restricted by Google AI services.
+var restrictedCountries = map[string]bool{
+	"IR": true, // Iran
+	"RU": true, // Russia
+	"CU": true, // Cuba
+	"SY": true, // Syria
+	"KP": true, // North Korea
+	"BY": true, // Belarus
+}
 
 // NormalizeText unescapes HTML entities, normalizes quotes/apostrophes,
 // collapses whitespace, and converts to lowercase.
@@ -194,9 +213,36 @@ func ClassifyResponse(resp *http.Response, body []byte, blockPhrases []string) C
 		}
 
 	case http.StatusOK:
-		normalized := NormalizeText(string(body))
+		bodyStr := string(body)
 
-		// 1. Negative check: regional block phrases
+		// 1. Negative check: Country code verification from WIZ_global_data
+		if matches := countryCodeRegex.FindStringSubmatch(bodyStr); len(matches) > 1 {
+			detectedCountry := matches[1]
+			if restrictedCountries[detectedCountry] {
+				return ClassificationResult{
+					Status:     store.StatusFailed,
+					Category:   store.ErrRegionBlocked,
+					StatusCode: 200,
+					Reason:     fmt.Sprintf("restricted country detected in WIZ_global_data: %s", detectedCountry),
+					Retryable:  false,
+				}
+			}
+		}
+
+		// 2. Negative check: Explicit restriction flags
+		if locationBlockRegex.MatchString(bodyStr) {
+			return ClassificationResult{
+				Status:     store.StatusFailed,
+				Category:   store.ErrRegionBlocked,
+				StatusCode: 200,
+				Reason:     "gemini restriction flag detected (LOCATION_REJECTED / no_access)",
+				Retryable:  false,
+			}
+		}
+
+		normalized := NormalizeText(bodyStr)
+
+		// 3. Negative check: Static block phrases
 		for _, phrase := range blockPhrases {
 			normPhrase := NormalizeText(phrase)
 			if normPhrase != "" && strings.Contains(normalized, normPhrase) {
@@ -210,7 +256,7 @@ func ClassifyResponse(resp *http.Response, body []byte, blockPhrases []string) C
 			}
 		}
 
-		// 2. Negative check: interception / captive portal / CDN challenges
+		// 4. Negative check: Interception / captive portal / CDN challenges
 		if strings.Contains(normalized, "cf-chl-bypass") ||
 			strings.Contains(normalized, "attention required! | cloudflare") ||
 			strings.Contains(normalized, "just a moment...") ||
@@ -225,7 +271,7 @@ func ClassifyResponse(resp *http.Response, body []byte, blockPhrases []string) C
 			}
 		}
 
-		// 3. Positive confidence signals
+		// 5. Positive confidence signals
 		// Signal A: Google Origin Proof (Server header or Google domain cookies)
 		serverHeader := resp.Header.Get("Server")
 		isGoogleServer := strings.Contains(strings.ToUpper(serverHeader), "ESF") ||
@@ -244,7 +290,7 @@ func ClassifyResponse(resp *http.Response, body []byte, blockPhrases []string) C
 
 		// Signal B: Brand & Title signals
 		titleSignal := false
-		lowerRaw := strings.ToLower(string(body))
+		lowerRaw := strings.ToLower(bodyStr)
 		if strings.Contains(lowerRaw, "<title>") {
 			start := strings.Index(lowerRaw, "<title>")
 			end := strings.Index(lowerRaw[start:], "</title>")
@@ -264,9 +310,6 @@ func ClassifyResponse(resp *http.Response, body []byte, blockPhrases []string) C
 			strings.Contains(normalized, "google gemini")
 
 		// Confidence Decision Rules:
-		// 1. If we have verified Google Origin (Server/Cookie), we require Title OR Brand signal.
-		// 2. If Google Origin headers were stripped by an intermediate proxy, we require BOTH Title signal AND distinct app/Google markers.
-		// Single ambiguous signals like <title>Gemini</title> or the word "gemini" alone on an unknown server are NOT sufficient.
 		isVerified := false
 		if originSignal && (titleSignal || brandSignal) {
 			isVerified = true
