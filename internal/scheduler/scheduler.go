@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gemsub/internal/config"
+	"gemsub/internal/events"
 	"gemsub/internal/parser"
 	"gemsub/internal/publisher"
 	"gemsub/internal/source"
@@ -22,6 +23,7 @@ type Scheduler struct {
 	cfg *config.Config
 	st  *store.Store
 	pub *publisher.Publisher
+	bus *events.EventBus
 
 	// Trigger lets anything (TUI, signal handler, ...) request an
 	// immediate cycle instead of waiting for the interval. Buffered
@@ -29,17 +31,34 @@ type Scheduler struct {
 	Trigger chan struct{}
 }
 
-func New(cfg *config.Config, st *store.Store) *Scheduler {
+func New(cfg *config.Config, st *store.Store, bus ...*events.EventBus) *Scheduler {
 	var pub *publisher.Publisher
 	if cfg.Publishing.Enabled {
 		pub = publisher.New(&cfg.Publishing, st)
+	}
+	var b *events.EventBus
+	if len(bus) > 0 && bus[0] != nil {
+		b = bus[0]
+	} else {
+		b = events.New()
 	}
 	return &Scheduler{
 		cfg:     cfg,
 		st:      st,
 		pub:     pub,
+		bus:     b,
 		Trigger: make(chan struct{}, 1),
 	}
+}
+
+// EventBus returns the scheduler's event bus.
+func (s *Scheduler) EventBus() *events.EventBus {
+	return s.bus
+}
+
+// SetEventBus replaces the event bus (e.g. for testing).
+func (s *Scheduler) SetEventBus(bus *events.EventBus) {
+	s.bus = bus
 }
 
 // SetPublisher allows configuring a custom publisher (e.g. for testing).
@@ -71,6 +90,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 func (s *Scheduler) runCycle(ctx context.Context) {
 	slog.Info("scheduler: cycle starting")
 	cycleStart := time.Now()
+	s.bus.Publish(events.CycleStarted{
+		StartedAt: cycleStart,
+	})
 
 	links, fetchErrs := source.FetchAll(ctx, s.cfg.Sources)
 	for _, e := range fetchErrs {
@@ -80,6 +102,18 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 
 	if len(links) == 0 && len(fetchErrs) > 0 {
 		slog.Warn("scheduler: fetch failed; aborting cycle without updating store or publishing", "errors", len(fetchErrs), "links", 0)
+		s.bus.Publish(events.CycleFinished{
+			ProgressMetrics: events.ProgressMetrics{
+				Total:        0,
+				Completed:    0,
+				Passed:       0,
+				Failed:       0,
+				Inconclusive: 0,
+			},
+			Duration:  time.Since(cycleStart),
+			Cancelled: ctx.Err() != nil,
+			Servable:  s.st.Stats().Servable,
+		})
 		return
 	}
 
@@ -98,6 +132,10 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 		candidates = candidates[:s.cfg.ProbeLimit]
 	}
 	slog.Info("scheduler: selected candidates for probing", "selected", len(candidates), "total", totalParsed)
+	s.bus.Publish(events.CandidatesLoaded{
+		Total:      len(candidates),
+		Candidates: candidates,
+	})
 
 	// Drop stale results for links no longer present in this cycle's
 	// source, so a config removed upstream also disappears from what
@@ -107,7 +145,7 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 	var passed, failed, inconclusive int64
 	var regionBlocked, timeout int64
 
-	completed := tester.RunPool(ctx, candidates, &s.cfg.Test, func(r store.Result) {
+	completed := tester.RunPool(ctx, candidates, &s.cfg.Test, s.bus, func(r store.Result) {
 		s.st.PutWithTransition(r)
 		switch r.Status {
 		case store.StatusPassed:
@@ -130,6 +168,18 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 		if err := s.st.Save(); err != nil {
 			slog.Error("scheduler: save state failed", "err", err)
 		}
+		s.bus.Publish(events.CycleFinished{
+			ProgressMetrics: events.ProgressMetrics{
+				Total:        len(candidates),
+				Completed:    int(atomic.LoadInt64(&passed) + atomic.LoadInt64(&failed) + atomic.LoadInt64(&inconclusive)),
+				Passed:       int(atomic.LoadInt64(&passed)),
+				Failed:       int(atomic.LoadInt64(&failed)),
+				Inconclusive: int(atomic.LoadInt64(&inconclusive)),
+			},
+			Duration:  time.Since(cycleStart),
+			Cancelled: true,
+			Servable:  s.st.Stats().Servable,
+		})
 		return
 	}
 
@@ -148,6 +198,19 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 		"inconclusive", stats.Inconclusive,
 		"servable", stats.Servable,
 	)
+
+	s.bus.Publish(events.CycleFinished{
+		ProgressMetrics: events.ProgressMetrics{
+			Total:        len(candidates),
+			Completed:    len(candidates),
+			Passed:       int(atomic.LoadInt64(&passed)),
+			Failed:       int(atomic.LoadInt64(&failed)),
+			Inconclusive: int(atomic.LoadInt64(&inconclusive)),
+		},
+		Duration:  time.Since(cycleStart),
+		Cancelled: false,
+		Servable:  stats.Servable,
+	})
 
 	if s.pub != nil {
 		if err := s.pub.Publish(ctx); err != nil {

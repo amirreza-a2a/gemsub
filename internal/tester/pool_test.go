@@ -11,6 +11,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"gemsub/internal/config"
+	"gemsub/internal/events"
 	"gemsub/internal/parser"
 	"gemsub/internal/store"
 	"gemsub/internal/tester"
@@ -54,7 +55,7 @@ func TestRunPool_DeterministicCancellation(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		ok := tester.RunPoolWithRunner(ctx, candidates, cfg, runner, func(r store.Result) {})
+		ok := tester.RunPoolWithRunner(ctx, candidates, cfg, runner, nil, func(r store.Result) {})
 		done <- ok
 	}()
 
@@ -126,7 +127,7 @@ func TestRunPool_CancelledProbesDoNotReachOnResult(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		ok := tester.RunPoolWithRunner(ctx, candidates, cfg, runner, onResult)
+		ok := tester.RunPoolWithRunner(ctx, candidates, cfg, runner, nil, onResult)
 		done <- ok
 	}()
 
@@ -186,7 +187,7 @@ func TestRunPool_CancellationPreservesStoreState(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		ok := tester.RunPoolWithRunner(ctx, candidates, cfg, runner, func(r store.Result) {
+		ok := tester.RunPoolWithRunner(ctx, candidates, cfg, runner, nil, func(r store.Result) {
 			st.PutWithTransition(r)
 		})
 		done <- ok
@@ -236,7 +237,7 @@ func TestRunPool_GenuineProbeTimeoutReachesOnResult(t *testing.T) {
 	}
 
 	var received []store.Result
-	ok := tester.RunPoolWithRunner(ctx, candidates, cfg, runner, func(r store.Result) {
+	ok := tester.RunPoolWithRunner(ctx, candidates, cfg, runner, nil, func(r store.Result) {
 		received = append(received, r)
 	})
 
@@ -248,5 +249,136 @@ func TestRunPool_GenuineProbeTimeoutReachesOnResult(t *testing.T) {
 	}
 	if received[0].Status != store.StatusFailed || received[0].Category != store.ErrTimeout {
 		t.Errorf("expected StatusFailed and ErrTimeout, got %+v", received[0])
+	}
+}
+
+func TestRunPool_PublishesProgressMetricsToEventBus(t *testing.T) {
+	ctx := context.Background()
+	candidates := []parser.Candidate{
+		{Link: "vless://pass-node"},
+		{Link: "vless://fail-node"},
+		{Link: "vless://inconclusive-node"},
+	}
+	cfg := &config.TestConfig{
+		Concurrency: 2,
+	}
+
+	runner := func(workerCtx context.Context, cand parser.Candidate, cfg *config.TestConfig, limiter *rate.Limiter) store.Result {
+		switch cand.Link {
+		case "vless://pass-node":
+			return store.Result{
+				Link:   cand.Link,
+				Status: store.StatusPassed,
+			}
+		case "vless://fail-node":
+			return store.Result{
+				Link:     cand.Link,
+				Status:   store.StatusFailed,
+				Category: store.ErrRegionBlocked,
+			}
+		default:
+			return store.Result{
+				Link:   cand.Link,
+				Status: store.StatusInconclusive,
+			}
+		}
+	}
+
+	bus := events.New()
+	defer bus.Close()
+	subCh := bus.Subscribe(10)
+	defer bus.Unsubscribe(subCh)
+
+	var onResultCount int32
+	ok := tester.RunPoolWithRunner(ctx, candidates, cfg, runner, bus, func(r store.Result) {
+		atomic.AddInt32(&onResultCount, 1)
+	})
+
+	if !ok {
+		t.Fatalf("expected RunPool to succeed")
+	}
+	if atomic.LoadInt32(&onResultCount) != 3 {
+		t.Fatalf("expected 3 onResult calls, got %d", atomic.LoadInt32(&onResultCount))
+	}
+
+	var eventsReceived []events.ProbeCompleted
+	for i := 0; i < 3; i++ {
+		select {
+		case evt, ok := <-subCh:
+			if !ok {
+				t.Fatalf("event channel closed prematurely at index %d", i)
+			}
+			pc, ok := evt.(events.ProbeCompleted)
+			if !ok {
+				t.Fatalf("expected ProbeCompleted event, got %T", evt)
+			}
+			eventsReceived = append(eventsReceived, pc)
+		case <-time.After(1 * time.Second):
+			t.Fatalf("timed out waiting for event %d", i)
+		}
+	}
+
+	// Verify all 3 events have Total == 3
+	for i, ev := range eventsReceived {
+		if ev.Total != 3 {
+			t.Errorf("event %d: expected Total=3, got %d", i, ev.Total)
+		}
+		if ev.Completed < 1 || ev.Completed > 3 {
+			t.Errorf("event %d: invalid Completed=%d", i, ev.Completed)
+		}
+		if ev.Passed+ev.Failed+ev.Inconclusive != ev.Completed {
+			t.Errorf("event %d: sum of (Passed=%d + Failed=%d + Inconclusive=%d) != Completed=%d",
+				i, ev.Passed, ev.Failed, ev.Inconclusive, ev.Completed)
+		}
+	}
+
+	// The final event must reflect all completed probes
+	lastEv := eventsReceived[len(eventsReceived)-1]
+	if lastEv.Completed != 3 || lastEv.Passed != 1 || lastEv.Failed != 1 || lastEv.Inconclusive != 1 {
+		t.Errorf("last event metrics mismatch: got %+v, want Completed=3, Passed=1, Failed=1, Inconclusive=1", lastEv.ProgressMetrics)
+	}
+}
+
+func TestRunPool_CancelledProbesDoNotEmitProbeCompleted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	candidates := []parser.Candidate{
+		{Link: "vless://cand1"},
+		{Link: "vless://cand2"},
+	}
+	cfg := &config.TestConfig{
+		Concurrency: 1,
+	}
+
+	started := make(chan struct{})
+	runner := func(workerCtx context.Context, cand parser.Candidate, cfg *config.TestConfig, limiter *rate.Limiter) store.Result {
+		close(started)
+		<-workerCtx.Done()
+		return store.Result{
+			Link:   cand.Link,
+			Status: store.StatusInconclusive,
+			Reason: "context canceled",
+		}
+	}
+
+	bus := events.New()
+	defer bus.Close()
+	subCh := bus.Subscribe(10)
+	defer bus.Unsubscribe(subCh)
+
+	done := make(chan bool)
+	go func() {
+		ok := tester.RunPoolWithRunner(ctx, candidates, cfg, runner, bus, func(r store.Result) {})
+		done <- ok
+	}()
+
+	<-started
+	cancel()
+	<-done
+
+	select {
+	case evt := <-subCh:
+		t.Fatalf("expected no ProbeCompleted events for cancelled probe, got %+v", evt)
+	case <-time.After(100 * time.Millisecond):
+		// Success
 	}
 }
