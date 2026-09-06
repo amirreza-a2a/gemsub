@@ -105,6 +105,8 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 	s.st.StartCycle(linkSet)
 
 	var passed, failed, inconclusive int64
+	var regionBlocked, timeout int64
+
 	completed := tester.RunPool(ctx, candidates, &s.cfg.Test, func(r store.Result) {
 		s.st.PutWithTransition(r)
 		switch r.Status {
@@ -112,6 +114,11 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 			atomic.AddInt64(&passed, 1)
 		case store.StatusFailed:
 			atomic.AddInt64(&failed, 1)
+			if r.Category == store.ErrRegionBlocked {
+				atomic.AddInt64(&regionBlocked, 1)
+			} else if r.Category == store.ErrTimeout {
+				atomic.AddInt64(&timeout, 1)
+			}
 		case store.StatusInconclusive:
 			atomic.AddInt64(&inconclusive, 1)
 		}
@@ -132,8 +139,15 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 	}
 
 	stats := s.st.Stats()
-	log.Printf("scheduler: cycle done in %s — %d passed, %d failed, %d inconclusive (%d servable to throne)",
-		time.Since(cycleStart).Round(time.Second), stats.Passed, stats.Failed, stats.Inconclusive, stats.Servable)
+	log.Printf("scheduler: cycle done in %s — %d passed, %d failed (region_blocked: %d, timeout: %d), %d inconclusive (%d servable to throne)",
+		time.Since(cycleStart).Round(time.Second),
+		stats.Passed,
+		stats.Failed,
+		atomic.LoadInt64(&regionBlocked),
+		atomic.LoadInt64(&timeout),
+		stats.Inconclusive,
+		stats.Servable,
+	)
 
 	if s.pub != nil {
 		if err := s.pub.Publish(ctx); err != nil {
