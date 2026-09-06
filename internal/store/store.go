@@ -78,6 +78,7 @@ type Store struct {
 	lastCycle      time.Time
 	cycleCount     int
 	cycleID        uint64
+	revision       uint64
 	path           string
 	cfg            ScoringConfig
 }
@@ -130,36 +131,37 @@ func (s *Store) Config() ScoringConfig {
 	return s.cfg.Clone()
 }
 
-// isServableRecordLocked evaluates the 4 operational policy gates for candidate servability.
+// servabilityGateLocked evaluates the 4 operational policy gates for candidate servability
+// and returns both the decision and human-readable explanation.
 // mu must be locked (RLock or Lock) by caller.
-func (s *Store) isServableRecordLocked(rec *CandidateRecord) bool {
+func (s *Store) servabilityGateLocked(rec *CandidateRecord) (bool, string) {
 	if rec == nil {
-		return false
+		return false, "No record"
 	}
 
 	// Gate 1: Source Presence Gate
 	// Disqualified if candidate is absent in active cycle or absent from upstream without reappearing.
 	if _, pending := s.pendingAbsent[rec.CanonicalLink]; pending {
-		return false
+		return false, "Absent in active cycle"
 	}
 	if _, present := s.pendingPresent[rec.CanonicalLink]; !present && rec.AbsentCycles > 0 {
-		return false
+		return false, "Absent from source upstream"
 	}
 
 	// Gate 2: Target Policy Override
 	// Disqualified if latest conclusive target observation is StatusFailed with ErrRegionBlocked or ErrTargetDenied.
 	if sample, ok := rec.History.LatestConclusive(); ok {
 		if sample.Status == StatusFailed && (sample.Category == ErrRegionBlocked || sample.Category == ErrTargetDenied) {
-			return false
+			return false, "Target policy: " + string(sample.Category)
 		}
 	} else if rec.Latest.Status == StatusFailed && (rec.Latest.Category == ErrRegionBlocked || rec.Latest.Category == ErrTargetDenied) {
-		return false
+		return false, "Target policy: " + string(rec.Latest.Category)
 	}
 
 	// Gate 3: Cold Start Gate
 	// Disqualified until minimum observation count is reached.
 	if rec.History.Count < s.cfg.MinObservationsForServing {
-		return false
+		return false, "Cold start: needs observation"
 	}
 
 	// Gate 4: Reliability Score Threshold Gate
@@ -168,12 +170,26 @@ func (s *Store) isServableRecordLocked(rec *CandidateRecord) bool {
 		// Legacy Last-Known-Good compatibility: if migrated from legacy state with prior pass
 		// and inconclusive count within limit, preserve servability until probed in new cycle.
 		if rec.Latest.Status == StatusInconclusive && rec.Latest.PreviouslyPassed && rec.Latest.ConsecutiveInconclusive <= s.cfg.MaxAbsentCycles && rec.History.Count == 1 {
-			return true
+			return true, "Servable (grace period)"
 		}
-		return false
+		return false, "Score below threshold"
 	}
 
-	return true
+	return true, "Servable"
+}
+
+// isServableRecordLocked evaluates the 4 operational policy gates for candidate servability.
+// mu must be locked (RLock or Lock) by caller.
+func (s *Store) isServableRecordLocked(rec *CandidateRecord) bool {
+	servable, _ := s.servabilityGateLocked(rec)
+	return servable
+}
+
+// ServabilityGate returns the servability decision and gate explanation for a record.
+func (s *Store) ServabilityGate(rec *CandidateRecord) (bool, string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.servabilityGateLocked(rec)
 }
 
 // IsServableRecord returns true if the candidate record satisfies all servability policy gates.
@@ -222,6 +238,7 @@ func (s *Store) Load() error {
 	s.lastCycle = snap.LastCycle
 	s.cycleCount = snap.CycleCount
 	s.cycleID = uint64(snap.CycleCount)
+	s.revision++
 	s.records = make(map[string]*CandidateRecord)
 	s.pendingAbsent = make(map[string]struct{})
 
@@ -507,6 +524,7 @@ func (s *Store) PutWithTransition(r Result) {
 	}
 
 	rec.Latest = r
+	s.revision++
 }
 
 // Put records the result of testing one candidate. Safe to call
@@ -522,6 +540,8 @@ func (s *Store) Put(r Result) {
 func (s *Store) StartCycle(currentLinks map[string]struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.revision++
 
 	canonicalPresent := make(map[string]struct{}, len(currentLinks))
 	for raw := range currentLinks {
@@ -568,6 +588,7 @@ func (s *Store) FinishCycle() {
 	s.lastCycle = time.Now()
 	s.cycleCount++
 	s.cycleID++
+	s.revision++
 }
 
 // Passing returns the active links of all servable candidates, in stable sorted order.
@@ -716,4 +737,36 @@ func (s *Store) GetRecord(link string) (*CandidateRecord, bool) {
 		return nil, false
 	}
 	return rec.Clone(), true
+}
+
+// CandidateSnapshot pairs a cloned CandidateRecord with its atomic servability status and gate reason.
+type CandidateSnapshot struct {
+	Record   *CandidateRecord
+	Servable bool
+	Gate     string
+}
+
+// Snapshots returns a consistent snapshot of all candidate records and their servability evaluations.
+func (s *Store) Snapshots() []CandidateSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]CandidateSnapshot, 0, len(s.records))
+	for _, rec := range s.records {
+		servable, gate := s.servabilityGateLocked(rec)
+		out = append(out, CandidateSnapshot{
+			Record:   rec.Clone(),
+			Servable: servable,
+			Gate:     gate,
+		})
+	}
+	return out
+}
+
+// Revision returns the monotonic generation counter of the store,
+// incremented on every candidate state transition or cycle boundary.
+func (s *Store) Revision() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.revision
 }

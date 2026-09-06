@@ -286,3 +286,110 @@ func TestStore_PersistenceAndMigration(t *testing.T) {
 		t.Fatalf("expected link-old-pass in passing after reload, got %v", st2.Passing())
 	}
 }
+
+func TestStore_Snapshots(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "test_state.json")
+
+	st := store.New(stateFile, 2)
+	linkPass := "vless://pass@1.1.1.1:443"
+	linkFail := "vless://fail@2.2.2.2:443"
+
+	st.PutWithTransition(store.Result{
+		Link:     linkPass,
+		Status:   store.StatusPassed,
+		Reason:   "ok",
+		Latency:  100 * time.Millisecond,
+		TestedAt: time.Now(),
+	})
+	st.PutWithTransition(store.Result{
+		Link:     linkFail,
+		Status:   store.StatusFailed,
+		Reason:   "target region blocked",
+		Category: store.ErrRegionBlocked,
+		Latency:  50 * time.Millisecond,
+		TestedAt: time.Now(),
+	})
+
+	snaps := st.Snapshots()
+	if len(snaps) != 2 {
+		t.Fatalf("expected 2 snapshots, got %d", len(snaps))
+	}
+
+	for _, snap := range snaps {
+		if snap.Record == nil {
+			t.Fatal("expected non-nil record in snapshot")
+		}
+		if snap.Record.ActiveLink == linkPass {
+			if !snap.Servable {
+				t.Errorf("expected pass link to be servable, got false (gate: %s)", snap.Gate)
+			}
+			if snap.Gate != "Servable" {
+				t.Errorf("expected gate 'Servable', got %q", snap.Gate)
+			}
+		} else if snap.Record.ActiveLink == linkFail {
+			if snap.Servable {
+				t.Errorf("expected fail link to not be servable")
+			}
+			if snap.Gate == "" || snap.Gate == "Servable" {
+				t.Errorf("expected non-servable gate explanation, got %q", snap.Gate)
+			}
+		}
+	}
+}
+
+func TestStore_Revision(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "test_state.json")
+
+	st := store.New(stateFile, 2)
+	rev0 := st.Revision()
+
+	// Put increment
+	st.PutWithTransition(store.Result{
+		Link:     "vless://r1@1.1.1.1:443",
+		Status:   store.StatusPassed,
+		TestedAt: time.Now(),
+	})
+	rev1 := st.Revision()
+	if rev1 <= rev0 {
+		t.Errorf("expected revision to increment after Put, rev0=%d rev1=%d", rev0, rev1)
+	}
+
+	// StartCycle increment
+	st.StartCycle(map[string]struct{}{"vless://r1@1.1.1.1:443": {}})
+	rev2 := st.Revision()
+	if rev2 <= rev1 {
+		t.Errorf("expected revision to increment after StartCycle, rev1=%d rev2=%d", rev1, rev2)
+	}
+
+	// FinishCycle increment
+	st.FinishCycle()
+	rev3 := st.Revision()
+	if rev3 <= rev2 {
+		t.Errorf("expected revision to increment after FinishCycle, rev2=%d rev3=%d", rev2, rev3)
+	}
+
+	// Put wrapper increment
+	st.Put(store.Result{
+		Link:     "vless://r2@2.2.2.2:443",
+		Status:   store.StatusPassed,
+		TestedAt: time.Now(),
+	})
+	rev4 := st.Revision()
+	if rev4 <= rev3 {
+		t.Errorf("expected revision to increment after Put wrapper, rev3=%d rev4=%d", rev3, rev4)
+	}
+
+	// Save and Load increment
+	if err := st.Save(); err != nil {
+		t.Fatalf("failed to save state: %v", err)
+	}
+	if err := st.Load(); err != nil {
+		t.Fatalf("failed to load state: %v", err)
+	}
+	rev5 := st.Revision()
+	if rev5 <= rev4 {
+		t.Errorf("expected revision to increment after Load, rev4=%d rev5=%d", rev4, rev5)
+	}
+}

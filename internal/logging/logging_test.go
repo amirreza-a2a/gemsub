@@ -277,6 +277,9 @@ func TestNewStandardHandler(t *testing.T) {
 }
 
 func TestSetup(t *testing.T) {
+	origLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
 	// Test headless setup
 	var buf bytes.Buffer
 	ring := logging.Setup(true, 10, &buf)
