@@ -109,8 +109,11 @@ func TestEndToEnd_PositivePath(t *testing.T) {
 		Format: "base64",
 	}, st)
 
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
+
 	go func() {
-		_ = srv.Run()
+		_ = srv.Run(srvCtx)
 	}()
 	time.Sleep(50 * time.Millisecond)
 

@@ -62,7 +62,7 @@ func main() {
 
 	srv := subserver.New(&cfg.Serve, st)
 	go func() {
-		if err := srv.Run(); err != nil {
+		if err := srv.Run(ctx); err != nil {
 			log.Fatalf("subserver: %v", err)
 		}
 	}()

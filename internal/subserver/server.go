@@ -5,11 +5,14 @@
 package subserver
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"gemsub/internal/config"
 	"gemsub/internal/store"
@@ -24,16 +27,41 @@ func New(cfg *config.ServeConfig, st *store.Store) *Server {
 	return &Server{cfg: cfg, st: st}
 }
 
-// Run starts the HTTP server and blocks until it exits or ctx-like
-// shutdown is triggered elsewhere (the caller owns the *http.Server
-// lifecycle via Serve's returned error).
-func (s *Server) Run() error {
+// Run starts the HTTP server and blocks until ctx is cancelled or an error occurs.
+// When ctx is cancelled, it gracefully shuts down the server with a 5-second timeout.
+func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc(s.cfg.Path, s.handleSub)
 	mux.HandleFunc("/healthz", s.handleHealth)
 
+	httpSrv := &http.Server{
+		Addr:    s.cfg.Listen,
+		Handler: mux,
+	}
+
+	serverStopped := make(chan struct{})
+	shutdownDone := make(chan error, 1)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			shutdownDone <- httpSrv.Shutdown(shutdownCtx)
+		case <-serverStopped:
+			shutdownDone <- nil
+		}
+	}()
+
 	log.Printf("subserver: listening on %s%s", s.cfg.Listen, s.cfg.Path)
-	return http.ListenAndServe(s.cfg.Listen, mux)
+	err := httpSrv.ListenAndServe()
+	close(serverStopped)
+
+	if errors.Is(err, http.ErrServerClosed) {
+		return <-shutdownDone
+	}
+	<-shutdownDone
+	return err
 }
 
 func (s *Server) handleSub(w http.ResponseWriter, r *http.Request) {
