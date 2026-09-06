@@ -3,6 +3,7 @@
 package source
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -16,13 +17,25 @@ var httpClient = &http.Client{Timeout: 20 * time.Second}
 // FetchAll pulls every source URL and returns the deduplicated union
 // of all links found. A single failing source is logged by the
 // caller via the returned per-source error, not fatal to the others.
-func FetchAll(urls []string) (links []string, errs []error) {
+// If the context is cancelled, fetching stops immediately and the cancellation
+// error is returned.
+func FetchAll(ctx context.Context, urls []string) (links []string, errs []error) {
+	if err := ctx.Err(); err != nil {
+		return nil, []error{err}
+	}
 	seen := make(map[string]struct{})
 
 	for _, u := range urls {
-		raw, err := fetchOne(u)
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", u, err))
+			break
+		}
+		raw, err := fetchOne(ctx, u)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", u, err))
+			if ctx.Err() != nil {
+				break
+			}
 			continue
 		}
 		for _, link := range splitLinks(raw) {
@@ -37,13 +50,25 @@ func FetchAll(urls []string) (links []string, errs []error) {
 	return links, errs
 }
 
-func fetchOne(u string) (string, error) {
+func fetchOne(ctx context.Context, u string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(1 * time.Second)
+			timer := time.NewTimer(1 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return "", ctx.Err()
+			case <-timer.C:
+			}
 		}
-		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
 			return "", err // not retryable
 		}
@@ -51,6 +76,9 @@ func fetchOne(u string) (string, error) {
 
 		resp, err := httpClient.Do(req)
 		if err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
 			lastErr = err // network/TLS error → transient, retry
 			continue
 		}
@@ -59,6 +87,9 @@ func fetchOne(u string) (string, error) {
 			body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20)) // 32MB safety cap
 			resp.Body.Close()
 			if err != nil {
+				if ctx.Err() != nil {
+					return "", ctx.Err()
+				}
 				lastErr = err
 				continue
 			}
@@ -66,6 +97,9 @@ func fetchOne(u string) (string, error) {
 		}
 
 		resp.Body.Close()
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		statusErr := fmt.Errorf("unexpected status %d", resp.StatusCode)
 
 		// Only retry transient HTTP statuses: 429 and 5xx.

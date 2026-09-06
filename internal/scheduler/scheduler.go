@@ -72,7 +72,7 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 	log.Printf("scheduler: cycle starting")
 	cycleStart := time.Now()
 
-	links, fetchErrs := source.FetchAll(s.cfg.Sources)
+	links, fetchErrs := source.FetchAll(ctx, s.cfg.Sources)
 	for _, e := range fetchErrs {
 		log.Printf("scheduler: fetch error: %v", e)
 	}

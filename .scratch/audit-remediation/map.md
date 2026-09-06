@@ -14,6 +14,7 @@ Harden the `gemsub` core engine by resolving all critical blockers, concurrency 
 - [02: fix(tester): discard cancelled probe results](issues/02-discard-cancelled-probe-results.md): Discard probe outcomes when parent context is cancelled, preventing false inconclusive counter increments and store corruption.
 - [03: fix(subserver): add context and graceful shutdown](issues/03-add-context-and-graceful-shutdown.md): Add context lifecycle and 5-second graceful shutdown draining to subserver.Server, eliminating socket and goroutine leaks.
 - [04: build: enforce with_utls tags and clean config defaults](issues/04-enforce-with-utls-tags-and-clean-config-defaults.md): Provide root Makefile enforcing with_utls compilation and eliminate hardcoded personal repository fallbacks across config and publisher.
+- [05: feat(source): add context support to FetchAll](issues/05-add-context-support-to-fetchall.md): Propagate context through FetchAll and fetchOne with interruptible retry sleep and in-flight request cancellation.
 
 ## Not yet specified
 
