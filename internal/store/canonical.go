@@ -1,6 +1,7 @@
 package store
 
 import (
+	"net"
 	"net/url"
 	"slices"
 	"strings"
@@ -9,6 +10,7 @@ import (
 // CanonicalizeLink returns a deterministic, canonical representation of a share link
 // suitable for use as the authoritative key in the Store.
 // It lowercases the scheme and hostname, sorts query parameters and duplicate values,
+// preserves IPv6 bracket notation using net.JoinHostPort,
 // and trims whitespace from the fragment while preserving original credentials,
 // path, and fragment identity.
 func CanonicalizeLink(raw string) string {
@@ -38,12 +40,16 @@ func CanonicalizeLink(raw string) string {
 
 	u.Scheme = strings.ToLower(u.Scheme)
 
-	host := strings.ToLower(u.Hostname())
+	hostname := strings.ToLower(u.Hostname())
 	port := u.Port()
 	if port != "" {
-		u.Host = host + ":" + port
+		u.Host = net.JoinHostPort(hostname, port)
 	} else {
-		u.Host = host
+		if strings.Contains(hostname, ":") {
+			u.Host = "[" + hostname + "]"
+		} else {
+			u.Host = hostname
+		}
 	}
 
 	q := u.Query()

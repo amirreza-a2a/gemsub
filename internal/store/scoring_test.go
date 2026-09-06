@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -469,4 +470,328 @@ func TestScoring_Concurrency(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// TestScoringConfig_DefensiveCopyBothDirections verifies that mutating the input ScoringConfig
+// or the returned Config() map does not affect the store's internal state.
+func TestScoringConfig_DefensiveCopyBothDirections(t *testing.T) {
+	cfg := store.DefaultScoringConfig()
+	cfg.CategoryWeights[store.ErrTimeout] = 0.50
+
+	st := store.NewWithConfig(filepath.Join(t.TempDir(), "test.json"), cfg)
+
+	// Mutate original cfg map after store initialization
+	cfg.CategoryWeights[store.ErrTimeout] = 0.99
+
+	// Verify store's internal config was not mutated
+	retrieved := st.Config()
+	if retrieved.CategoryWeights[store.ErrTimeout] != 0.50 {
+		t.Fatalf("store config was mutated via external cfg map; expected 0.50, got %f", retrieved.CategoryWeights[store.ErrTimeout])
+	}
+
+	// Mutate the returned config map
+	retrieved.CategoryWeights[store.ErrTimeout] = 0.10
+
+	// Retrieve again and verify store's internal config was not mutated
+	retrieved2 := st.Config()
+	if retrieved2.CategoryWeights[store.ErrTimeout] != 0.50 {
+		t.Fatalf("store config was mutated via returned Config() map; expected 0.50, got %f", retrieved2.CategoryWeights[store.ErrTimeout])
+	}
+}
+
+// TestScoring_LatencyRankingPreservesLastValidPassed verifies that latency used for ranking
+// is taken exclusively from StatusPassed observations and non-passing probe durations do not overwrite it.
+func TestScoring_LatencyRankingPreservesLastValidPassed(t *testing.T) {
+	st := store.New(filepath.Join(t.TempDir(), "latency.json"), 2)
+
+	linkA := "vless://user@host-a.com:443#CandidateA"
+	linkB := "vless://user@host-b.com:443#CandidateB"
+
+	// linkA: Pass with 100ms
+	st.PutWithTransition(store.Result{
+		Link:     linkA,
+		Status:   store.StatusPassed,
+		Latency:  100 * time.Millisecond,
+		Category: store.ErrNone,
+	})
+	// linkB: Pass with 200ms
+	st.PutWithTransition(store.Result{
+		Link:     linkB,
+		Status:   store.StatusPassed,
+		Latency:  200 * time.Millisecond,
+		Category: store.ErrNone,
+	})
+
+	// Now linkA experiences an inconclusive probe with high timeout latency (4000ms)
+	st.PutWithTransition(store.Result{
+		Link:     linkA,
+		Status:   store.StatusInconclusive,
+		Latency:  4000 * time.Millisecond,
+		Category: store.ErrTimeout,
+	})
+
+	// And linkB experiences an inconclusive probe with high timeout latency (4000ms)
+	st.PutWithTransition(store.Result{
+		Link:     linkB,
+		Status:   store.StatusInconclusive,
+		Latency:  4000 * time.Millisecond,
+		Category: store.ErrTimeout,
+	})
+
+	// Both A and B have equal scores.
+	// linkA's ranking latency must remain 100ms (its last valid StatusPassed latency).
+	// linkB's ranking latency must remain 200ms.
+	// Therefore, linkA MUST rank before linkB!
+	ranked := st.PassingRanked()
+	if len(ranked) != 2 {
+		t.Fatalf("expected 2 ranked links, got %d", len(ranked))
+	}
+	if ranked[0] != linkA {
+		t.Errorf("expected linkA (100ms last passed latency) to rank ahead of linkB (200ms), got %s", ranked[0])
+	}
+
+	// Candidates that have never passed must rank behind candidates with at least one pass.
+	cfg := store.DefaultScoringConfig()
+	cfg.MinObservationsForServing = 1
+	cfg.MinServableScore = 0.30 // Allow inconclusive candidate with score 0.40 to be servable
+	st2 := store.NewWithConfig(filepath.Join(t.TempDir(), "latency2.json"), cfg)
+
+	linkProven := "vless://proven@host.com:443#Proven"
+	linkUnproven := "vless://unproven@host.com:443#Unproven"
+
+	// Proven: Pass at 500ms
+	st2.PutWithTransition(store.Result{
+		Link:     linkProven,
+		Status:   store.StatusPassed,
+		Latency:  500 * time.Millisecond,
+		Category: store.ErrNone,
+	})
+
+	// Unproven: Inconclusive at 10ms (never passed)
+	st2.PutWithTransition(store.Result{
+		Link:     linkUnproven,
+		Status:   store.StatusInconclusive,
+		Latency:  10 * time.Millisecond,
+		Category: store.ErrTimeout,
+	})
+
+	ranked2 := st2.PassingRanked()
+	if len(ranked2) != 2 {
+		t.Fatalf("expected 2 ranked links, got %d", len(ranked2))
+	}
+	if ranked2[0] != linkProven {
+		t.Errorf("expected proven link to rank ahead of unproven link regardless of latency, got 1st: %s, 2nd: %s", ranked2[0], ranked2[1])
+	}
+}
+
+// TestScoring_TargetPolicyOverride_ValidAndInvalidCombinations verifies that only StatusFailed
+// with target policy errors triggers Gate 2, whereas invalid combinations do not.
+func TestScoring_TargetPolicyOverride_ValidAndInvalidCombinations(t *testing.T) {
+	st := store.New(filepath.Join(t.TempDir(), "target_policy.json"), 2)
+
+	// Valid trigger: StatusFailed + ErrRegionBlocked -> Disqualified
+	linkBlocked := "vless://user@blocked.com:443#Blocked"
+	st.PutWithTransition(store.Result{
+		Link:     linkBlocked,
+		Status:   store.StatusFailed,
+		Category: store.ErrRegionBlocked,
+	})
+	rBlocked, _ := st.Get(linkBlocked)
+	if st.IsServable(rBlocked) {
+		t.Errorf("expected StatusFailed + ErrRegionBlocked to be disqualified by target policy override")
+	}
+
+	// Valid trigger: StatusFailed + ErrTargetDenied -> Disqualified
+	linkDenied := "vless://user@denied.com:443#Denied"
+	st.PutWithTransition(store.Result{
+		Link:     linkDenied,
+		Status:   store.StatusFailed,
+		Category: store.ErrTargetDenied,
+	})
+	rDenied, _ := st.Get(linkDenied)
+	if st.IsServable(rDenied) {
+		t.Errorf("expected StatusFailed + ErrTargetDenied to be disqualified by target policy override")
+	}
+
+	// Invalid combinations:
+	// A probe with StatusPassed but anomalous ErrRegionBlocked category (e.g. synthetic or malformed)
+	// must NOT be disqualified by Gate 2 (only StatusFailed with target errors triggers Gate 2).
+	linkPassWithAnomalousCat := "vless://user@anomalous.com:443#PassAnomalous"
+	for i := 0; i < 5; i++ {
+		st.PutWithTransition(store.Result{
+			Link:     linkPassWithAnomalousCat,
+			Status:   store.StatusPassed,
+			Category: store.ErrRegionBlocked,
+		})
+	}
+	rPass, _ := st.Get(linkPassWithAnomalousCat)
+	if !st.IsServable(rPass) {
+		t.Errorf("expected StatusPassed not to trigger target policy override even if Category was anomalous")
+	}
+
+	// An inconclusive probe with ErrRegionBlocked must NOT trigger target policy override.
+	linkInconclusive := "vless://user@inconclusive.com:443#Inconclusive"
+	for i := 0; i < 10; i++ {
+		st.PutWithTransition(store.Result{
+			Link:     linkInconclusive,
+			Status:   store.StatusPassed,
+			Category: store.ErrNone,
+		})
+	}
+	st.PutWithTransition(store.Result{
+		Link:     linkInconclusive,
+		Status:   store.StatusInconclusive,
+		Category: store.ErrRegionBlocked,
+	})
+	rInconclusive, _ := st.Get(linkInconclusive)
+	if !st.IsServable(rInconclusive) {
+		t.Errorf("expected StatusInconclusive not to trigger target policy override (requires StatusFailed)")
+	}
+}
+
+// TestScoring_LegacyV1MigrationDoesNotFabricateObservations verifies that V1 migration
+// does not synthesize historical passes, timestamps, or repeated inconclusive samples.
+func TestScoring_LegacyV1MigrationDoesNotFabricateObservations(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "v1_legacy.json")
+	v1Content := `{
+  "results": [
+    {
+      "link": "vless://user@host.com:443#InconclusiveNode",
+      "status": "inconclusive",
+      "category": "timeout",
+      "reason": "i/o timeout",
+      "latency": 3000000000,
+      "tested_at": "2026-09-01T12:00:00Z",
+      "attempts": 2,
+      "previously_passed": true,
+      "consecutive_inconclusive": 2
+    },
+    {
+      "link": "vless://user@host2.com:443#PassedNode",
+      "status": "passed",
+      "category": "none",
+      "reason": "ok",
+      "latency": 150000000,
+      "tested_at": "2026-09-01T12:00:00Z",
+      "attempts": 1,
+      "previously_passed": true,
+      "consecutive_inconclusive": 0
+    }
+  ],
+  "last_cycle": "2026-09-01T12:00:00Z",
+  "cycle_count": 5
+}`
+	if err := os.WriteFile(stateFile, []byte(v1Content), 0o644); err != nil {
+		t.Fatalf("failed to write v1 state: %v", err)
+	}
+
+	st := store.New(stateFile, 2)
+	if err := st.Load(); err != nil {
+		t.Fatalf("failed to load legacy v1 state: %v", err)
+	}
+
+	link1 := "vless://user@host.com:443#InconclusiveNode"
+	rec1, ok := st.GetRecord(link1)
+	if !ok {
+		t.Fatalf("expected record for %s", link1)
+	}
+
+	// Authoritative history invariant: strictly ONE authentic sample
+	if rec1.History.Count != 1 {
+		t.Fatalf("expected exactly 1 sample in history without fabricated passes/duplicates, got %d", rec1.History.Count)
+	}
+	sample1 := rec1.History.ChronologicalSamples()[0]
+	if sample1.Status != store.StatusInconclusive {
+		t.Errorf("expected sample status StatusInconclusive, got %s", sample1.Status)
+	}
+	if sample1.Category != store.ErrTimeout {
+		t.Errorf("expected sample category ErrTimeout, got %s", sample1.Category)
+	}
+	expectedTime, _ := time.Parse(time.RFC3339, "2026-09-01T12:00:00Z")
+	if !sample1.TestedAt.Equal(expectedTime) {
+		t.Errorf("expected exact authentic TestedAt %v, got %v", expectedTime, sample1.TestedAt)
+	}
+
+	// Preserved LKG servability: should be servable because previously_passed=true and consecutive_inconclusive=2 <= maxAbsentCycles (2)
+	if !st.IsServableRecord(rec1) {
+		t.Errorf("expected legacy record with LKG to remain servable until next probe cycle")
+	}
+
+	// Verify candidate 2
+	link2 := "vless://user@host2.com:443#PassedNode"
+	rec2, ok := st.GetRecord(link2)
+	if !ok {
+		t.Fatalf("expected record for %s", link2)
+	}
+	if rec2.History.Count != 1 {
+		t.Fatalf("expected exactly 1 sample in history for candidate 2, got %d", rec2.History.Count)
+	}
+	if rec2.LastPassedLatency != 150*time.Millisecond || !rec2.HasPassed {
+		t.Errorf("expected LastPassedLatency=150ms and HasPassed=true, got latency=%v hasPassed=%v", rec2.LastPassedLatency, rec2.HasPassed)
+	}
+}
+
+// TestScoring_MalformedV2SnapshotRecovery verifies that corrupted or malformed history
+// structs in a V2 snapshot are normalized without panicking on load or subsequent pushes.
+func TestScoring_MalformedV2SnapshotRecovery(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "malformed_v2.json")
+	link := "vless://user@host.com:443#Node"
+	malformedJSON := `{
+  "version": 2,
+  "cycle_count": 3,
+  "last_cycle": "2026-09-01T12:00:00Z",
+  "records": [
+    {
+      "canonical_link": "vless://user@host.com:443#Node",
+      "active_link": "vless://user@host.com:443#Node",
+      "score": 0.0,
+      "absent_cycles": 0,
+      "history": {
+        "capacity": 0,
+        "samples": null,
+        "count": -1,
+        "start": 5
+      }
+    }
+  ]
+}`
+	if err := os.WriteFile(stateFile, []byte(malformedJSON), 0o644); err != nil {
+		t.Fatalf("failed to write malformed state: %v", err)
+	}
+
+	st := store.New(stateFile, 2)
+	if err := st.Load(); err != nil {
+		t.Fatalf("Load() failed on malformed history: %v", err)
+	}
+
+	rec, ok := st.GetRecord(link)
+	if !ok {
+		t.Fatalf("failed to get candidate record")
+	}
+
+	// Invariants should be restored
+	if rec.History.Capacity != 10 {
+		t.Errorf("expected Capacity restored to default 10, got %d", rec.History.Capacity)
+	}
+	if len(rec.History.Samples) != 10 {
+		t.Errorf("expected Samples length 10, got %d", len(rec.History.Samples))
+	}
+	if rec.History.Count != 0 {
+		t.Errorf("expected Count clamped to 0, got %d", rec.History.Count)
+	}
+	if rec.History.Start != 0 {
+		t.Errorf("expected Start clamped to 0, got %d", rec.History.Start)
+	}
+
+	// Subsequent push must work cleanly without panic
+	st.PutWithTransition(store.Result{
+		Link:     link,
+		Status:   store.StatusPassed,
+		Category: store.ErrNone,
+	})
+
+	recAfter, _ := st.GetRecord(link)
+	if recAfter.History.Count != 1 {
+		t.Errorf("expected 1 sample after push, got %d", recAfter.History.Count)
+	}
 }

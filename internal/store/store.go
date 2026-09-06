@@ -6,6 +6,7 @@ package store
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"slices"
 	"sort"
@@ -92,6 +93,7 @@ func New(path string, maxInconclusiveCycles int) *Store {
 
 // NewWithConfig creates a Store with a custom ScoringConfig.
 func NewWithConfig(path string, cfg ScoringConfig) *Store {
+	cfg = cfg.Clone()
 	if cfg.HistoryCapacity <= 0 {
 		cfg.HistoryCapacity = 10
 	}
@@ -119,11 +121,11 @@ func NewWithConfig(path string, cfg ScoringConfig) *Store {
 	}
 }
 
-// Config returns a copy of the store's scoring configuration.
+// Config returns a deep copy of the store's scoring configuration.
 func (s *Store) Config() ScoringConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.cfg
+	return s.cfg.Clone()
 }
 
 // isServableRecordLocked evaluates the 4 operational policy gates for candidate servability.
@@ -143,14 +145,13 @@ func (s *Store) isServableRecordLocked(rec *CandidateRecord) bool {
 	}
 
 	// Gate 2: Target Policy Override
-	// Disqualified if latest conclusive target observation is ErrRegionBlocked or ErrTargetDenied.
-	if rec.Latest.Category == ErrRegionBlocked || rec.Latest.Category == ErrTargetDenied {
-		return false
-	}
+	// Disqualified if latest conclusive target observation is StatusFailed with ErrRegionBlocked or ErrTargetDenied.
 	if sample, ok := rec.History.LatestConclusive(); ok {
 		if sample.Status == StatusFailed && (sample.Category == ErrRegionBlocked || sample.Category == ErrTargetDenied) {
 			return false
 		}
+	} else if rec.Latest.Status == StatusFailed && (rec.Latest.Category == ErrRegionBlocked || rec.Latest.Category == ErrTargetDenied) {
+		return false
 	}
 
 	// Gate 3: Cold Start Gate
@@ -162,6 +163,11 @@ func (s *Store) isServableRecordLocked(rec *CandidateRecord) bool {
 	// Gate 4: Reliability Score Threshold Gate
 	// Disqualified if recency-weighted score is below threshold.
 	if rec.Score < s.cfg.MinServableScore {
+		// Legacy Last-Known-Good compatibility: if migrated from legacy state with prior pass
+		// and inconclusive count within limit, preserve servability until probed in new cycle.
+		if rec.Latest.Status == StatusInconclusive && rec.Latest.PreviouslyPassed && rec.Latest.ConsecutiveInconclusive <= s.cfg.MaxAbsentCycles && rec.History.Count == 1 {
+			return true
+		}
 		return false
 	}
 
@@ -228,23 +234,36 @@ func (s *Store) Load() error {
 			if rec.ActiveLink == "" && rec.CanonicalLink != "" {
 				rec.ActiveLink = rec.CanonicalLink
 			}
-			if rec.History.Capacity <= 0 {
-				rec.History.Capacity = s.cfg.HistoryCapacity
-			}
+			// Validate and normalize circular buffer invariants
+			rec.History.NormalizeAndValidate(s.cfg.HistoryCapacity)
+
+			// Repair pass for any fabricated samples from buggy 6d8f4ad
+			repairBuggyV2History(&rec.History)
+
 			// Recompute score deterministically from authoritative history on load
 			rec.Score = rec.History.ComputeScore(s.cfg.DecayLambda, s.cfg.CategoryWeights)
 
+			// Restore LastPassedLatency from history if not set
+			if rec.LastPassedLatency == 0 {
+				if lat, ok := rec.History.LastPassedLatency(); ok {
+					rec.LastPassedLatency = lat
+					rec.HasPassed = true
+				}
+			}
+
 			// Align projection semantics on latest Result
 			rec.Latest.Passed = (rec.Latest.Status == StatusPassed)
-			rec.Latest.PreviouslyPassed = rec.History.PreviouslyPassed()
-			rec.Latest.ConsecutiveInconclusive = rec.History.ConsecutiveInconclusive()
+			if rec.History.Count > 0 {
+				rec.Latest.PreviouslyPassed = rec.History.PreviouslyPassed()
+				rec.Latest.ConsecutiveInconclusive = rec.History.ConsecutiveInconclusive()
+			}
 
 			s.records[rec.CanonicalLink] = rec
 		}
 		return nil
 	}
 
-	// Legacy V1 migration
+	// Legacy V1 migration: strictly preserve actual observations without fabricating history
 	for _, r := range snap.Results {
 		if r.Status == "" {
 			if r.Passed {
@@ -277,6 +296,15 @@ func (s *Store) Load() error {
 			History:       NewBoundedHistory(s.cfg.HistoryCapacity),
 		}
 
+		attempts := r.Attempts
+		if attempts <= 0 {
+			attempts = 1
+		}
+
+		// Push EXACTLY ONE authentic probe sample representing the legacy result.
+		// DO NOT fabricate historical StatusPassed samples from PreviouslyPassed.
+		// DO NOT fabricate timestamps or status codes.
+		// DO NOT duplicate samples from ConsecutiveInconclusive.
 		sample := ProbeSample{
 			CycleID:    uint64(snap.CycleCount),
 			TestedAt:   r.TestedAt,
@@ -284,44 +312,57 @@ func (s *Store) Load() error {
 			Category:   r.Category,
 			StatusCode: r.StatusCode,
 			Latency:    r.Latency,
-			Attempts:   r.Attempts,
+			Attempts:   attempts,
 		}
-		if sample.Attempts <= 0 {
-			sample.Attempts = 1
-		}
+		rec.History.Push(sample)
 
-		if r.Status == StatusInconclusive {
-			if r.PreviouslyPassed {
-				rec.History.Push(ProbeSample{
-					CycleID:    uint64(snap.CycleCount),
-					TestedAt:   r.TestedAt.Add(-time.Minute),
-					Status:     StatusPassed,
-					Category:   ErrNone,
-					StatusCode: 200,
-					Attempts:   1,
-				})
-			}
-			inconclusiveCount := r.ConsecutiveInconclusive
-			if inconclusiveCount <= 0 {
-				inconclusiveCount = 1
-			}
-			for i := 0; i < inconclusiveCount; i++ {
-				rec.History.Push(sample)
-			}
-		} else {
-			rec.History.Push(sample)
+		if r.Status == StatusPassed {
+			rec.LastPassedLatency = r.Latency
+			rec.HasPassed = true
 		}
 
 		rec.Score = rec.History.ComputeScore(s.cfg.DecayLambda, s.cfg.CategoryWeights)
+
+		// Projection invariants: Passed reflects actual observation outcome
 		r.Passed = (r.Status == StatusPassed)
-		r.PreviouslyPassed = rec.History.PreviouslyPassed()
-		r.ConsecutiveInconclusive = rec.History.ConsecutiveInconclusive()
 		rec.Latest = r
+		// Preserve legacy LKG metadata on Latest for backward compatibility
+		rec.Latest.PreviouslyPassed = r.PreviouslyPassed
+		rec.Latest.ConsecutiveInconclusive = r.ConsecutiveInconclusive
 
 		s.records[canonical] = rec
 	}
 
 	return nil
+}
+
+func repairBuggyV2History(h *BoundedHistory) {
+	if h.Count <= 1 {
+		return
+	}
+	samples := h.ChronologicalSamples()
+	filtered := make([]ProbeSample, 0, len(samples))
+	for i := 0; i < len(samples); i++ {
+		isFabricated := false
+		if i+1 < len(samples) {
+			curr := samples[i]
+			next := samples[i+1]
+			if curr.Status == StatusPassed && curr.Category == ErrNone && curr.StatusCode == 200 &&
+				next.Status == StatusInconclusive && next.TestedAt.Sub(curr.TestedAt) == time.Minute {
+				isFabricated = true
+			}
+		}
+		if !isFabricated {
+			filtered = append(filtered, samples[i])
+		}
+	}
+	if len(filtered) != len(samples) {
+		h.Count = 0
+		h.Start = 0
+		for _, s := range filtered {
+			h.Push(s)
+		}
+	}
 }
 
 func deriveCategory(reason string, statusCode int) ErrorCategory {
@@ -470,6 +511,13 @@ func (s *Store) PutWithTransition(r Result) {
 	rec.History.Push(sample)
 	rec.Score = rec.History.ComputeScore(s.cfg.DecayLambda, s.cfg.CategoryWeights)
 
+	// Latency used for ranking must come only from StatusPassed observations.
+	// A failed or inconclusive probe must never replace the candidate's last valid successful latency.
+	if r.Status == StatusPassed {
+		rec.LastPassedLatency = r.Latency
+		rec.HasPassed = true
+	}
+
 	// Result projection invariants
 	r.Passed = (r.Status == StatusPassed)
 	r.PreviouslyPassed = rec.History.PreviouslyPassed()
@@ -559,20 +607,36 @@ func (s *Store) PassingRanked() []string {
 		activeLink string
 		score      float64
 		latency    time.Duration
+		hasPassed  bool
 	}
 
 	servable := make([]rankedRecord, 0, len(s.records))
 	for _, rec := range s.records {
 		if s.isServableRecordLocked(rec) {
+			lat := rec.LastPassedLatency
+			hasPassed := rec.HasPassed
+			if !hasPassed {
+				if l, ok := rec.History.LastPassedLatency(); ok {
+					lat = l
+					hasPassed = true
+				} else {
+					lat = time.Duration(math.MaxInt64)
+				}
+			}
 			servable = append(servable, rankedRecord{
 				activeLink: rec.ActiveLink,
 				score:      rec.Score,
-				latency:    rec.Latest.Latency,
+				latency:    lat,
+				hasPassed:  hasPassed,
 			})
 		}
 	}
 
 	sort.Slice(servable, func(i, j int) bool {
+		// Proven candidates (with at least one successful pass) always rank before unproven ones
+		if servable[i].hasPassed != servable[j].hasPassed {
+			return servable[i].hasPassed
+		}
 		if servable[i].score != servable[j].score {
 			return servable[i].score > servable[j].score // Score desc
 		}

@@ -188,3 +188,94 @@ func TestBoundedHistory_ConsecutiveInconclusive(t *testing.T) {
 		t.Errorf("expected reset to 0 after pass")
 	}
 }
+
+func TestBoundedHistory_NormalizeAndValidate(t *testing.T) {
+	// Case 1: Uninitialized struct (Capacity 0, Samples nil)
+	var h1 store.BoundedHistory
+	h1.NormalizeAndValidate(10)
+	if h1.Capacity != 10 || len(h1.Samples) != 10 || h1.Count != 0 || h1.Start != 0 {
+		t.Fatalf("h1 normalization failed: %+v", h1)
+	}
+	// Push must not panic
+	h1.Push(store.ProbeSample{Status: store.StatusPassed})
+	if h1.Count != 1 {
+		t.Errorf("expected count 1 after push, got %d", h1.Count)
+	}
+
+	// Case 2: len(Samples) != Capacity (mismatched length from malformed snapshot)
+	h2 := store.BoundedHistory{
+		Capacity: 5,
+		Count:    2,
+		Start:    0,
+		Samples:  []store.ProbeSample{{CycleID: 1, Status: store.StatusPassed}, {CycleID: 2, Status: store.StatusFailed}},
+	}
+	// Capacity is 5, but len(Samples) is 2
+	h2.NormalizeAndValidate(10)
+	if h2.Capacity != 5 || len(h2.Samples) != 5 {
+		t.Fatalf("h2 normalization failed: %+v", h2)
+	}
+	if h2.Count != 2 {
+		t.Fatalf("expected preserved count 2, got %d", h2.Count)
+	}
+	// Push 3 more to fill to 5 without panic
+	for i := uint64(3); i <= 5; i++ {
+		h2.Push(store.ProbeSample{CycleID: i, Status: store.StatusPassed})
+	}
+	if h2.Count != 5 {
+		t.Fatalf("expected count 5, got %d", h2.Count)
+	}
+	// 6th push triggers eviction
+	h2.Push(store.ProbeSample{CycleID: 6, Status: store.StatusPassed})
+	if h2.Count != 5 {
+		t.Fatalf("expected capped count 5, got %d", h2.Count)
+	}
+	samples := h2.ChronologicalSamples()
+	if samples[0].CycleID != 2 || samples[4].CycleID != 6 {
+		t.Fatalf("unexpected chronological samples: %+v", samples)
+	}
+
+	// Case 3: Out of bounds Start and Count
+	h3 := store.BoundedHistory{
+		Capacity: 3,
+		Count:    10, // exceeds capacity
+		Start:    -1, // invalid start
+		Samples:  make([]store.ProbeSample, 3),
+	}
+	h3.NormalizeAndValidate(3)
+	if h3.Count != 3 || h3.Start != 0 {
+		t.Fatalf("expected count clamped to 3 and start reset to 0: %+v", h3)
+	}
+}
+
+func TestBoundedHistory_LastPassedLatency(t *testing.T) {
+	h := store.NewBoundedHistory(5)
+
+	// Empty history
+	if _, ok := h.LastPassedLatency(); ok {
+		t.Errorf("expected false on empty history")
+	}
+
+	// Only failed/inconclusive samples
+	h.Push(store.ProbeSample{Status: store.StatusFailed, Latency: 500 * time.Millisecond})
+	h.Push(store.ProbeSample{Status: store.StatusInconclusive, Latency: 4000 * time.Millisecond})
+	if _, ok := h.LastPassedLatency(); ok {
+		t.Errorf("expected false when no StatusPassed sample exists")
+	}
+
+	// Add a StatusPassed sample
+	h.Push(store.ProbeSample{Status: store.StatusPassed, Latency: 120 * time.Millisecond})
+	lat, ok := h.LastPassedLatency()
+	if !ok || lat != 120*time.Millisecond {
+		t.Fatalf("expected 120ms, got %v (ok=%v)", lat, ok)
+	}
+
+	// Add subsequent inconclusive and failed samples
+	h.Push(store.ProbeSample{Status: store.StatusInconclusive, Latency: 4000 * time.Millisecond})
+	h.Push(store.ProbeSample{Status: store.StatusFailed, Latency: 300 * time.Millisecond})
+
+	// LastPassedLatency MUST still return 120ms
+	lat, ok = h.LastPassedLatency()
+	if !ok || lat != 120*time.Millisecond {
+		t.Fatalf("expected last passed latency to remain 120ms, got %v (ok=%v)", lat, ok)
+	}
+}

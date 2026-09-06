@@ -37,21 +37,67 @@ func NewBoundedHistory(capacity int) BoundedHistory {
 	}
 }
 
+// NormalizeAndValidate ensures all internal circular buffer invariants hold:
+// - Capacity > 0
+// - len(Samples) == Capacity
+// - 0 <= Count <= Capacity
+// - 0 <= Start < Capacity
+func (h *BoundedHistory) NormalizeAndValidate(defaultCapacity int) {
+	if defaultCapacity <= 0 {
+		defaultCapacity = 10
+	}
+	if h.Capacity <= 0 {
+		h.Capacity = defaultCapacity
+	}
+
+	if len(h.Samples) != h.Capacity {
+		newSamples := make([]ProbeSample, h.Capacity)
+		if h.Count > 0 && len(h.Samples) > 0 {
+			validCount := 0
+			start := h.Start
+			if start < 0 || start >= len(h.Samples) {
+				start = 0
+			}
+			for i := 0; i < h.Count && i < len(h.Samples) && validCount < h.Capacity; i++ {
+				idx := (start + i) % len(h.Samples)
+				newSamples[validCount] = h.Samples[idx]
+				validCount++
+			}
+			h.Count = validCount
+			h.Start = 0
+		} else {
+			h.Count = 0
+			h.Start = 0
+		}
+		h.Samples = newSamples
+	} else {
+		if h.Count < 0 {
+			h.Count = 0
+		} else if h.Count > h.Capacity {
+			h.Count = h.Capacity
+		}
+		if h.Start < 0 || h.Start >= h.Capacity {
+			h.Start = 0
+		}
+	}
+}
+
 // Clone returns a deep copy of the BoundedHistory with its own backing slice.
 func (h BoundedHistory) Clone() BoundedHistory {
 	cp := h
 	if len(h.Samples) > 0 {
 		cp.Samples = make([]ProbeSample, len(h.Samples))
 		copy(cp.Samples, h.Samples)
+	} else if h.Capacity > 0 {
+		cp.Samples = make([]ProbeSample, h.Capacity)
 	}
 	return cp
 }
 
 // Push adds a new probe sample to the circular buffer, evicting the oldest sample if capacity is reached.
 func (h *BoundedHistory) Push(sample ProbeSample) {
-	if h.Capacity <= 0 {
-		h.Capacity = 10
-		h.Samples = make([]ProbeSample, h.Capacity)
+	if h.Capacity <= 0 || len(h.Samples) != h.Capacity {
+		h.NormalizeAndValidate(h.Capacity)
 	}
 
 	if h.Count < h.Capacity {
@@ -63,6 +109,21 @@ func (h *BoundedHistory) Push(sample ProbeSample) {
 		h.Samples[h.Start] = sample
 		h.Start = (h.Start + 1) % h.Capacity
 	}
+}
+
+// LastPassedLatency returns the latency of the most recent StatusPassed sample,
+// or false if no StatusPassed sample exists in history.
+func (h *BoundedHistory) LastPassedLatency() (time.Duration, bool) {
+	if h.Count == 0 {
+		return 0, false
+	}
+	for i := h.Count - 1; i >= 0; i-- {
+		idx := (h.Start + i) % h.Capacity
+		if h.Samples[idx].Status == StatusPassed {
+			return h.Samples[idx].Latency, true
+		}
+	}
+	return 0, false
 }
 
 // ChronologicalSamples returns all valid samples ordered from oldest to newest.

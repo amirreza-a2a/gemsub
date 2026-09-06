@@ -11,6 +11,19 @@ type ScoringConfig struct {
 	AttemptPenaltyMultiplier   float64                       `json:"attempt_penalty_multiplier"`
 }
 
+// Clone returns a deep copy of ScoringConfig, duplicating map fields to prevent aliasing.
+func (c ScoringConfig) Clone() ScoringConfig {
+	cp := c
+	if c.CategoryWeights != nil {
+		weights := make(map[ErrorCategory]float64, len(c.CategoryWeights))
+		for k, v := range c.CategoryWeights {
+			weights[k] = v
+		}
+		cp.CategoryWeights = weights
+	}
+	return cp
+}
+
 // DefaultScoringConfig returns the frozen default policy configuration.
 func DefaultScoringConfig() ScoringConfig {
 	weights := map[ErrorCategory]float64{

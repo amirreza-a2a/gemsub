@@ -19,6 +19,7 @@ Harden the `gemsub` core engine by resolving all critical blockers, concurrency 
 - [07: refactor(logging): decouple logging with log/slog](issues/07-decouple-logging-with-slog.md): Replace legacy logging with log/slog across engine packages and implement in-memory RingLogHandler for UI mode alongside timestamped standard handler for headless mode.
 - [08: feat(events): implement event bus for scheduler and tester](issues/08-implement-event-bus.md): Implement thread-safe EventBus emitting typed progress and lifecycle events without blocking probe loop.
 - [09: feat(store): implement reliability scoring engine with bounded history](issues/09-implement-reliability-scoring-engine.md): Implement bounded history circular buffer, recency-weighted scoring, four servability policy gates, absence lifecycle, and V2 persistence.
+- [10: fix(store): remediate reliability scoring engine defects](issues/10-remediate-reliability-scoring-engine-defects.md): Remediate observation fabrication in legacy migration, latency ranking preservation, config aliasing, IPv6 formatting, and persistence invariants.
 
 ## Not yet specified
 
