@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"golang.org/x/time/rate"
@@ -35,6 +36,18 @@ func TestNormalizeText(t *testing.T) {
 			input:    "\u201cNot available in your region\u201d",
 			expected: "\"not available in your region\"",
 		},
+		{
+			input:    "   Leading and trailing whitespace   \n\t  ",
+			expected: "leading and trailing whitespace",
+		},
+		{
+			input:    "Hello &amp; welcome &lt;to&gt; &quot;Gemini&#39;s&quot; world&#x2019;s best &nbsp; tool",
+			expected: "hello & welcome <to> \"gemini's\" world's best tool",
+		},
+		{
+			input:    "<style>.css { color: red; }</style>Content <!-- comment --> remains",
+			expected: "content remains",
+		},
 	}
 
 	for _, c := range cases {
@@ -42,6 +55,15 @@ func TestNormalizeText(t *testing.T) {
 		if got != c.expected {
 			t.Errorf("NormalizeText(%q) = %q; want %q", c.input, got, c.expected)
 		}
+	}
+}
+
+func TestNormalizeBytes(t *testing.T) {
+	input := []byte("<style>body{}</style>Gemini isn&rsquo;t supported &amp; available <!-- comment --> in Iran.")
+	expected := "gemini isn't supported & available in iran."
+	got := tester.NormalizeBytes(input)
+	if got != expected {
+		t.Errorf("NormalizeBytes() = %q; want %q", got, expected)
 	}
 }
 
@@ -371,5 +393,98 @@ func TestClassifyResponse_RealGeminiPageWithAdminUrl_Passes(t *testing.T) {
 	if res.Status != store.StatusPassed {
 		t.Errorf("expected real Gemini page with admin fallback URL to pass, got status=%s category=%s reason=%q",
 			res.Status, res.Category, res.Reason)
+	}
+}
+
+func TestClassifyResponse_Large1MBPayload_MaintainsPrecision(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Server": []string{"ESF"}},
+	}
+	blockPhrases := []string{"isn\u2019t currently supported in your country"}
+
+	var sb strings.Builder
+	sb.WriteString("<!doctype html><html><head><title>Google Gemini</title><style>")
+	for sb.Len() < 500*1024 {
+		sb.WriteString("body { margin: 0; padding: 0; font-family: 'Google Sans'; }\n")
+	}
+	sb.WriteString("</style><script>window.WIZ_global_data = {\"vXmutd\":\"%.@.\\\"US\\\",\\\"ZZ\\\",\\\"2u255g\\\\u003d\\\\u003d\\\"]\"};</script></head><body><div id=\"bardchatui\">")
+	for sb.Len() < 1<<20 {
+		sb.WriteString("<p>Welcome to Google Gemini AI service.</p>\n")
+	}
+	sb.WriteString("</div></body></html>")
+	clean1MB := []byte(sb.String())
+
+	resClean := tester.ClassifyResponse(resp, clean1MB, blockPhrases)
+	if resClean.Status != store.StatusPassed {
+		t.Errorf("expected clean 1MB Gemini payload to pass, got status=%s category=%s reason=%q",
+			resClean.Status, resClean.Category, resClean.Reason)
+	}
+
+	blockedCountry1MB := []byte(strings.Replace(string(clean1MB), `\"US\"`, `\"IR\"`, 1))
+	resBlockedCountry := tester.ClassifyResponse(resp, blockedCountry1MB, blockPhrases)
+	if resBlockedCountry.Status != store.StatusFailed || resBlockedCountry.Category != store.ErrRegionBlocked {
+		t.Errorf("expected 1MB blocked country payload to fail with ErrRegionBlocked, got status=%s category=%s",
+			resBlockedCountry.Status, resBlockedCountry.Category)
+	}
+
+	blockedPhrase1MB := []byte(strings.Replace(string(clean1MB), "Welcome to Google Gemini AI service.", "Gemini isn’t currently supported in your country.", 1))
+	resBlockedPhrase := tester.ClassifyResponse(resp, blockedPhrase1MB, blockPhrases)
+	if resBlockedPhrase.Status != store.StatusFailed || resBlockedPhrase.Category != store.ErrRegionBlocked {
+		t.Errorf("expected 1MB regional block phrase payload to fail with ErrRegionBlocked, got status=%s category=%s",
+			resBlockedPhrase.Status, resBlockedPhrase.Category)
+	}
+}
+
+func BenchmarkNormalizeText_1MB(b *testing.B) {
+	snippet := "<div class=\"content\">Gemini isn\u2019t supported &amp; &#8217;available&#8217; in region \u201cXYZ\u201d.\n\t  Lots   of    spaces   and\tnewlines.\n</div>\n"
+	var sb strings.Builder
+	for sb.Len() < 1<<20 {
+		sb.WriteString(snippet)
+	}
+	payload := sb.String()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = tester.NormalizeText(payload)
+	}
+}
+
+func BenchmarkNormalizeBytes_1MB(b *testing.B) {
+	snippet := "<div class=\"content\">Gemini isn\u2019t supported &amp; &#8217;available&#8217; in region \u201cXYZ\u201d.\n\t  Lots   of    spaces   and\tnewlines.\n</div>\n"
+	var sb strings.Builder
+	for sb.Len() < 1<<20 {
+		sb.WriteString(snippet)
+	}
+	payload := []byte(sb.String())
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = tester.NormalizeBytes(payload)
+	}
+}
+
+func BenchmarkClassifyResponse_1MB(b *testing.B) {
+	snippet := "<div class=\"content\">Gemini isn\u2019t supported &amp; &#8217;available&#8217; in region \u201cXYZ\u201d.\n\t  Lots   of    spaces   and\tnewlines.\n</div>\n"
+	var sb strings.Builder
+	sb.WriteString("<!doctype html><html><head><title>Google Gemini</title></head><body><div id=\"bardchatui\">")
+	for sb.Len() < 1<<20 {
+		sb.WriteString(snippet)
+	}
+	sb.WriteString("</div></body></html>")
+	payload := []byte(sb.String())
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Server": []string{"ESF"}},
+	}
+	blockPhrases := []string{"isn't currently supported in your country"}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = tester.ClassifyResponse(resp, payload, blockPhrases)
 	}
 }
