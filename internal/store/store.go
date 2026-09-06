@@ -242,12 +242,14 @@ func (s *Store) Load() error {
 			// Recompute score deterministically from authoritative history on load
 			rec.Score = rec.History.ComputeScore(s.cfg.DecayLambda, s.cfg.CategoryWeights)
 
-			// Restore LastPassedLatency from history if not set
-			if rec.LastPassedLatency == 0 {
-				if lat, ok := rec.History.LastPassedLatency(); ok {
-					rec.LastPassedLatency = lat
-					rec.HasPassed = true
-				}
+			// Recompute HasPassed and LastPassedLatency deterministically from authoritative history on load,
+			// treating persisted values as derived/cache data.
+			if lat, ok := rec.History.LastPassedLatency(); ok {
+				rec.LastPassedLatency = lat
+				rec.HasPassed = true
+			} else {
+				rec.LastPassedLatency = 0
+				rec.HasPassed = false
 			}
 
 			// Align projection semantics on latest Result
@@ -482,11 +484,16 @@ func (s *Store) PutWithTransition(r Result) {
 	rec.History.Push(sample)
 	rec.Score = rec.History.ComputeScore(s.cfg.DecayLambda, s.cfg.CategoryWeights)
 
-	// Latency used for ranking must come only from StatusPassed observations.
-	// A failed or inconclusive probe must never replace the candidate's last valid successful latency.
-	if r.Status == StatusPassed {
-		rec.LastPassedLatency = r.Latency
+	// Derive HasPassed and LastPassedLatency dynamically from authoritative history.
+	// Ranking latency derives strictly from the most recent StatusPassed sample currently
+	// present in the active bounded history window. If all successful observations have been
+	// evicted from active history, HasPassed becomes false and LastPassedLatency is reset to 0.
+	if lat, ok := rec.History.LastPassedLatency(); ok {
+		rec.LastPassedLatency = lat
 		rec.HasPassed = true
+	} else {
+		rec.LastPassedLatency = 0
+		rec.HasPassed = false
 	}
 
 	// Result projection invariants
@@ -602,12 +609,7 @@ func (s *Store) PassingRanked() []string {
 			lat := rec.LastPassedLatency
 			hasPassed := rec.HasPassed
 			if !hasPassed {
-				if l, ok := rec.History.LastPassedLatency(); ok {
-					lat = l
-					hasPassed = true
-				} else {
-					lat = time.Duration(math.MaxInt64)
-				}
+				lat = time.Duration(math.MaxInt64)
 			}
 			servable = append(servable, rankedRecord{
 				activeLink: rec.ActiveLink,

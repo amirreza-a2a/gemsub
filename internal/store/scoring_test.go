@@ -1075,3 +1075,112 @@ func TestScoring_StartCycle_NormalFinishCycleCommitsReset(t *testing.T) {
 		t.Fatalf("expected AbsentCycles committed to 0 after normal FinishCycle, got %d", recB.AbsentCycles)
 	}
 }
+
+// TestScoring_HasPassedAndLatencyDerivedFromAuthoritativeHistory verifies that HasPassed
+// and LastPassedLatency are derived strictly from active BoundedHistory. When all passes
+// are evicted by subsequent failures, HasPassed becomes false, LastPassedLatency resets to 0,
+// PassingRanked treats the candidate as unproven, and Save -> Load reconstructs these fields.
+func TestScoring_HasPassedAndLatencyDerivedFromAuthoritativeHistory(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "history_derivation.json")
+
+	cfg := store.DefaultScoringConfig()
+	cfg.HistoryCapacity = 2
+	cfg.MinObservationsForServing = 1
+	cfg.MinServableScore = 0.05 // Keep servable after failures to verify ranking precedence
+
+	st := store.NewWithConfig(stateFile, cfg)
+
+	linkA := "vless://user@host-a.com:443#CandidateA"
+	linkProven := "vless://user@host-proven.com:443#CandidateProven"
+
+	// Proven candidate: 1 pass at 500ms
+	st.PutWithTransition(store.Result{
+		Link:     linkProven,
+		Status:   store.StatusPassed,
+		Latency:  500 * time.Millisecond,
+		Category: store.ErrNone,
+	})
+
+	// Sequence for CandidateA: Pass(100ms) -> Pass(200ms)
+	st.PutWithTransition(store.Result{
+		Link:     linkA,
+		Status:   store.StatusPassed,
+		Latency:  100 * time.Millisecond,
+		Category: store.ErrNone,
+	})
+	st.PutWithTransition(store.Result{
+		Link:     linkA,
+		Status:   store.StatusPassed,
+		Latency:  200 * time.Millisecond,
+		Category: store.ErrNone,
+	})
+
+	recA, ok := st.GetRecord(linkA)
+	if !ok || !recA.HasPassed || recA.LastPassedLatency != 200*time.Millisecond {
+		t.Fatalf("expected HasPassed=true and LastPassedLatency=200ms after passes, got hasPassed=%v lat=%v", recA.HasPassed, recA.LastPassedLatency)
+	}
+
+	// 1st Failure: buffer has [Pass(200ms), Fail]
+	st.PutWithTransition(store.Result{
+		Link:     linkA,
+		Status:   store.StatusFailed,
+		Latency:  300 * time.Millisecond,
+		Category: store.ErrConnRefused,
+	})
+	recA, _ = st.GetRecord(linkA)
+	if !recA.HasPassed || recA.LastPassedLatency != 200*time.Millisecond {
+		t.Fatalf("expected HasPassed=true and LastPassedLatency=200ms while 1 pass remains, got hasPassed=%v lat=%v", recA.HasPassed, recA.LastPassedLatency)
+	}
+
+	// 2nd Failure: buffer has [Fail, Fail] -> both passes are now EVICTED!
+	st.PutWithTransition(store.Result{
+		Link:     linkA,
+		Status:   store.StatusFailed,
+		Latency:  400 * time.Millisecond,
+		Category: store.ErrConnRefused,
+	})
+
+	recA, _ = st.GetRecord(linkA)
+	// HasPassed must become false and LastPassedLatency must become 0
+	if recA.HasPassed {
+		t.Errorf("CRITICAL VIOLATION: HasPassed must be false when all passes are evicted from history!")
+	}
+	if recA.LastPassedLatency != 0 {
+		t.Errorf("expected LastPassedLatency=0 after eviction, got %v", recA.LastPassedLatency)
+	}
+
+	// In PassingRanked(), linkA is now unproven (HasPassed == false), so it must sort AFTER linkProven
+	ranked := st.PassingRanked()
+	if len(ranked) != 2 {
+		t.Fatalf("expected 2 servable candidates, got %d", len(ranked))
+	}
+	if ranked[0] != linkProven {
+		t.Errorf("expected proven candidate %s to rank 1st ahead of unproven %s, got %s", linkProven, linkA, ranked[0])
+	}
+
+	// Save state and reload into fresh store
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save() failed: %v", err)
+	}
+
+	st2 := store.NewWithConfig(stateFile, cfg)
+	if err := st2.Load(); err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+
+	recA2, ok := st2.GetRecord(linkA)
+	if !ok {
+		t.Fatalf("record for linkA not found after reload")
+	}
+	if recA2.HasPassed {
+		t.Errorf("expected HasPassed=false reconstructed from history on Load, got true")
+	}
+	if recA2.LastPassedLatency != 0 {
+		t.Errorf("expected LastPassedLatency=0 reconstructed from history on Load, got %v", recA2.LastPassedLatency)
+	}
+
+	ranked2 := st2.PassingRanked()
+	if len(ranked2) != 2 || ranked2[0] != linkProven {
+		t.Errorf("expected proven candidate to remain 1st after reload, got %+v", ranked2)
+	}
+}

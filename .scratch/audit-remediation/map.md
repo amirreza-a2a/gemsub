@@ -21,6 +21,7 @@ Harden the `gemsub` core engine by resolving all critical blockers, concurrency 
 - [09: feat(store): implement reliability scoring engine with bounded history](issues/09-implement-reliability-scoring-engine.md): Implement bounded history circular buffer, recency-weighted scoring, four servability policy gates, absence lifecycle, and V2 persistence.
 - [10: fix(store): remediate reliability scoring engine defects](issues/10-remediate-reliability-scoring-engine-defects.md): Remediate observation fabrication in legacy migration, latency ranking preservation, config aliasing, IPv6 formatting, and persistence invariants. Note on ranking policy: `PassingRanked()` prioritizes proven candidates (`HasPassed == true`) ahead of unproven ones (`HasPassed == false`) before comparing Score and Latency, preventing unproven candidates from ranking above proven ones.
 - [11: fix(store): remediate history repair, capacity clamping, and cycle transactions](issues/11-remediate-v2-history-repair-and-cycle-transactions.md): Remove automatic history repair heuristic from normal Load, clamp persisted history capacity to configured maximum, and make cycle absence transitions fully transactional across StartCycle and FinishCycle.
+- [12: fix(store): derive HasPassed and LastPassedLatency from authoritative history](issues/12-derive-has-passed-from-authoritative-history.md): Keep HasPassed and LastPassedLatency dynamically derived from BoundedHistory; reset when passes are evicted from active window and recompute on Load.
 
 ## Not yet specified
 
