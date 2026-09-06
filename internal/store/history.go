@@ -38,16 +38,24 @@ func NewBoundedHistory(capacity int) BoundedHistory {
 }
 
 // NormalizeAndValidate ensures all internal circular buffer invariants hold:
-// - Capacity > 0
+// - Capacity is clamped to [1, maxCapacity] (defaulting to 10 if maxCapacity <= 0)
 // - len(Samples) == Capacity
 // - 0 <= Count <= Capacity
 // - 0 <= Start < Capacity
-func (h *BoundedHistory) NormalizeAndValidate(defaultCapacity int) {
-	if defaultCapacity <= 0 {
-		defaultCapacity = 10
+//
+// Design decision: The store's sliding-window capacity N is an engine-level policy
+// defined by ScoringConfig.HistoryCapacity. Persisted capacity from snapshots is never
+// trusted as-is; it is clamped to maxCapacity (the store's configured HistoryCapacity).
+// This prevents corrupted or malicious state files from triggering massive unbounded slice
+// allocations (e.g. make([]ProbeSample, 1_000_000_000)) while allowing sane per-record
+// sample depths up to the configured limit, and ensures FIFO preservation of the most
+// recent samples when resizing.
+func (h *BoundedHistory) NormalizeAndValidate(maxCapacity int) {
+	if maxCapacity <= 0 {
+		maxCapacity = 10
 	}
-	if h.Capacity <= 0 {
-		h.Capacity = defaultCapacity
+	if h.Capacity <= 0 || h.Capacity > maxCapacity {
+		h.Capacity = maxCapacity
 	}
 
 	if len(h.Samples) != h.Capacity {
@@ -58,7 +66,12 @@ func (h *BoundedHistory) NormalizeAndValidate(defaultCapacity int) {
 			if start < 0 || start >= len(h.Samples) {
 				start = 0
 			}
-			for i := 0; i < h.Count && i < len(h.Samples) && validCount < h.Capacity; i++ {
+			// When shrinking buffer capacity, preserve the most recent h.Capacity samples
+			skip := 0
+			if h.Count > h.Capacity {
+				skip = h.Count - h.Capacity
+			}
+			for i := skip; i < h.Count && i < len(h.Samples) && validCount < h.Capacity; i++ {
 				idx := (start + i) % len(h.Samples)
 				newSamples[validCount] = h.Samples[idx]
 				validCount++

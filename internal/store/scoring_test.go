@@ -210,16 +210,18 @@ func TestScoring_AbsenceLifecycleAndReappearance(t *testing.T) {
 
 	// Cycle 2: B reappears in upstream!
 	st.StartCycle(map[string]struct{}{linkA: {}, linkB: {}})
-	recB, ok = st.GetRecord(linkB)
-	if !ok || recB.AbsentCycles != 0 {
-		t.Fatalf("expected linkB AbsentCycles reset to 0 upon reappearance, got %+v", recB)
-	}
 
 	// Because B reappeared and its history was preserved, it is immediately servable!
 	if len(st.Passing()) != 2 {
 		t.Fatalf("expected both linkA and linkB in Passing() after reappearance, got %v", st.Passing())
 	}
 	st.FinishCycle()
+
+	// FinishCycle commits the absence reset to 0
+	recB, ok = st.GetRecord(linkB)
+	if !ok || recB.AbsentCycles != 0 {
+		t.Fatalf("expected linkB AbsentCycles committed to 0 after FinishCycle, got %+v", recB)
+	}
 }
 
 // TestScoring_CycleAbortAndSkippedProbes verifies that aborted cycles do not commit absence,
@@ -793,5 +795,283 @@ func TestScoring_MalformedV2SnapshotRecovery(t *testing.T) {
 	recAfter, _ := st.GetRecord(link)
 	if recAfter.History.Count != 1 {
 		t.Errorf("expected 1 sample after push, got %d", recAfter.History.Count)
+	}
+}
+
+// TestScoring_LegitimateHistoryNotMutatedOnLoad asserts that normal Load() does NOT mutate
+// or prune a legitimate history containing a real Passed(200)-then-Inconclusive(+60s) probe sequence.
+func TestScoring_LegitimateHistoryNotMutatedOnLoad(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "legit_history.json")
+	link := "vless://user@host.com:443#LegitNode"
+
+	t0, _ := time.Parse(time.RFC3339, "2026-09-01T12:00:00Z")
+	t1 := t0.Add(time.Minute) // exactly 60s later
+
+	v2JSON := fmt.Sprintf(`{
+  "version": 2,
+  "cycle_count": 5,
+  "last_cycle": "2026-09-01T12:01:00Z",
+  "records": [
+    {
+      "canonical_link": "%s",
+      "active_link": "%s",
+      "score": 0.8,
+      "absent_cycles": 0,
+      "history": {
+        "capacity": 10,
+        "count": 2,
+        "start": 0,
+        "samples": [
+          {
+            "cycle_id": 4,
+            "tested_at": "%s",
+            "status": "passed",
+            "category": "none",
+            "status_code": 200,
+            "latency": 100000000,
+            "attempts": 1
+          },
+          {
+            "cycle_id": 5,
+            "tested_at": "%s",
+            "status": "inconclusive",
+            "category": "none",
+            "status_code": 200,
+            "latency": 4000000000,
+            "attempts": 1
+          }
+        ]
+      },
+      "latest": {
+        "link": "%s",
+        "status": "inconclusive",
+        "passed": false,
+        "latency": 4000000000,
+        "tested_at": "%s"
+      }
+    }
+  ]
+}`, link, link, t0.Format(time.RFC3339), t1.Format(time.RFC3339), link, t1.Format(time.RFC3339))
+
+	if err := os.WriteFile(stateFile, []byte(v2JSON), 0o644); err != nil {
+		t.Fatalf("failed to write state file: %v", err)
+	}
+
+	st := store.New(stateFile, 2)
+	if err := st.Load(); err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+
+	rec, ok := st.GetRecord(link)
+	if !ok {
+		t.Fatalf("record not found")
+	}
+
+	// Invariant: Both samples MUST be preserved!
+	if rec.History.Count != 2 {
+		t.Fatalf("expected count 2, got %d (genuine samples must never be deleted by Load)", rec.History.Count)
+	}
+	samples := rec.History.ChronologicalSamples()
+	if len(samples) != 2 {
+		t.Fatalf("expected 2 chronological samples, got %d", len(samples))
+	}
+	if samples[0].Status != store.StatusPassed || samples[0].StatusCode != 200 {
+		t.Errorf("expected sample 0 to be Passed with code 200, got status=%s code=%d", samples[0].Status, samples[0].StatusCode)
+	}
+	if samples[1].Status != store.StatusInconclusive || !samples[1].TestedAt.Equal(t1) {
+		t.Errorf("expected sample 1 to be Inconclusive at %v, got status=%s testedAt=%v", t1, samples[1].Status, samples[1].TestedAt)
+	}
+}
+
+// TestScoring_AbsurdCapacitySnapshotClampedOnLoad asserts that an absurdly large persisted capacity
+// is clamped to the store's configured HistoryCapacity and loads into a bounded, valid buffer.
+func TestScoring_AbsurdCapacitySnapshotClampedOnLoad(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "absurd_capacity.json")
+	link := "vless://user@host.com:443#Node"
+
+	v2JSON := fmt.Sprintf(`{
+  "version": 2,
+  "cycle_count": 1,
+  "last_cycle": "2026-09-01T12:00:00Z",
+  "records": [
+    {
+      "canonical_link": "%s",
+      "active_link": "%s",
+      "score": 1.0,
+      "absent_cycles": 0,
+      "history": {
+        "capacity": 1000000000,
+        "count": 1,
+        "start": 0,
+        "samples": [
+          {
+            "cycle_id": 1,
+            "tested_at": "2026-09-01T12:00:00Z",
+            "status": "passed",
+            "category": "none",
+            "latency": 100000000,
+            "attempts": 1
+          }
+        ]
+      },
+      "latest": {
+        "link": "%s",
+        "status": "passed",
+        "passed": true,
+        "latency": 100000000,
+        "tested_at": "2026-09-01T12:00:00Z"
+      }
+    }
+  ]
+}`, link, link, link)
+
+	if err := os.WriteFile(stateFile, []byte(v2JSON), 0o644); err != nil {
+		t.Fatalf("failed to write state file: %v", err)
+	}
+
+	st := store.New(stateFile, 2)
+	if err := st.Load(); err != nil {
+		t.Fatalf("Load() failed on absurd capacity: %v", err)
+	}
+
+	rec, ok := st.GetRecord(link)
+	if !ok {
+		t.Fatalf("record not found")
+	}
+
+	// Persisted capacity 1,000,000,000 must be clamped to configured HistoryCapacity (10)
+	if rec.History.Capacity != 10 {
+		t.Errorf("expected Capacity clamped to 10, got %d", rec.History.Capacity)
+	}
+	if len(rec.History.Samples) != 10 {
+		t.Errorf("expected Samples backing slice length 10, got %d", len(rec.History.Samples))
+	}
+	if rec.History.Count != 1 {
+		t.Errorf("expected Count 1, got %d", rec.History.Count)
+	}
+
+	// Subsequent push must work cleanly
+	st.PutWithTransition(store.Result{
+		Link:     link,
+		Status:   store.StatusPassed,
+		Category: store.ErrNone,
+	})
+	recAfter, _ := st.GetRecord(link)
+	if recAfter.History.Count != 2 {
+		t.Errorf("expected Count 2 after push, got %d", recAfter.History.Count)
+	}
+}
+
+// TestScoring_StartCycleReappearance_AbortPreservesAbsentCycles verifies that if a candidate
+// reappears in StartCycle but the cycle is aborted before FinishCycle, AbsentCycles remains unchanged.
+func TestScoring_StartCycleReappearance_AbortPreservesAbsentCycles(t *testing.T) {
+	st := store.New(filepath.Join(t.TempDir(), "abort1.json"), 2)
+	linkA := "vless://user@host-a.com:443#NodeA"
+	linkB := "vless://user@host-b.com:443#NodeB"
+
+	st.PutWithTransition(store.Result{Link: linkA, Status: store.StatusPassed})
+	st.PutWithTransition(store.Result{Link: linkB, Status: store.StatusPassed})
+	st.FinishCycle()
+
+	// Cycle 1: linkB is absent -> FinishCycle increments AbsentCycles to 1
+	st.StartCycle(map[string]struct{}{linkA: {}})
+	st.FinishCycle()
+
+	recB, _ := st.GetRecord(linkB)
+	if recB.AbsentCycles != 1 {
+		t.Fatalf("expected AbsentCycles=1 after cycle 1, got %d", recB.AbsentCycles)
+	}
+
+	// Cycle 2: linkB reappears in StartCycle, BUT cycle aborts (FinishCycle is NEVER called)
+	st.StartCycle(map[string]struct{}{linkA: {}, linkB: {}})
+
+	// In active cycle: B is servable because it reappeared in upstream
+	if len(st.Passing()) != 2 {
+		t.Fatalf("expected 2 passing during active cycle, got %d", len(st.Passing()))
+	}
+	// BUT its committed record state must NOT be mutated yet!
+	recB, _ = st.GetRecord(linkB)
+	if recB.AbsentCycles != 1 {
+		t.Fatalf("expected uncommitted AbsentCycles=1 during active cycle before FinishCycle, got %d", recB.AbsentCycles)
+	}
+
+	// Cycle aborts! Instead of FinishCycle, a new cycle begins without B:
+	st.StartCycle(map[string]struct{}{linkA: {}})
+
+	recB, _ = st.GetRecord(linkB)
+	if recB.AbsentCycles != 1 {
+		t.Fatalf("expected AbsentCycles=1 preserved after cycle abort, got %d", recB.AbsentCycles)
+	}
+}
+
+// TestScoring_PutWithTransition_AbortPreservesAbsentCycles verifies that if a candidate
+// is probed in PutWithTransition but the cycle aborts before FinishCycle, AbsentCycles remains unchanged.
+func TestScoring_PutWithTransition_AbortPreservesAbsentCycles(t *testing.T) {
+	st := store.New(filepath.Join(t.TempDir(), "abort2.json"), 2)
+	linkA := "vless://user@host-a.com:443#NodeA"
+	linkB := "vless://user@host-b.com:443#NodeB"
+
+	st.PutWithTransition(store.Result{Link: linkA, Status: store.StatusPassed})
+	st.PutWithTransition(store.Result{Link: linkB, Status: store.StatusPassed})
+	st.FinishCycle()
+
+	// Cycle 1: linkB missing -> AbsentCycles=1
+	st.StartCycle(map[string]struct{}{linkA: {}})
+	st.FinishCycle()
+
+	recB, _ := st.GetRecord(linkB)
+	if recB.AbsentCycles != 1 {
+		t.Fatalf("expected AbsentCycles=1 after cycle 1, got %d", recB.AbsentCycles)
+	}
+
+	// Cycle 2: linkB was not in StartCycle, but a probe arrives via PutWithTransition
+	st.StartCycle(map[string]struct{}{linkA: {}})
+	st.PutWithTransition(store.Result{Link: linkB, Status: store.StatusPassed})
+
+	// During cycle: B was probed so it's servable
+	if len(st.Passing()) != 2 {
+		t.Fatalf("expected 2 passing after probe during active cycle, got %d", len(st.Passing()))
+	}
+	// BUT committed AbsentCycles is still 1 until FinishCycle commits it
+	recB, _ = st.GetRecord(linkB)
+	if recB.AbsentCycles != 1 {
+		t.Fatalf("expected uncommitted AbsentCycles=1 before FinishCycle, got %d", recB.AbsentCycles)
+	}
+
+	// Cycle aborts! Next cycle starts without B:
+	st.StartCycle(map[string]struct{}{linkA: {}})
+	recB, _ = st.GetRecord(linkB)
+	if recB.AbsentCycles != 1 {
+		t.Fatalf("expected AbsentCycles=1 preserved after cycle abort, got %d", recB.AbsentCycles)
+	}
+}
+
+// TestScoring_StartCycle_NormalFinishCycleCommitsReset verifies that upon normal FinishCycle,
+// absence resets for reappeared candidates are atomically committed.
+func TestScoring_StartCycle_NormalFinishCycleCommitsReset(t *testing.T) {
+	st := store.New(filepath.Join(t.TempDir(), "commit.json"), 2)
+	linkA := "vless://user@host-a.com:443#NodeA"
+	linkB := "vless://user@host-b.com:443#NodeB"
+
+	st.PutWithTransition(store.Result{Link: linkA, Status: store.StatusPassed})
+	st.PutWithTransition(store.Result{Link: linkB, Status: store.StatusPassed})
+	st.FinishCycle()
+
+	// Cycle 1: linkB missing -> AbsentCycles=1
+	st.StartCycle(map[string]struct{}{linkA: {}})
+	st.FinishCycle()
+
+	recB, _ := st.GetRecord(linkB)
+	if recB.AbsentCycles != 1 {
+		t.Fatalf("expected AbsentCycles=1 after cycle 1, got %d", recB.AbsentCycles)
+	}
+
+	// Cycle 2: linkB reappears in StartCycle and completes normally
+	st.StartCycle(map[string]struct{}{linkA: {}, linkB: {}})
+	st.FinishCycle()
+
+	recB, _ = st.GetRecord(linkB)
+	if recB.AbsentCycles != 0 {
+		t.Fatalf("expected AbsentCycles committed to 0 after normal FinishCycle, got %d", recB.AbsentCycles)
 	}
 }

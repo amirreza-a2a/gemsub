@@ -71,14 +71,15 @@ type Snapshot struct {
 
 // Store is safe for concurrent use.
 type Store struct {
-	mu            sync.RWMutex
-	records       map[string]*CandidateRecord // keyed by CanonicalLink
-	pendingAbsent map[string]struct{}         // candidates absent in current active cycle
-	lastCycle     time.Time
-	cycleCount    int
-	cycleID       uint64
-	path          string
-	cfg           ScoringConfig
+	mu             sync.RWMutex
+	records        map[string]*CandidateRecord // keyed by CanonicalLink
+	pendingAbsent  map[string]struct{}         // candidates absent in current active cycle
+	pendingPresent map[string]struct{}         // candidates confirmed present in current active cycle
+	lastCycle      time.Time
+	cycleCount     int
+	cycleID        uint64
+	path           string
+	cfg            ScoringConfig
 }
 
 // New creates an empty store bound to the given snapshot file path and retention policy.
@@ -114,10 +115,11 @@ func NewWithConfig(path string, cfg ScoringConfig) *Store {
 	}
 
 	return &Store{
-		records:       make(map[string]*CandidateRecord),
-		pendingAbsent: make(map[string]struct{}),
-		path:          path,
-		cfg:           cfg,
+		records:        make(map[string]*CandidateRecord),
+		pendingAbsent:  make(map[string]struct{}),
+		pendingPresent: make(map[string]struct{}),
+		path:           path,
+		cfg:            cfg,
 	}
 }
 
@@ -136,11 +138,11 @@ func (s *Store) isServableRecordLocked(rec *CandidateRecord) bool {
 	}
 
 	// Gate 1: Source Presence Gate
-	// Disqualified if absent from upstream in previous completed cycles or in active cycle.
-	if rec.AbsentCycles > 0 {
+	// Disqualified if candidate is absent in active cycle or absent from upstream without reappearing.
+	if _, pending := s.pendingAbsent[rec.CanonicalLink]; pending {
 		return false
 	}
-	if _, pending := s.pendingAbsent[rec.CanonicalLink]; pending {
+	if _, present := s.pendingPresent[rec.CanonicalLink]; !present && rec.AbsentCycles > 0 {
 		return false
 	}
 
@@ -237,9 +239,6 @@ func (s *Store) Load() error {
 			// Validate and normalize circular buffer invariants
 			rec.History.NormalizeAndValidate(s.cfg.HistoryCapacity)
 
-			// Repair pass for any fabricated samples from buggy 6d8f4ad
-			repairBuggyV2History(&rec.History)
-
 			// Recompute score deterministically from authoritative history on load
 			rec.Score = rec.History.ComputeScore(s.cfg.DecayLambda, s.cfg.CategoryWeights)
 
@@ -334,35 +333,6 @@ func (s *Store) Load() error {
 	}
 
 	return nil
-}
-
-func repairBuggyV2History(h *BoundedHistory) {
-	if h.Count <= 1 {
-		return
-	}
-	samples := h.ChronologicalSamples()
-	filtered := make([]ProbeSample, 0, len(samples))
-	for i := 0; i < len(samples); i++ {
-		isFabricated := false
-		if i+1 < len(samples) {
-			curr := samples[i]
-			next := samples[i+1]
-			if curr.Status == StatusPassed && curr.Category == ErrNone && curr.StatusCode == 200 &&
-				next.Status == StatusInconclusive && next.TestedAt.Sub(curr.TestedAt) == time.Minute {
-				isFabricated = true
-			}
-		}
-		if !isFabricated {
-			filtered = append(filtered, samples[i])
-		}
-	}
-	if len(filtered) != len(samples) {
-		h.Count = 0
-		h.Start = 0
-		for _, s := range filtered {
-			h.Push(s)
-		}
-	}
 }
 
 func deriveCategory(reason string, statusCode int) ErrorCategory {
@@ -485,9 +455,10 @@ func (s *Store) PutWithTransition(r Result) {
 	// Update active serving representation to match the link used
 	rec.ActiveLink = r.Link
 
-	// Candidate was probed in current cycle: clear absence state
+	// Candidate was probed in current cycle: mark pending present and clear pending absent.
+	// Note: AbsentCycles reset to 0 is deferred until FinishCycle() to ensure cycle-level atomicity.
 	delete(s.pendingAbsent, canonical)
-	rec.AbsentCycles = 0
+	s.pendingPresent[canonical] = struct{}{}
 
 	testedAt := r.TestedAt
 	if testedAt.IsZero() {
@@ -538,8 +509,9 @@ func (s *Store) Put(r Result) {
 }
 
 // StartCycle marks the beginning of a new test cycle. Candidates present in currentLinks
-// have their absence counter reset to 0. Candidates missing from currentLinks are marked
-// pending-absent; their absence counters are only incremented upon successful FinishCycle.
+// are marked pending-present (retaining servability without prematurely mutating record state).
+// Candidates missing from currentLinks are marked pending-absent. Absence increments and resets
+// are only committed atomically to candidate records upon successful FinishCycle.
 func (s *Store) StartCycle(currentLinks map[string]struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -550,9 +522,10 @@ func (s *Store) StartCycle(currentLinks map[string]struct{}) {
 	}
 
 	s.pendingAbsent = make(map[string]struct{})
-	for canonical, rec := range s.records {
+	s.pendingPresent = make(map[string]struct{}, len(canonicalPresent))
+	for canonical := range s.records {
 		if _, ok := canonicalPresent[canonical]; ok {
-			rec.AbsentCycles = 0
+			s.pendingPresent[canonical] = struct{}{}
 		} else {
 			s.pendingAbsent[canonical] = struct{}{}
 		}
@@ -560,7 +533,8 @@ func (s *Store) StartCycle(currentLinks map[string]struct{}) {
 }
 
 // FinishCycle records that a full test cycle completed. It commits absence increments
-// for pending-absent candidates and evicts those exceeding MaxAbsentCycles.
+// for pending-absent candidates (evicting those exceeding MaxAbsentCycles) and commits
+// absence resets for candidates confirmed present during the cycle.
 func (s *Store) FinishCycle() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -575,7 +549,15 @@ func (s *Store) FinishCycle() {
 			delete(s.records, canonical)
 		}
 	}
+
+	for canonical := range s.pendingPresent {
+		if rec, exists := s.records[canonical]; exists {
+			rec.AbsentCycles = 0
+		}
+	}
+
 	s.pendingAbsent = make(map[string]struct{})
+	s.pendingPresent = make(map[string]struct{})
 	s.lastCycle = time.Now()
 	s.cycleCount++
 	s.cycleID++
@@ -596,9 +578,13 @@ func (s *Store) Passing() []string {
 	return out
 }
 
-// PassingRanked returns the active links of all servable candidates,
-// sorted primarily by reliability score descending, then by latency ascending,
-// and finally by active link for determinism.
+// PassingRanked returns the active links of all servable candidates.
+// Ranking policy precedence:
+//  1. Proven candidates (HasPassed == true) strictly outrank unproven candidates (HasPassed == false),
+//     preventing candidates without confirmed passes from outranking proven ones via score or latency.
+//  2. Reliability score descending.
+//  3. Last passed latency ascending (unproven candidates sort worst at math.MaxInt64).
+//  4. ActiveLink ascending for deterministic tie-breaking.
 func (s *Store) PassingRanked() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

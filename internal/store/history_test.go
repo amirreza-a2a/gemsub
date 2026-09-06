@@ -245,6 +245,32 @@ func TestBoundedHistory_NormalizeAndValidate(t *testing.T) {
 	if h3.Count != 3 || h3.Start != 0 {
 		t.Fatalf("expected count clamped to 3 and start reset to 0: %+v", h3)
 	}
+
+	// Case 4: Absurdly large capacity clamped to configured maximum
+	h4 := store.BoundedHistory{
+		Capacity: 1_000_000_000,
+		Count:    0,
+		Samples:  nil,
+	}
+	h4.NormalizeAndValidate(10)
+	if h4.Capacity != 10 || len(h4.Samples) != 10 {
+		t.Fatalf("expected capacity clamped to 10 and len(Samples)==10, got capacity=%d len=%d", h4.Capacity, len(h4.Samples))
+	}
+
+	// Case 5: Shrinking capacity preserves most recent samples in FIFO order
+	h5 := store.NewBoundedHistory(5)
+	for i := uint64(1); i <= 5; i++ {
+		h5.Push(store.ProbeSample{CycleID: i, Status: store.StatusPassed})
+	}
+	// Shrink capacity from 5 to 3
+	h5.NormalizeAndValidate(3)
+	if h5.Capacity != 3 || len(h5.Samples) != 3 || h5.Count != 3 {
+		t.Fatalf("expected h5 clamped to 3, got %+v", h5)
+	}
+	chron5 := h5.ChronologicalSamples()
+	if len(chron5) != 3 || chron5[0].CycleID != 3 || chron5[1].CycleID != 4 || chron5[2].CycleID != 5 {
+		t.Fatalf("expected preserved most recent samples [3, 4, 5], got %+v", chron5)
+	}
 }
 
 func TestBoundedHistory_LastPassedLatency(t *testing.T) {

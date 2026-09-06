@@ -90,6 +90,34 @@ func TestCanonicalizeLink_IPv6ParserCompatibility(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeLink_IPv6ZoneIdentifiers(t *testing.T) {
+	// RFC 6874 standard percent-encoded zone identifier (%25eth0)
+	rawValidZone := "vless://11111111-1111-1111-1111-111111111111@[fe80::1%25eth0]:443?type=tcp#IPv6-Zone"
+	canonicalValid := store.CanonicalizeLink(rawValidZone)
+	if canonicalValid != rawValidZone {
+		t.Errorf("expected canonical valid zone to match %q, got %q", rawValidZone, canonicalValid)
+	}
+	cand, err := parser.Parse(canonicalValid)
+	if err != nil {
+		t.Fatalf("parser.Parse failed for valid RFC 6874 IPv6 zone link %q: %v", canonicalValid, err)
+	}
+	if cand.Outbound.Type != "vless" {
+		t.Fatalf("expected outbound type vless, got %s", cand.Outbound.Type)
+	}
+
+	// Literal unencoded zone identifier (%eth0) - violates RFC 6874
+	rawInvalidZone := "vless://11111111-1111-1111-1111-111111111111@[fe80::1%eth0]:443?type=tcp#IPv6-Invalid"
+	canonicalInvalid := store.CanonicalizeLink(rawInvalidZone)
+	// CanonicalizeLink must not panic; it falls back safely to raw link
+	if canonicalInvalid != rawInvalidZone {
+		t.Errorf("expected fallback for unparseable raw link, got %q", canonicalInvalid)
+	}
+	// parser.Parse predictably rejects the malformed URI
+	if _, err := parser.Parse(canonicalInvalid); err == nil {
+		t.Errorf("expected parser.Parse to reject unencoded literal zone identifier %%eth0")
+	}
+}
+
 func TestCanonicalizeLink_ParserCompatibility(t *testing.T) {
 	rawLinks := []string{
 		"vless://11111111-1111-1111-1111-111111111111@example.com:443?flow=xtls-rprx-vision&fp=chrome&host=example.com&path=%2Fws&pbk=pubkey123&security=reality&sid=1234&sni=example.com&type=ws#US-01",
