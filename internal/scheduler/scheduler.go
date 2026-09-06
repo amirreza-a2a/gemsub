@@ -78,6 +78,11 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 	}
 	log.Printf("scheduler: %d raw links fetched", len(links))
 
+	if len(links) == 0 && len(fetchErrs) > 0 {
+		log.Printf("scheduler: fetch failed (%d error(s), 0 links); aborting cycle without updating store or publishing", len(fetchErrs))
+		return
+	}
+
 	var candidates []parser.Candidate
 	linkSet := make(map[string]struct{}, len(links))
 	for _, link := range links {
