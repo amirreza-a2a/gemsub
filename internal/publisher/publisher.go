@@ -7,7 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -127,7 +127,7 @@ func (p *Publisher) RenderSubscriptionFiles() (map[string][]byte, Metadata) {
 	}
 
 	if len(otherLinks) > 0 {
-		log.Printf("publisher: notice: %d servable candidate(s) with other protocols (e.g. ss://) included in all.txt but excluded from protocol-specific files", len(otherLinks))
+		slog.Warn("publisher: notice: servable candidate(s) with other protocols excluded from protocol-specific files", "count", len(otherLinks))
 	}
 
 	stats := p.st.Stats()
@@ -271,7 +271,7 @@ func (p *Publisher) Publish(ctx context.Context) error {
 		return err
 	}
 
-	log.Printf("publisher: generating subscription files")
+	slog.Info("publisher: generating subscription files")
 	files, meta := p.RenderSubscriptionFiles()
 
 	// Check if all subscription files on disk already match the newly rendered ones.
@@ -342,19 +342,19 @@ func (p *Publisher) Publish(ctx context.Context) error {
 
 	if hasStagedChanges {
 		// Commit staged changes
-		log.Printf("publisher: committing publication update")
+		slog.Info("publisher: committing publication update")
 		commitMsg := "chore: update generated subscriptions"
 		if _, err := p.git.Run(ctx, repoDir, "commit", "-m", commitMsg); err != nil {
 			return fmt.Errorf("publisher: git commit failed: %w", err)
 		}
 
 		// Push to branch
-		log.Printf("publisher: pushing to origin/%s", branch)
+		slog.Info("publisher: pushing to origin", "branch", branch)
 		if _, err := p.git.Run(ctx, repoDir, "push", "origin", branch); err != nil {
 			return fmt.Errorf("publisher: git push failed: %w", err)
 		}
 
-		log.Printf("publisher: publish completed")
+		slog.Info("publisher: publish completed")
 		return nil
 	}
 
@@ -365,16 +365,16 @@ func (p *Publisher) Publish(ctx context.Context) error {
 	}
 
 	if !ahead {
-		log.Printf("publisher: no changes")
+		slog.Info("publisher: no changes")
 		return nil
 	}
 
 	// Local branch has unpushed publication commit(s); retry push without creating another commit
-	log.Printf("publisher: unpushed commits detected, pushing to origin/%s", branch)
+	slog.Info("publisher: unpushed commits detected", "branch", branch)
 	if _, err := p.git.Run(ctx, repoDir, "push", "origin", branch); err != nil {
 		return fmt.Errorf("publisher: git push failed: %w", err)
 	}
 
-	log.Printf("publisher: publish completed")
+	slog.Info("publisher: publish completed")
 	return nil
 }

@@ -7,18 +7,22 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"gemsub/internal/config"
+	"gemsub/internal/logging"
 	"gemsub/internal/scheduler"
 	"gemsub/internal/store"
 	"gemsub/internal/subserver"
 )
 
 func main() {
+	// Initialize default standard terminal logging during bootstrap
+	logging.Setup(true, 1000, os.Stderr)
+
 	configPath := flag.String("config", "./config.json", "path to config file")
 	headless := flag.Bool("headless", false, "run without the TUI (daemon + sub server only)")
 	probeLimit := flag.Int("limit", 0, "limit number of parsed candidates to probe per cycle (0 = unlimited)")
@@ -27,7 +31,8 @@ func main() {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		slog.Error("config load failed", "err", err)
+		os.Exit(1)
 	}
 	if *headless {
 		cfg.Headless = true
@@ -40,15 +45,19 @@ func main() {
 			cfg.Publishing.Enabled = *publish
 			if *publish {
 				if err := cfg.Validate(); err != nil {
-					log.Fatalf("config: %v", err)
+					slog.Error("config validation failed", "err", err)
+					os.Exit(1)
 				}
 			}
 		}
 	})
 
+	// Configure handler based on headless / TUI mode
+	logging.Setup(cfg.Headless, 1000, os.Stderr)
+
 	st := store.New(cfg.StateFile, cfg.Test.MaxInconclusiveCycles)
 	if err := st.Load(); err != nil {
-		log.Printf("warning: could not load previous state: %v", err)
+		slog.Warn("could not load previous state", "err", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -58,7 +67,7 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sig
-		log.Println("shutting down...")
+		slog.Info("shutting down...")
 		cancel()
 	}()
 
@@ -68,7 +77,8 @@ func main() {
 	srv := subserver.New(&cfg.Serve, st)
 	go func() {
 		if err := srv.Run(ctx); err != nil {
-			log.Fatalf("subserver: %v", err)
+			slog.Error("subserver error", "err", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -81,6 +91,6 @@ func main() {
 	// writing to sched.Trigger for a manual "refresh now" action.
 	// Until that's wired up, headless mode is what you want:
 	//   gemsub -headless -config config.json
-	log.Println("TUI not wired up yet — running headless. Use -headless to silence this note.")
+	slog.Info("TUI not wired up yet — running headless. Use -headless to silence this note.")
 	<-ctx.Done()
 }

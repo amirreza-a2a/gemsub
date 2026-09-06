@@ -8,7 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,7 +53,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}()
 
-	log.Printf("subserver: listening on %s%s", s.cfg.Listen, s.cfg.Path)
+	slog.Info("subserver: listening", "addr", s.cfg.Listen, "path", s.cfg.Path)
 	err := httpSrv.ListenAndServe()
 	close(serverStopped)
 

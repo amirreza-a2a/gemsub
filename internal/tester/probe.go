@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
@@ -48,6 +49,7 @@ func Probe(ctx context.Context, cand parser.Candidate, cfg *config.TestConfig, l
 
 // ProbeWithExecutor runs the probe retry loop using a custom attempt executor.
 func ProbeWithExecutor(ctx context.Context, cand parser.Candidate, cfg *config.TestConfig, limiter *rate.Limiter, exec AttemptFunc) store.Result {
+	slog.Debug("tester: probing candidate", "link", cand.Link, "tag", cand.Outbound.Tag)
 	start := time.Now()
 	result := store.Result{
 		Link:     cand.Link,
@@ -68,6 +70,7 @@ func ProbeWithExecutor(ctx context.Context, cand parser.Candidate, cfg *config.T
 				result.Reason = "probe context cancelled while waiting for attempt rate limiter token"
 				result.Attempts = attempt + 1
 				result.Latency = time.Since(start)
+				slog.Debug("tester: probe completed", "link", result.Link, "status", result.Status, "attempts", result.Attempts, "latency", result.Latency)
 				return result
 			}
 		}
@@ -82,12 +85,14 @@ func ProbeWithExecutor(ctx context.Context, cand parser.Candidate, cfg *config.T
 
 		// Calculate backoff with jitter and honor Retry-After
 		backoff := computeBackoff(cfg.RetryBackoff, attempt, retryAfter)
+		slog.Debug("tester: retrying probe", "link", cand.Link, "attempt", attempt+1, "backoff", backoff, "category", lastClassResult.Category)
 		select {
 		case <-ctx.Done():
 			result.Status = store.StatusInconclusive
 			result.Category = store.ErrTimeout
 			result.Reason = "probe context cancelled during retry backoff"
 			result.Latency = time.Since(start)
+			slog.Debug("tester: probe completed", "link", result.Link, "status", result.Status, "attempts", result.Attempts, "latency", result.Latency)
 			return result
 		case <-time.After(backoff):
 			// Proceed to next attempt
@@ -106,6 +111,7 @@ func ProbeWithExecutor(ctx context.Context, cand parser.Candidate, cfg *config.T
 	}
 
 	result.Latency = time.Since(start)
+	slog.Debug("tester: probe completed", "link", result.Link, "status", result.Status, "attempts", result.Attempts, "latency", result.Latency)
 	return result
 }
 

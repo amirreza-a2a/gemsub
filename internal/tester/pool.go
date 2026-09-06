@@ -2,6 +2,7 @@ package tester
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
 	"golang.org/x/time/rate"
@@ -23,6 +24,7 @@ func RunPool(ctx context.Context, candidates []parser.Candidate, cfg *config.Tes
 
 // RunPoolWithRunner runs the pool using a custom probe runner function.
 func RunPoolWithRunner(ctx context.Context, candidates []parser.Candidate, cfg *config.TestConfig, runner ProbeRunner, onResult func(store.Result)) bool {
+	slog.Debug("tester: starting probe pool", "candidates", len(candidates), "concurrency", cfg.Concurrency)
 	var limiter *rate.Limiter
 	if cfg.RateLimitRPS > 0 {
 		// Conservative burst of 2 to smooth traffic and prevent CDN/proxy hammering.

@@ -6,7 +6,7 @@ package scheduler
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -69,17 +69,17 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 func (s *Scheduler) runCycle(ctx context.Context) {
-	log.Printf("scheduler: cycle starting")
+	slog.Info("scheduler: cycle starting")
 	cycleStart := time.Now()
 
 	links, fetchErrs := source.FetchAll(ctx, s.cfg.Sources)
 	for _, e := range fetchErrs {
-		log.Printf("scheduler: fetch error: %v", e)
+		slog.Error("scheduler: fetch error", "err", e)
 	}
-	log.Printf("scheduler: %d raw links fetched", len(links))
+	slog.Info("scheduler: raw links fetched", "count", len(links))
 
 	if len(links) == 0 && len(fetchErrs) > 0 {
-		log.Printf("scheduler: fetch failed (%d error(s), 0 links); aborting cycle without updating store or publishing", len(fetchErrs))
+		slog.Warn("scheduler: fetch failed; aborting cycle without updating store or publishing", "errors", len(fetchErrs), "links", 0)
 		return
 	}
 
@@ -97,7 +97,7 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 	if s.cfg.ProbeLimit > 0 && len(candidates) > s.cfg.ProbeLimit {
 		candidates = candidates[:s.cfg.ProbeLimit]
 	}
-	log.Printf("scheduler: selected %d of %d parsed candidates for probing", len(candidates), totalParsed)
+	slog.Info("scheduler: selected candidates for probing", "selected", len(candidates), "total", totalParsed)
 
 	// Drop stale results for links no longer present in this cycle's
 	// source, so a config removed upstream also disappears from what
@@ -125,33 +125,33 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 	})
 
 	if !completed || ctx.Err() != nil {
-		log.Printf("scheduler: cycle cancelled/interrupted after %s; saving partial state without incrementing cycle_count",
-			time.Since(cycleStart).Round(time.Second))
+		slog.Warn("scheduler: cycle cancelled/interrupted; saving partial state without incrementing cycle_count",
+			"duration", time.Since(cycleStart).Round(time.Second))
 		if err := s.st.Save(); err != nil {
-			log.Printf("scheduler: save state failed: %v", err)
+			slog.Error("scheduler: save state failed", "err", err)
 		}
 		return
 	}
 
 	s.st.FinishCycle()
 	if err := s.st.Save(); err != nil {
-		log.Printf("scheduler: save state failed: %v", err)
+		slog.Error("scheduler: save state failed", "err", err)
 	}
 
 	stats := s.st.Stats()
-	log.Printf("scheduler: cycle done in %s — %d passed, %d failed (region_blocked: %d, timeout: %d), %d inconclusive (%d servable to throne)",
-		time.Since(cycleStart).Round(time.Second),
-		stats.Passed,
-		stats.Failed,
-		atomic.LoadInt64(&regionBlocked),
-		atomic.LoadInt64(&timeout),
-		stats.Inconclusive,
-		stats.Servable,
+	slog.Info("scheduler: cycle done",
+		"duration", time.Since(cycleStart).Round(time.Second),
+		"passed", stats.Passed,
+		"failed", stats.Failed,
+		"region_blocked", atomic.LoadInt64(&regionBlocked),
+		"timeout", atomic.LoadInt64(&timeout),
+		"inconclusive", stats.Inconclusive,
+		"servable", stats.Servable,
 	)
 
 	if s.pub != nil {
 		if err := s.pub.Publish(ctx); err != nil {
-			log.Printf("scheduler: publish failed: %v", err)
+			slog.Error("scheduler: publish failed", "err", err)
 		}
 	}
 }
