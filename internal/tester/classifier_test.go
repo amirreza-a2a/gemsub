@@ -1,8 +1,11 @@
 package tester_test
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"testing"
 
 	"golang.org/x/time/rate"
@@ -68,9 +71,47 @@ func TestClassifyDialError(t *testing.T) {
 		t.Errorf("expected non-retryable timeout, got %+v", resTimeout)
 	}
 
+	resDeadline := tester.ClassifyDialError(errors.New("context deadline exceeded"))
+	if resDeadline.Category != store.ErrTimeout || resDeadline.Retryable || resDeadline.Status != store.StatusFailed {
+		t.Errorf("expected genuine deadline exceeded to fail with ErrTimeout, got %+v", resDeadline)
+	}
+
 	resReality := tester.ClassifyDialError(errors.New("reality verification failed"))
 	if resReality.Category != store.ErrReality || resReality.Retryable || resReality.Status != store.StatusFailed {
 		t.Errorf("expected non-retryable reality error, got %+v", resReality)
+	}
+}
+
+func TestClassifyDialError_ContextCanceled(t *testing.T) {
+	testCases := []struct {
+		name string
+		err  error
+	}{
+		{"standard context.Canceled", context.Canceled},
+		{"wrapped url.Error context.Canceled", &url.Error{Op: "Get", URL: "https://gemini.google.com/app", Err: context.Canceled}},
+		{"fmt wrapped context.Canceled", fmt.Errorf("read response body: %w", context.Canceled)},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := tester.ClassifyDialError(tc.err)
+
+			if res.Category == store.ErrProxyError {
+				t.Errorf("context cancellation must NOT be misclassified as ErrProxyError: got %+v", res)
+			}
+			if res.Category != store.ErrTimeout {
+				t.Errorf("expected category ErrTimeout, got %s", res.Category)
+			}
+			if res.Status != store.StatusInconclusive {
+				t.Errorf("expected StatusInconclusive, got %s", res.Status)
+			}
+			if res.Reason != "context canceled" {
+				t.Errorf("expected reason 'context canceled', got %q", res.Reason)
+			}
+			if res.Retryable {
+				t.Errorf("cancelled probe should not be retryable")
+			}
+		})
 	}
 }
 

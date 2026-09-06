@@ -49,6 +49,9 @@ func RunPoolWithRunner(ctx context.Context, candidates []parser.Candidate, cfg *
 			defer func() { <-sem }()
 
 			result := runner(ctx, c, cfg, limiter)
+			if ctx.Err() != nil {
+				return
+			}
 			onResult(result)
 		}(cand)
 	}

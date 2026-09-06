@@ -1,7 +1,7 @@
 # 02: fix(tester): discard cancelled probe results
 
 Type: task
-Status: open
+Status: resolved
 Blocked by: None (can start immediately)
 
 ## Question
@@ -14,6 +14,12 @@ In `RunPool` / `Probe`, if context cancellation is detected (`ctx.Err() != nil` 
 
 ## Acceptance criteria
 
-- [ ] Cancelled probes are not passed to `onResult` or `Store.PutWithTransition`.
-- [ ] `ConsecutiveInconclusive` counter is not incremented on interrupted runs.
-- [ ] Unit tests verify that context cancellation during probe execution preserves store state.
+- [x] Cancelled probes are not passed to `onResult` or `Store.PutWithTransition`.
+- [x] `ConsecutiveInconclusive` counter is not incremented on interrupted runs.
+- [x] Unit tests verify that context cancellation during probe execution preserves store state.
+
+## Answer
+
+1. In `internal/tester/pool.go`, added `if ctx.Err() != nil { return }` immediately after `runner` completes to drop cancelled probe outcomes before invoking `onResult(result)`.
+2. In `internal/tester/classifier.go`, added explicit handling for `context.Canceled` (standard, wrapped, and stringified) in `ClassifyDialError`, returning `StatusInconclusive` with `Reason: "context canceled"` instead of misclassifying as `ErrProxyError`.
+3. Verified via regression tests in `internal/tester/pool_test.go` and `internal/tester/classifier_test.go`.

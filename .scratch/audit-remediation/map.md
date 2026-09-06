@@ -11,6 +11,7 @@ Harden the `gemsub` core engine by resolving all critical blockers, concurrency 
 ## Decisions so far
 
 - [01: fix(scheduler): prevent store wipe on empty fetch](issues/01-prevent-store-wipe-on-empty-fetch.md): Abort runCycle when fetch yields 0 links and errors occurred, preventing store wiping and empty publication.
+- [02: fix(tester): discard cancelled probe results](issues/02-discard-cancelled-probe-results.md): Discard probe outcomes when parent context is cancelled, preventing false inconclusive counter increments and store corruption.
 
 ## Not yet specified
 

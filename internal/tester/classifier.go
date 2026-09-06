@@ -1,6 +1,8 @@
 package tester
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"html"
 	"net/http"
@@ -116,6 +118,13 @@ func ClassifyDialError(err error) ClassificationResult {
 			Status:    store.StatusFailed,
 			Category:  store.ErrConnRefused,
 			Reason:    "connection refused",
+			Retryable: false,
+		}
+	case errors.Is(err, context.Canceled):
+		return ClassificationResult{
+			Status:    store.StatusInconclusive,
+			Category:  store.ErrTimeout,
+			Reason:    "context canceled",
 			Retryable: false,
 		}
 	case strings.Contains(lower, "i/o timeout") || strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "client.timeout exceeded"):
