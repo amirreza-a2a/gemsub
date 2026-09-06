@@ -258,9 +258,9 @@ func (p *Publisher) Publish(ctx context.Context) error {
 	}
 	originURL = strings.TrimSpace(originURL)
 
-	expectedRemote := p.cfg.RemoteURL
+	expectedRemote := strings.TrimSpace(p.cfg.RemoteURL)
 	if expectedRemote == "" {
-		expectedRemote = "git@github.com:amirreza-a2a/gemsub-subscriptions.git"
+		return fmt.Errorf("publisher: remote_url is required")
 	}
 	if originURL != expectedRemote {
 		return fmt.Errorf("publisher: remote origin URL mismatch: expected %q, got %q", expectedRemote, originURL)

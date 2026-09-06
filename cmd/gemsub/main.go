@@ -38,6 +38,11 @@ func main() {
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "publish" {
 			cfg.Publishing.Enabled = *publish
+			if *publish {
+				if err := cfg.Validate(); err != nil {
+					log.Fatalf("config: %v", err)
+				}
+			}
 		}
 	})
 

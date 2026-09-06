@@ -59,7 +59,7 @@ func TestScheduler_PublishOnSuccessfulCycle(t *testing.T) {
 			Enabled:    true,
 			Repository: tmpDir,
 			Branch:     "main",
-			RemoteURL:  "git@github.com:amirreza-a2a/gemsub-subscriptions.git",
+			RemoteURL:  "git@github.com:example/gemsub-subscriptions.git",
 		},
 	}
 	if err := cfg.Validate(); err != nil {
@@ -74,7 +74,7 @@ func TestScheduler_PublishOnSuccessfulCycle(t *testing.T) {
 				case "rev-parse":
 					return "true\n", nil
 				case "config":
-					return "git@github.com:amirreza-a2a/gemsub-subscriptions.git\n", nil
+					return "git@github.com:example/gemsub-subscriptions.git\n", nil
 				case "add":
 					atomic.AddInt32(&publishCount, 1)
 					return "", nil
@@ -132,7 +132,7 @@ func TestScheduler_CancelledCycleDoesNotPublish(t *testing.T) {
 			Enabled:    true,
 			Repository: tmpDir,
 			Branch:     "main",
-			RemoteURL:  "git@github.com:amirreza-a2a/gemsub-subscriptions.git",
+			RemoteURL:  "git@github.com:example/gemsub-subscriptions.git",
 		},
 	}
 	if err := cfg.Validate(); err != nil {
@@ -197,7 +197,7 @@ func TestScheduler_FetchFailurePreservesStoreAndSkipsPublishing(t *testing.T) {
 			Enabled:    true,
 			Repository: tmpDir,
 			Branch:     "main",
-			RemoteURL:  "git@github.com:amirreza-a2a/gemsub-subscriptions.git",
+			RemoteURL:  "git@github.com:example/gemsub-subscriptions.git",
 		},
 	}
 	if err := cfg.Validate(); err != nil {

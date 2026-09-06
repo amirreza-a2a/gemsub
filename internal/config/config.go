@@ -172,11 +172,13 @@ func (c *Config) Validate() error {
 	if c.Publishing.Branch == "" {
 		c.Publishing.Branch = "main"
 	}
-	if c.Publishing.RemoteURL == "" {
-		c.Publishing.RemoteURL = "git@github.com:amirreza-a2a/gemsub-subscriptions.git"
-	}
-	if c.Publishing.Enabled && c.Publishing.Repository == "" {
-		return fmt.Errorf("publishing.repository must not be empty when publishing is enabled")
+	if c.Publishing.Enabled {
+		if c.Publishing.Repository == "" {
+			return fmt.Errorf("publishing.repository must not be empty when publishing is enabled")
+		}
+		if c.Publishing.RemoteURL == "" {
+			return fmt.Errorf("publishing.remote_url must not be empty when publishing is enabled")
+		}
 	}
 
 	return nil

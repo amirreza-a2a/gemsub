@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gemsub/internal/config"
@@ -101,12 +102,13 @@ func TestMaxRetries_NegativeReturnsError(t *testing.T) {
 	}
 }
 
-func TestPublishing_DefaultsAndValidation(t *testing.T) {
+func TestPublishing_ValidExplicitConfig(t *testing.T) {
 	dir := t.TempDir()
 	cfgMap := baseConfig()
 	cfgMap["publishing"] = map[string]interface{}{
 		"enabled":    true,
 		"repository": "~/gemsub-subscriptions",
+		"remote_url": "git@github.com:example/gemsub-subscriptions.git",
 	}
 	path := writeTestConfig(t, dir, cfgMap)
 
@@ -120,19 +122,77 @@ func TestPublishing_DefaultsAndValidation(t *testing.T) {
 	if cfg.Publishing.Branch != "main" {
 		t.Errorf("expected default branch 'main', got %q", cfg.Publishing.Branch)
 	}
-	if cfg.Publishing.RemoteURL != "git@github.com:amirreza-a2a/gemsub-subscriptions.git" {
-		t.Errorf("expected default RemoteURL, got %q", cfg.Publishing.RemoteURL)
+	if cfg.Publishing.RemoteURL != "git@github.com:example/gemsub-subscriptions.git" {
+		t.Errorf("expected RemoteURL 'git@github.com:example/gemsub-subscriptions.git', got %q", cfg.Publishing.RemoteURL)
 	}
 	if cfg.Publishing.Repository != "~/gemsub-subscriptions" {
 		t.Errorf("expected repository '~/gemsub-subscriptions', got %q", cfg.Publishing.Repository)
 	}
+}
 
-	// Missing repository when enabled
+func TestPublishing_EnabledRequiresRemoteURL(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
 	cfgMap["publishing"] = map[string]interface{}{
-		"enabled": true,
+		"enabled":    true,
+		"repository": "~/gemsub-subscriptions",
+		// remote_url omitted
 	}
-	pathMissingRepo := writeTestConfig(t, dir, cfgMap)
-	if _, err := config.Load(pathMissingRepo); err == nil {
+	path := writeTestConfig(t, dir, cfgMap)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected error when publishing is enabled without remote_url")
+	}
+	expected := "publishing.remote_url must not be empty when publishing is enabled"
+	if !strings.Contains(err.Error(), expected) {
+		t.Errorf("expected error containing %q, got %q", expected, err.Error())
+	}
+}
+
+func TestPublishing_EnabledRequiresRepository(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	cfgMap["publishing"] = map[string]interface{}{
+		"enabled":    true,
+		"remote_url": "git@github.com:example/gemsub-subscriptions.git",
+		// repository omitted
+	}
+	path := writeTestConfig(t, dir, cfgMap)
+
+	_, err := config.Load(path)
+	if err == nil {
 		t.Fatal("expected error when publishing is enabled without repository")
+	}
+	expected := "publishing.repository must not be empty when publishing is enabled"
+	if !strings.Contains(err.Error(), expected) {
+		t.Errorf("expected error containing %q, got %q", expected, err.Error())
+	}
+}
+
+func TestPublishing_DisabledPermitsEmptyFields(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	cfgMap["publishing"] = map[string]interface{}{
+		"enabled": false,
+		// repository and remote_url omitted
+	}
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Publishing.Enabled {
+		t.Errorf("expected Publishing.Enabled=false")
+	}
+	if cfg.Publishing.RemoteURL != "" {
+		t.Errorf("expected empty RemoteURL when disabled, got %q", cfg.Publishing.RemoteURL)
+	}
+	if cfg.Publishing.Repository != "" {
+		t.Errorf("expected empty Repository when disabled, got %q", cfg.Publishing.Repository)
+	}
+	if cfg.Publishing.Branch != "main" {
+		t.Errorf("expected default branch 'main', got %q", cfg.Publishing.Branch)
 	}
 }

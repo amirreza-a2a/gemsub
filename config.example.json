@@ -26,7 +26,8 @@
   "publishing": {
     "enabled": false,
     "repository": "~/gemsub-subscriptions",
-    "branch": "main"
+    "branch": "main",
+    "remote_url": "git@github.com:your-user/your-subscriptions.git"
   },
   "state_file": "./gemsub_state.json",
   "headless": false

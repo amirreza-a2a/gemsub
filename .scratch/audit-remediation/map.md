@@ -13,6 +13,7 @@ Harden the `gemsub` core engine by resolving all critical blockers, concurrency 
 - [01: fix(scheduler): prevent store wipe on empty fetch](issues/01-prevent-store-wipe-on-empty-fetch.md): Abort runCycle when fetch yields 0 links and errors occurred, preventing store wiping and empty publication.
 - [02: fix(tester): discard cancelled probe results](issues/02-discard-cancelled-probe-results.md): Discard probe outcomes when parent context is cancelled, preventing false inconclusive counter increments and store corruption.
 - [03: fix(subserver): add context and graceful shutdown](issues/03-add-context-and-graceful-shutdown.md): Add context lifecycle and 5-second graceful shutdown draining to subserver.Server, eliminating socket and goroutine leaks.
+- [04: build: enforce with_utls tags and clean config defaults](issues/04-enforce-with-utls-tags-and-clean-config-defaults.md): Provide root Makefile enforcing with_utls compilation and eliminate hardcoded personal repository fallbacks across config and publisher.
 
 ## Not yet specified
 

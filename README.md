@@ -2,6 +2,20 @@
 
 `gemsub` is a daemon that pulls VPN subscription share links from upstream sources, validates each link by testing connectivity and target accessibility through the proxy, and serves the servable candidates as a subscription for clients (e.g. Throne).
 
+## Building
+
+Build with uTLS/Reality support:
+
+```bash
+make build
+```
+
+Run tests:
+
+```bash
+make test
+```
+
 ## Git Publishing Layer
 
 `gemsub` includes an optional local Git publishing layer that can automatically publish verified servable configurations to a dedicated Git repository after each successfully completed test cycle.
@@ -29,7 +43,8 @@ Publishing is disabled by default. You can enable it in `config.json`:
   "publishing": {
     "enabled": true,
     "repository": "~/gemsub-subscriptions",
-    "branch": "main"
+    "branch": "main",
+    "remote_url": "git@github.com:your-user/your-subscriptions.git"
   }
 }
 ```

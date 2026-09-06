@@ -270,7 +270,7 @@ func TestPublisher_WorkingTreeSafety(t *testing.T) {
 				case "rev-parse":
 					return "true\n", nil
 				case "config":
-					return "git@github.com:amirreza-a2a/gemsub-subscriptions.git\n", nil
+					return "git@github.com:example/gemsub-subscriptions.git\n", nil
 				case "status":
 					return " M all.txt\n", nil
 				}
@@ -282,7 +282,7 @@ func TestPublisher_WorkingTreeSafety(t *testing.T) {
 	cfg := &config.PublishingConfig{
 		Enabled:    true,
 		Repository: tmpDir,
-		RemoteURL:  "git@github.com:amirreza-a2a/gemsub-subscriptions.git",
+		RemoteURL:  "git@github.com:example/gemsub-subscriptions.git",
 	}
 	pubUnstaged := publisher.NewWithGit(cfg, st, mockUnstaged)
 	err := pubUnstaged.Publish(context.Background())
@@ -298,7 +298,7 @@ func TestPublisher_WorkingTreeSafety(t *testing.T) {
 				case "rev-parse":
 					return "true\n", nil
 				case "config":
-					return "git@github.com:amirreza-a2a/gemsub-subscriptions.git\n", nil
+					return "git@github.com:example/gemsub-subscriptions.git\n", nil
 				case "status":
 					return "M  vless.txt\n", nil
 				}
@@ -592,11 +592,35 @@ func TestPublisher_RepositoryValidation(t *testing.T) {
 	cfgWrongRemote := &config.PublishingConfig{
 		Enabled:    true,
 		Repository: tmpDir,
-		RemoteURL:  "git@github.com:amirreza-a2a/gemsub-subscriptions.git",
+		RemoteURL:  "git@github.com:example/gemsub-subscriptions.git",
 	}
 	pubWrongRemote := publisher.NewWithGit(cfgWrongRemote, st, mockWrongRemote)
 	if err := pubWrongRemote.Publish(context.Background()); err == nil {
 		t.Fatalf("expected error for remote URL mismatch")
+	}
+
+	// Empty RemoteURL rejected
+	mockValidGit := &mockGitRunner{
+		runFunc: func(ctx context.Context, dir string, args ...string) (string, error) {
+			if len(args) > 0 && args[0] == "rev-parse" {
+				return "true\n", nil
+			}
+			if len(args) > 0 && args[0] == "config" {
+				return "git@github.com:example/gemsub-subscriptions.git\n", nil
+			}
+			return "", nil
+		},
+	}
+	cfgEmptyRemote := &config.PublishingConfig{
+		Enabled:    true,
+		Repository: tmpDir,
+		RemoteURL:  "",
+	}
+	pubEmptyRemote := publisher.NewWithGit(cfgEmptyRemote, st, mockValidGit)
+	if err := pubEmptyRemote.Publish(context.Background()); err == nil {
+		t.Fatalf("expected error for empty remote URL")
+	} else if !strings.Contains(err.Error(), "publisher: remote_url is required") {
+		t.Fatalf("expected 'publisher: remote_url is required', got: %v", err)
 	}
 }
 
@@ -636,7 +660,7 @@ func TestPublisher_GitFailuresSurfaced(t *testing.T) {
 							return "true\n", nil
 						}
 						if cmd == "config" {
-							return "git@github.com:amirreza-a2a/gemsub-subscriptions.git\n", nil
+							return "git@github.com:example/gemsub-subscriptions.git\n", nil
 						}
 						if cmd == "status" {
 							return "", nil
@@ -656,7 +680,7 @@ func TestPublisher_GitFailuresSurfaced(t *testing.T) {
 				Enabled:    true,
 				Repository: tmpDir,
 				Branch:     "main",
-				RemoteURL:  "git@github.com:amirreza-a2a/gemsub-subscriptions.git",
+				RemoteURL:  "git@github.com:example/gemsub-subscriptions.git",
 			}
 			pub := publisher.NewWithGit(cfg, st, mock)
 			err := pub.Publish(context.Background())
