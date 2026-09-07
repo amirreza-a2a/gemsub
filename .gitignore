@@ -9,6 +9,7 @@
 
 # Local configurations (keep config.example.json)
 /config.json
+/config2.json
 
 # Test configurations (ephemeral)
 /test-config.json
