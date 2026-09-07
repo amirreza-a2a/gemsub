@@ -196,3 +196,34 @@ func TestPublishing_DisabledPermitsEmptyFields(t *testing.T) {
 		t.Errorf("expected default branch 'main', got %q", cfg.Publishing.Branch)
 	}
 }
+
+func TestFlagMode_Validation(t *testing.T) {
+	dir := t.TempDir()
+
+	validModes := []string{"", "auto", "unicode", "ascii"}
+	for _, m := range validModes {
+		cfgMap := baseConfig()
+		if m != "" {
+			cfgMap["flag_mode"] = m
+		}
+		path := writeTestConfig(t, dir, cfgMap)
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("expected mode %q to be valid, got err: %v", m, err)
+		}
+		if cfg.FlagMode != m {
+			t.Errorf("expected FlagMode=%q, got %q", m, cfg.FlagMode)
+		}
+	}
+
+	invalidMap := baseConfig()
+	invalidMap["flag_mode"] = "invalid_mode"
+	path := writeTestConfig(t, dir, invalidMap)
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected error for invalid flag_mode, got nil")
+	}
+	if !strings.Contains(err.Error(), "flag_mode") {
+		t.Errorf("expected error message to mention flag_mode, got: %v", err)
+	}
+}

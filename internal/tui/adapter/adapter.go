@@ -12,6 +12,7 @@ import (
 	"gemsub/internal/events"
 	"gemsub/internal/logging"
 	"gemsub/internal/store"
+	"gemsub/internal/tui/country"
 	"gemsub/internal/tui/viewmodel"
 )
 
@@ -51,6 +52,9 @@ type Adapter struct {
 	logLevel     slog.Level
 	scrollOffset int
 	followMode   bool
+
+	// Presentation mode for country flags
+	flagMode country.Mode
 }
 
 // New creates an unstarted Adapter.
@@ -73,6 +77,7 @@ func New(st *store.Store, bus *events.EventBus, ring *logging.RingLogHandler) *A
 		followMode:              true,
 		lastRevision:            initRev,
 		lastCompletedCycleCount: initCycleCount,
+		flagMode:                country.ModeAuto,
 	}
 }
 
@@ -340,7 +345,7 @@ func (a *Adapter) CandidateRows(servableOnly bool) []viewmodel.CandidateRowViewM
 
 		proto := ExtractProtocol(activeLink)
 		endpoint := ExtractEndpoint(activeLink)
-		remark := ExtractRemark(activeLink)
+		remark := country.FormatRemark(ExtractRemark(activeLink), a.flagMode)
 
 		status := "PEND"
 		if snap.Record.Latest.Status != "" {
@@ -390,6 +395,7 @@ func (a *Adapter) CandidateRows(servableOnly bool) []viewmodel.CandidateRowViewM
 func (a *Adapter) CandidateDetail(opaqueID string) (viewmodel.CandidateDetailViewModel, bool) {
 	a.mu.RLock()
 	canonical, ok := a.idToLink[opaqueID]
+	mode := a.flagMode
 	a.mu.RUnlock()
 
 	if !ok || a.st == nil {
@@ -412,7 +418,7 @@ func (a *Adapter) CandidateDetail(opaqueID string) (viewmodel.CandidateDetailVie
 	proto := ExtractProtocol(activeLink)
 	endpoint := ExtractEndpoint(activeLink)
 	host, port, path, sni := ExtractConnectionParams(activeLink)
-	remark := ExtractRemark(activeLink)
+	remark := country.FormatRemark(ExtractRemark(activeLink), mode)
 
 	statusStr := "PENDING"
 	if rec.Latest.Status != "" {
@@ -549,6 +555,21 @@ func (a *Adapter) SetMinLogLevel(l slog.Level) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.logLevel = l
+}
+
+// SetFlagMode sets the presentation mode for country flags and marks presentation dirty.
+func (a *Adapter) SetFlagMode(m country.Mode) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.flagMode = m
+	atomic.StoreInt32(&a.dirty, 1)
+}
+
+// FlagMode returns the active country flag presentation mode.
+func (a *Adapter) FlagMode() country.Mode {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.flagMode
 }
 
 // CycleMinLogLevel cycles the active minimum log level: DEBUG -> INFO -> WARN -> ERROR -> DEBUG.

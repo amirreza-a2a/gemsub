@@ -10,6 +10,7 @@ import (
 
 	"gemsub/internal/config"
 	"gemsub/internal/store"
+	"gemsub/internal/tui/country"
 )
 
 func TestHeadlessIsolation_ZeroTUIComponents(t *testing.T) {
@@ -207,5 +208,42 @@ func TestLifecycle_ContextCancellationShutdown(t *testing.T) {
 	}
 	if rec.Latest.Status != store.StatusPassed {
 		t.Errorf("expected StatusPassed, got %s", rec.Latest.Status)
+	}
+}
+
+func TestFlagMode_Initialization(t *testing.T) {
+	origLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	tmpDir := t.TempDir()
+
+	tests := []struct {
+		configMode string
+		wantMode   country.Mode
+	}{
+		{"", country.ModeAuto},
+		{"auto", country.ModeAuto},
+		{"unicode", country.ModeUnicode},
+		{"ascii", country.ModeASCII},
+	}
+
+	for _, tt := range tests {
+		t.Run("Mode_"+tt.configMode, func(t *testing.T) {
+			cfg := &config.Config{
+				Headless:  false,
+				StateFile: filepath.Join(tmpDir, "state_"+tt.configMode+".json"),
+				FlagMode:  tt.configMode,
+			}
+			var logBuf bytes.Buffer
+			rt, cleanup := setupRuntime(cfg, &logBuf)
+			defer cleanup()
+
+			if rt.Adapter == nil {
+				t.Fatal("expected rt.Adapter != nil")
+			}
+			if rt.Adapter.FlagMode() != tt.wantMode {
+				t.Errorf("expected adapter flagMode %v, got %v", tt.wantMode, rt.Adapter.FlagMode())
+			}
+		})
 	}
 }

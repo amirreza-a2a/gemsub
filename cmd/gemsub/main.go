@@ -24,6 +24,7 @@ import (
 	"gemsub/internal/subserver"
 	"gemsub/internal/tui"
 	"gemsub/internal/tui/adapter"
+	"gemsub/internal/tui/country"
 )
 
 func main() {
@@ -34,6 +35,7 @@ func main() {
 	headless := flag.Bool("headless", false, "run without the TUI (daemon + sub server only)")
 	probeLimit := flag.Int("limit", 0, "limit number of parsed candidates to probe per cycle (0 = unlimited)")
 	publish := flag.Bool("publish", false, "enable git publishing after test cycles (overrides config)")
+	flagMode := flag.String("flag-mode", "", "country flag presentation mode: auto, unicode, ascii")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -55,6 +57,13 @@ func main() {
 					slog.Error("config validation failed", "err", err)
 					os.Exit(1)
 				}
+			}
+		}
+		if f.Name == "flag-mode" {
+			cfg.FlagMode = *flagMode
+			if err := cfg.Validate(); err != nil {
+				slog.Error("config validation failed", "err", err)
+				os.Exit(1)
 			}
 		}
 	})
@@ -167,6 +176,9 @@ func setupRuntime(cfg *config.Config, logWriter io.Writer) (*Runtime, func()) {
 	// Step 4: In non-headless mode, instantiate and subscribe TUI adapter BEFORE scheduler execution
 	if !cfg.Headless {
 		ad := adapter.New(st, bus, ringHandler)
+		if cfg.FlagMode != "" {
+			ad.SetFlagMode(country.Mode(cfg.FlagMode))
+		}
 		ad.Subscribe()
 		rt.Adapter = ad
 		rt.TUIModel = tui.New(ad)

@@ -13,6 +13,7 @@ import (
 	"gemsub/internal/store"
 	"gemsub/internal/tui"
 	"gemsub/internal/tui/adapter"
+	"gemsub/internal/tui/country"
 )
 
 func setupTestModel(t *testing.T) (*tui.Model, *store.Store, *events.EventBus, *logging.RingLogHandler) {
@@ -227,5 +228,66 @@ func TestModel_HeaderRendersCurrentCycleMetrics(t *testing.T) {
 	viewUpdated := m.View()
 	if !strings.Contains(viewUpdated, "Cycle: Pass: 1  Fail: 0  Incon: 0") {
 		t.Errorf("expected updated header to render 'Cycle: Pass: 1  Fail: 0  Incon: 0', got:\n%s", viewUpdated)
+	}
+}
+
+func TestModel_CountryFlagRendering(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "store.json"), 2)
+	bus := events.New()
+	defer bus.Close()
+	ad := adapter.New(st, bus, nil)
+	ad.Subscribe()
+	defer ad.Close()
+
+	st.PutWithTransition(store.Result{
+		Link:     "vless://node1@1.1.1.1:443#🇩🇪 Germany",
+		Status:   store.StatusPassed,
+		TestedAt: time.Now(),
+	})
+
+	m := tui.New(ad)
+
+	// 1. ASCII mode: table and detail render [DE] Germany
+	ad.SetFlagMode(country.ModeASCII)
+	updated, _ := m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+
+	viewASCII := m.View()
+	if !strings.Contains(viewASCII, "[DE] Germany") {
+		t.Errorf("expected view to contain '[DE] Germany', got:\n%s", viewASCII)
+	}
+	if strings.Contains(viewASCII, "🇩🇪") {
+		t.Errorf("expected ASCII view not to contain emoji flag '🇩🇪', got:\n%s", viewASCII)
+	}
+
+	// Open detail view
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+	detailASCII := m.View()
+	if !strings.Contains(detailASCII, "Remark:    [DE] Germany") {
+		t.Errorf("expected detail to contain 'Remark:    [DE] Germany', got:\n%s", detailASCII)
+	}
+
+	// Close detail
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(*tui.Model)
+
+	// 2. Unicode mode: table and detail render 🇩🇪 Germany
+	ad.SetFlagMode(country.ModeUnicode)
+	updated, _ = m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+
+	viewUnicode := m.View()
+	if !strings.Contains(viewUnicode, "🇩🇪 Germany") {
+		t.Errorf("expected view to contain '🇩🇪 Germany', got:\n%s", viewUnicode)
+	}
+
+	// Open detail view
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+	detailUnicode := m.View()
+	if !strings.Contains(detailUnicode, "Remark:    🇩🇪 Germany") {
+		t.Errorf("expected detail to contain 'Remark:    🇩🇪 Germany', got:\n%s", detailUnicode)
 	}
 }

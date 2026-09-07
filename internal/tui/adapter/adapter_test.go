@@ -11,6 +11,7 @@ import (
 	"gemsub/internal/logging"
 	"gemsub/internal/store"
 	"gemsub/internal/tui/adapter"
+	"gemsub/internal/tui/country"
 	"gemsub/internal/tui/viewmodel"
 )
 
@@ -926,5 +927,88 @@ func TestAdapter_CancellationAndAbortPaths(t *testing.T) {
 	if hAbort.PassedCount != 0 || hAbort.FailedCount != 0 || hAbort.InconclusiveCount != 0 {
 		t.Errorf("expected 0/0/0 on abort, got Pass:%d Fail:%d Incon:%d",
 			hAbort.PassedCount, hAbort.FailedCount, hAbort.InconclusiveCount)
+	}
+}
+
+func TestAdapter_FlagPresentationModes(t *testing.T) {
+	st := store.New(filepath.Join(t.TempDir(), "store.json"), 2)
+	bus := events.New()
+	t.Cleanup(bus.Close)
+	ad := adapter.New(st, bus, nil)
+
+	// Candidate with Unicode flag emoji in remark
+	cand1 := "vless://user@1.1.1.1:443#🇩🇪 Germany"
+	// Candidate with ASCII bracketed code in remark
+	cand2 := "vless://user@2.2.2.2:443#[FR] France"
+
+	st.PutWithTransition(store.Result{
+		Link:     cand1,
+		Status:   store.StatusPassed,
+		TestedAt: time.Now(),
+	})
+	st.PutWithTransition(store.Result{
+		Link:     cand2,
+		Status:   store.StatusPassed,
+		TestedAt: time.Now(),
+	})
+
+	// 1. Test ASCII mode
+	ad.SetFlagMode(country.ModeASCII)
+	if ad.FlagMode() != country.ModeASCII {
+		t.Fatalf("expected FlagMode ASCII, got %v", ad.FlagMode())
+	}
+
+	rowsASCII := ad.CandidateRows(false)
+	if len(rowsASCII) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rowsASCII))
+	}
+
+	for _, r := range rowsASCII {
+		if r.Endpoint == "1.1.1.1:443" {
+			if r.Remark != "[DE] Germany" {
+				t.Errorf("expected ASCII remark [DE] Germany, got %q", r.Remark)
+			}
+			detail, ok := ad.CandidateDetail(r.ID)
+			if !ok || detail.Remark != "[DE] Germany" {
+				t.Errorf("expected detail remark [DE] Germany, got %q", detail.Remark)
+			}
+		} else if r.Endpoint == "2.2.2.2:443" {
+			if r.Remark != "[FR] France" {
+				t.Errorf("expected ASCII remark [FR] France, got %q", r.Remark)
+			}
+		}
+	}
+
+	// 2. Test Unicode mode
+	ad.SetFlagMode(country.ModeUnicode)
+	if ad.FlagMode() != country.ModeUnicode {
+		t.Fatalf("expected FlagMode Unicode, got %v", ad.FlagMode())
+	}
+
+	rowsUnicode := ad.CandidateRows(false)
+	for _, r := range rowsUnicode {
+		if r.Endpoint == "1.1.1.1:443" {
+			if r.Remark != "🇩🇪 Germany" {
+				t.Errorf("expected Unicode remark 🇩🇪 Germany, got %q", r.Remark)
+			}
+			detail, ok := ad.CandidateDetail(r.ID)
+			if !ok || detail.Remark != "🇩🇪 Germany" {
+				t.Errorf("expected detail remark 🇩🇪 Germany, got %q", detail.Remark)
+			}
+		} else if r.Endpoint == "2.2.2.2:443" {
+			if r.Remark != "🇫🇷 France" {
+				t.Errorf("expected Unicode remark 🇫🇷 France, got %q", r.Remark)
+			}
+		}
+	}
+
+	// 3. Verify Candidate Identity and Store state are completely untouched
+	rec1, ok := st.GetRecord(cand1)
+	if !ok || rec1.CanonicalLink != cand1 {
+		t.Errorf("Store state or identity corrupted: expected %q, got %v", cand1, rec1)
+	}
+	rawLink, ok := ad.ActiveLink(rowsASCII[0].ID)
+	if !ok || (rawLink != cand1 && rawLink != cand2) {
+		t.Errorf("ActiveLink corrupted: got %q", rawLink)
 	}
 }

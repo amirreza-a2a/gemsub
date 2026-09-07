@@ -48,6 +48,7 @@ type Config struct {
 	StateFile        string           `json:"state_file"`
 	Headless         bool             `json:"headless"`
 	ProbeLimit       int              `json:"probe_limit,omitempty"`
+	FlagMode         string           `json:"flag_mode,omitempty"`
 
 	// Parsed fields, populated by Validate.
 	FetchInterval time.Duration `json:"-"`
@@ -179,6 +180,13 @@ func (c *Config) Validate() error {
 		if c.Publishing.RemoteURL == "" {
 			return fmt.Errorf("publishing.remote_url must not be empty when publishing is enabled")
 		}
+	}
+
+	switch c.FlagMode {
+	case "", "auto", "unicode", "ascii":
+		// ok
+	default:
+		return fmt.Errorf("flag_mode must be one of \"auto\", \"unicode\", \"ascii\", got %q", c.FlagMode)
 	}
 
 	return nil
