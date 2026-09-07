@@ -24,10 +24,12 @@ Harden the `gemsub` core engine by resolving all critical blockers, concurrency 
 - [12: fix(store): derive HasPassed and LastPassedLatency from authoritative history](issues/12-derive-has-passed-from-authoritative-history.md): Keep HasPassed and LastPassedLatency dynamically derived from BoundedHistory; reset when passes are evicted from active window and recompute on Load.
 - [13: fix(tui): current-cycle metrics in header](issues/13-tui-current-cycle-metrics.md): Derive Pass/Fail/Incon header metrics from cycle-local lifecycle/progress events, resetting at CycleStarted and finalizing at CycleFinished, while preserving authoritative Store aggregate statistics and revision-driven projection integrity.
 - [14: feat(tui): portable country flag rendering](issues/14-portable-country-flag-rendering.md): Provide portable fallback rendering for country flags on terminals without emoji support using auto, unicode, and ascii presentation modes.
+- [15: audit(pipeline): preserve network-healthy and target-incompatible candidates](issues/15-preserve-network-healthy-target-incompatible-candidates.md): Trace candidate lifecycle and identify semantic collapse where Gemini target-incompatible nodes are physically retained but excluded from query projections.
+- [16: feat(store): preserve and project network-healthy candidates](issues/16-preserve-network-healthy-candidates.md): Preserve and project network-healthy candidates that pass proxy transport but fail Gemini-specific verification without breaking Gemini servability or default publications.
 
 ## Active issues
 
-- [15: audit(pipeline): preserve network-healthy and target-incompatible candidates](issues/15-preserve-network-healthy-target-incompatible-candidates.md): Trace candidate lifecycle and design minimal architecture to retain candidates that pass network health but fail Gemini-specific probing. (Status: ready-for-agent, Blocked by: None)
+None
 
 ## Not yet specified
 

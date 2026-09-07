@@ -44,6 +44,12 @@ const (
 	ErrConfig            ErrorCategory = "config_error"        // Outbound config error
 )
 
+// IsTargetSpecific returns true if the error category represents a target-application-layer
+// rejection (such as regional blocking or target access denial) rather than a network transport failure.
+func (c ErrorCategory) IsTargetSpecific() bool {
+	return c == ErrRegionBlocked || c == ErrTargetDenied
+}
+
 // Result is the outcome of testing a single candidate link.
 type Result struct {
 	Link                    string        `json:"link"`
@@ -197,6 +203,69 @@ func (s *Store) IsServableRecord(rec *CandidateRecord) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.isServableRecordLocked(rec)
+}
+
+// networkHealthyStateLocked checks whether a record is network-healthy, and returns both
+// whether it is network-healthy and whether it is Gemini-servable, avoiding duplicate gate evaluations.
+// mu must be locked (RLock or Lock) by caller.
+func (s *Store) networkHealthyStateLocked(rec *CandidateRecord) (healthy bool, servable bool) {
+	if rec == nil {
+		return false, false
+	}
+
+	// Gate 1: Source Presence Gate
+	// Disqualified if candidate is absent in active cycle or absent from upstream without reappearing.
+	if _, pending := s.pendingAbsent[rec.CanonicalLink]; pending {
+		return false, false
+	}
+	if _, present := s.pendingPresent[rec.CanonicalLink]; !present && rec.AbsentCycles > 0 {
+		return false, false
+	}
+
+	// Gate 3: Cold Start Gate
+	// Disqualified until minimum observation count is reached.
+	if rec.History.Count < s.cfg.MinObservationsForServing {
+		return false, false
+	}
+
+	// If candidate satisfies the standard servability gate (passed Gemini), it is network-healthy and servable.
+	if s.isServableRecordLocked(rec) {
+		return true, true
+	}
+
+	// Otherwise, check if the candidate is healthy at the network/transport layer
+	// despite failing target-specific criteria (e.g. ErrRegionBlocked or ErrTargetDenied).
+	sample, ok := rec.History.LatestConclusive()
+	if !ok {
+		sample = ProbeSample{
+			Status:   rec.Latest.Status,
+			Category: rec.Latest.Category,
+		}
+	}
+
+	// Transport is healthy if the latest authoritative conclusive observation was rejected solely by
+	// target-specific restrictions where proxy dial and HTTP round-trip succeeded.
+	if sample.Status == StatusFailed && sample.Category.IsTargetSpecific() {
+		return true, false
+	}
+
+	return false, false
+}
+
+// isNetworkHealthyRecordLocked evaluates whether a candidate has verified network/transport health,
+// regardless of target-specific restrictions such as region blocks or target denial.
+// mu must be locked (RLock or Lock) by caller.
+func (s *Store) isNetworkHealthyRecordLocked(rec *CandidateRecord) bool {
+	healthy, _ := s.networkHealthyStateLocked(rec)
+	return healthy
+}
+
+// IsNetworkHealthyRecord returns true if the candidate record has verified network/transport health,
+// regardless of target-specific restrictions such as region blocks.
+func (s *Store) IsNetworkHealthyRecord(rec *CandidateRecord) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isNetworkHealthyRecordLocked(rec)
 }
 
 // IsServable returns true if candidate passes directly or retains servable status.
@@ -662,6 +731,111 @@ func (s *Store) PassingRanked() []string {
 	return out
 }
 
+// NetworkPassing returns the active links of all candidates with verified network/transport health,
+// in stable sorted order. This includes candidates that are Gemini-servable as well as candidates
+// whose network transport succeeded but were blocked solely by Gemini-specific target restrictions.
+func (s *Store) NetworkPassing() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var out []string
+	for _, rec := range s.records {
+		if s.isNetworkHealthyRecordLocked(rec) {
+			out = append(out, rec.ActiveLink)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// NetworkPassingRanked returns the active links of all network-healthy candidates.
+// Ranking policy precedence:
+//  1. Gemini-servable candidates (isServableRecordLocked == true) strictly outrank
+//     target-incompatible candidates.
+//  2. Within Tier 1 (Gemini-servable candidates):
+//     - Reliability score descending.
+//     - Last passed latency ascending (unproven candidates sort worst at math.MaxInt64).
+//     - ActiveLink ascending for deterministic tie-breaking.
+//  3. Within Tier 2 (Target-incompatible but network-healthy candidates):
+//     - Network-healthy latency ascending (using LastNetworkHealthyLatency; unknown latency sorts worst at math.MaxInt64).
+//     - ActiveLink ascending for deterministic tie-breaking.
+//     - NOTE: Gemini-specific reliability score (rec.Score) is intentionally NOT used for Tier 2 ranking,
+//     preventing candidates with prior timeouts from outranking clean target-blocked nodes.
+func (s *Store) NetworkPassingRanked() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	type rankedRecord struct {
+		activeLink string
+		score      float64
+		latency    time.Duration
+		servable   bool
+	}
+
+	healthy := make([]rankedRecord, 0, len(s.records))
+	for _, rec := range s.records {
+		if isHealthy, isServable := s.networkHealthyStateLocked(rec); isHealthy {
+			var lat time.Duration
+			if isServable {
+				if rec.HasPassed && rec.LastPassedLatency > 0 {
+					lat = rec.LastPassedLatency
+				} else if rec.Latest.Latency > 0 {
+					lat = rec.Latest.Latency
+				} else {
+					lat = time.Duration(math.MaxInt64)
+				}
+			} else {
+				if l, ok := rec.History.LastNetworkHealthyLatency(); ok && l > 0 {
+					lat = l
+				} else if rec.Latest.Latency > 0 {
+					lat = rec.Latest.Latency
+				} else {
+					lat = time.Duration(math.MaxInt64)
+				}
+			}
+			healthy = append(healthy, rankedRecord{
+				activeLink: rec.ActiveLink,
+				score:      rec.Score,
+				latency:    lat,
+				servable:   isServable,
+			})
+		}
+	}
+
+	sort.Slice(healthy, func(i, j int) bool {
+		// Tier 1: Gemini-servable candidates strictly outrank target-incompatible candidates
+		if healthy[i].servable != healthy[j].servable {
+			return healthy[i].servable
+		}
+
+		// Within Tier 1 (Gemini-servable candidates): preserve authoritative PassingRanked semantics
+		if healthy[i].servable {
+			if healthy[i].score != healthy[j].score {
+				return healthy[i].score > healthy[j].score
+			}
+			if healthy[i].latency != healthy[j].latency {
+				return healthy[i].latency < healthy[j].latency
+			}
+			return healthy[i].activeLink < healthy[j].activeLink
+		}
+
+		// Within Tier 2 (Target-incompatible candidates):
+		// Do NOT use Gemini-specific rec.Score. Rank strictly by:
+		// 1. Network-healthy latency ascending.
+		// 2. ActiveLink ascending as deterministic tie-breaker.
+		if healthy[i].latency != healthy[j].latency {
+			return healthy[i].latency < healthy[j].latency
+		}
+		return healthy[i].activeLink < healthy[j].activeLink
+	})
+
+	out := make([]string, len(healthy))
+	for i, r := range healthy {
+		out[i] = r.activeLink
+	}
+	return out
+}
+
 // Stats is a snapshot of counts based on canonical Status and servability.
 type Stats struct {
 	Total        int       `json:"total"`
@@ -741,9 +915,10 @@ func (s *Store) GetRecord(link string) (*CandidateRecord, bool) {
 
 // CandidateSnapshot pairs a cloned CandidateRecord with its atomic servability status and gate reason.
 type CandidateSnapshot struct {
-	Record   *CandidateRecord
-	Servable bool
-	Gate     string
+	Record         *CandidateRecord
+	Servable       bool
+	Gate           string
+	NetworkHealthy bool
 }
 
 // Snapshots returns a consistent snapshot of all candidate records and their servability evaluations.
@@ -755,9 +930,10 @@ func (s *Store) Snapshots() []CandidateSnapshot {
 	for _, rec := range s.records {
 		servable, gate := s.servabilityGateLocked(rec)
 		out = append(out, CandidateSnapshot{
-			Record:   rec.Clone(),
-			Servable: servable,
-			Gate:     gate,
+			Record:         rec.Clone(),
+			Servable:       servable,
+			Gate:           gate,
+			NetworkHealthy: s.isNetworkHealthyRecordLocked(rec),
 		})
 	}
 	return out

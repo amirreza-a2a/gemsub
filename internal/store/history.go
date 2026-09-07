@@ -139,6 +139,37 @@ func (h *BoundedHistory) LastPassedLatency() (time.Duration, bool) {
 	return 0, false
 }
 
+// LastNetworkHealthyLatency returns the latency of the most recent network-healthy sample
+// (StatusPassed, or StatusFailed with a target-specific category like ErrRegionBlocked or ErrTargetDenied).
+// If a conclusive transport failure (StatusFailed with a non-target-specific error category) occurred
+// more recently than any network-healthy sample, scanning halts and returns (0, false), ensuring that
+// a subsequent conclusive transport failure invalidates previous network-health evidence.
+func (h *BoundedHistory) LastNetworkHealthyLatency() (time.Duration, bool) {
+	if h.Count == 0 {
+		return 0, false
+	}
+	for i := h.Count - 1; i >= 0; i-- {
+		idx := (h.Start + i) % h.Capacity
+		s := h.Samples[idx]
+
+		// 1. Success or target-layer rejection proves network transport succeeded
+		if s.Status == StatusPassed || (s.Status == StatusFailed && s.Category.IsTargetSpecific()) {
+			if s.Latency > 0 {
+				return s.Latency, true
+			}
+			return 0, true
+		}
+
+		// 2. Conclusive transport failure invalidates prior network-health evidence
+		if s.Status == StatusFailed && !s.Category.IsTargetSpecific() {
+			return 0, false
+		}
+
+		// 3. StatusInconclusive (e.g. timeout) is non-conclusive: continue scanning backward
+	}
+	return 0, false
+}
+
 // ChronologicalSamples returns all valid samples ordered from oldest to newest.
 func (h *BoundedHistory) ChronologicalSamples() []ProbeSample {
 	if h.Count == 0 {
