@@ -21,9 +21,9 @@ type HeaderViewModel struct {
 	ProgressCurrent   int
 	ProgressTotal     int
 	TotalCandidates   int
-	PassedCount       int
-	FailedCount       int
-	InconclusiveCount int
+	PassedCount       int // Active cycle passed count
+	FailedCount       int // Active cycle failed count
+	InconclusiveCount int // Active cycle inconclusive count
 	ServableCount     int
 }
 

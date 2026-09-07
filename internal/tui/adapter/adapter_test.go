@@ -192,8 +192,11 @@ func TestAdapter_EventBusDrivenDirtyTracking(t *testing.T) {
 	// 3. ProbeCompleted
 	bus.Publish(events.ProbeCompleted{
 		ProgressMetrics: events.ProgressMetrics{
-			Completed: 10,
-			Total:     42,
+			Completed:    10,
+			Total:        42,
+			Passed:       8,
+			Failed:       1,
+			Inconclusive: 1,
 		},
 	})
 	time.Sleep(20 * time.Millisecond)
@@ -205,12 +208,19 @@ func TestAdapter_EventBusDrivenDirtyTracking(t *testing.T) {
 	if header.ProgressCurrent != 10 {
 		t.Errorf("expected ProgressCurrent 10, got %d", header.ProgressCurrent)
 	}
+	if header.PassedCount != 8 || header.FailedCount != 1 || header.InconclusiveCount != 1 {
+		t.Errorf("expected cycle metrics Pass:8 Fail:1 Incon:1, got Pass:%d Fail:%d Incon:%d",
+			header.PassedCount, header.FailedCount, header.InconclusiveCount)
+	}
 
 	// 4. CycleFinished
 	bus.Publish(events.CycleFinished{
 		ProgressMetrics: events.ProgressMetrics{
-			Completed: 42,
-			Total:     42,
+			Completed:    42,
+			Total:        42,
+			Passed:       35,
+			Failed:       5,
+			Inconclusive: 2,
 		},
 	})
 	time.Sleep(20 * time.Millisecond)
@@ -221,6 +231,10 @@ func TestAdapter_EventBusDrivenDirtyTracking(t *testing.T) {
 	header = ad.Header()
 	if header.CycleStatus != viewmodel.CycleIdle {
 		t.Errorf("expected CycleIdle after CycleFinished, got %s", header.CycleStatus)
+	}
+	if header.PassedCount != 35 || header.FailedCount != 5 || header.InconclusiveCount != 2 {
+		t.Errorf("expected final cycle metrics Pass:35 Fail:5 Incon:2, got Pass:%d Fail:%d Incon:%d",
+			header.PassedCount, header.FailedCount, header.InconclusiveCount)
 	}
 }
 
@@ -486,5 +500,431 @@ func TestAdapter_ControllerMethods(t *testing.T) {
 	errMissing := ad.CopyCandidateLink("non-existent-id")
 	if errMissing == nil {
 		t.Error("expected error for non-existent candidate link copy")
+	}
+}
+
+func TestAdapter_CurrentCycleMetricsLifecycle(t *testing.T) {
+	ad, st, bus, _ := setupTestAdapter(t)
+	ad.Subscribe()
+
+	// 1. Pre-populate Store with historical records (simulating past cycles)
+	now := time.Now()
+	st.PutWithTransition(store.Result{Link: "vless://p1@1.1.1.1:443#P1", Status: store.StatusPassed, TestedAt: now})
+	st.PutWithTransition(store.Result{Link: "vless://p2@1.1.1.2:443#P2", Status: store.StatusPassed, TestedAt: now})
+	st.PutWithTransition(store.Result{Link: "vless://f1@2.2.2.1:443#F1", Status: store.StatusFailed, TestedAt: now})
+	st.PutWithTransition(store.Result{Link: "vless://i1@3.3.3.1:443#I1", Status: store.StatusInconclusive, TestedAt: now})
+
+	// Invariant: Store aggregate statistics reflect historical state
+	storeStats := ad.StoreStats()
+	if storeStats.Total != 4 || storeStats.Passed != 2 || storeStats.Failed != 1 || storeStats.Inconclusive != 1 {
+		t.Fatalf("unexpected store stats: %+v", storeStats)
+	}
+
+	// Initial HeaderViewModel before cycle execution begins:
+	// Pass/Fail/Incon counts must be 0 for current cycle, NOT store aggregates!
+	initHdr := ad.Header()
+	if initHdr.PassedCount != 0 || initHdr.FailedCount != 0 || initHdr.InconclusiveCount != 0 {
+		t.Errorf("expected initial cycle counters 0/0/0, got Pass:%d Fail:%d Incon:%d",
+			initHdr.PassedCount, initHdr.FailedCount, initHdr.InconclusiveCount)
+	}
+	if initHdr.CycleStatus != viewmodel.CycleIdle {
+		t.Errorf("expected initial status CycleIdle, got %s", initHdr.CycleStatus)
+	}
+	if initHdr.TotalCandidates != 4 {
+		t.Errorf("expected TotalCandidates 4 from store, got %d", initHdr.TotalCandidates)
+	}
+
+	// 2. CycleStarted resets counters and sets CycleRunning
+	bus.Publish(events.CycleStarted{StartedAt: time.Now()})
+	time.Sleep(20 * time.Millisecond)
+
+	startHdr := ad.Header()
+	if startHdr.CycleStatus != viewmodel.CycleRunning {
+		t.Errorf("expected CycleRunning, got %s", startHdr.CycleStatus)
+	}
+	if startHdr.PassedCount != 0 || startHdr.FailedCount != 0 || startHdr.InconclusiveCount != 0 {
+		t.Errorf("expected reset cycle counters at CycleStarted, got Pass:%d Fail:%d Incon:%d",
+			startHdr.PassedCount, startHdr.FailedCount, startHdr.InconclusiveCount)
+	}
+
+	// 3. CandidatesLoaded updates ProgressTotal
+	bus.Publish(events.CandidatesLoaded{Total: 4})
+	time.Sleep(20 * time.Millisecond)
+
+	loadedHdr := ad.Header()
+	if loadedHdr.ProgressTotal != 4 {
+		t.Errorf("expected ProgressTotal 4, got %d", loadedHdr.ProgressTotal)
+	}
+
+	// 4. ProbeCompleted events update current-cycle counters incrementally
+	bus.Publish(events.ProbeCompleted{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    1,
+			Total:        4,
+			Passed:       1,
+			Failed:       0,
+			Inconclusive: 0,
+		},
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	p1Hdr := ad.Header()
+	if p1Hdr.PassedCount != 1 || p1Hdr.FailedCount != 0 || p1Hdr.InconclusiveCount != 0 || p1Hdr.ProgressCurrent != 1 {
+		t.Errorf("expected step 1 counters Pass:1 Fail:0 Incon:0 Probes:1/4, got Pass:%d Fail:%d Incon:%d Probes:%d/%d",
+			p1Hdr.PassedCount, p1Hdr.FailedCount, p1Hdr.InconclusiveCount, p1Hdr.ProgressCurrent, p1Hdr.ProgressTotal)
+	}
+
+	bus.Publish(events.ProbeCompleted{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    2,
+			Total:        4,
+			Passed:       1,
+			Failed:       1,
+			Inconclusive: 0,
+		},
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	p2Hdr := ad.Header()
+	if p2Hdr.PassedCount != 1 || p2Hdr.FailedCount != 1 || p2Hdr.InconclusiveCount != 0 || p2Hdr.ProgressCurrent != 2 {
+		t.Errorf("expected step 2 counters Pass:1 Fail:1 Incon:0 Probes:2/4, got Pass:%d Fail:%d Incon:%d Probes:%d/%d",
+			p2Hdr.PassedCount, p2Hdr.FailedCount, p2Hdr.InconclusiveCount, p2Hdr.ProgressCurrent, p2Hdr.ProgressTotal)
+	}
+
+	bus.Publish(events.ProbeCompleted{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    3,
+			Total:        4,
+			Passed:       1,
+			Failed:       1,
+			Inconclusive: 1,
+		},
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	p3Hdr := ad.Header()
+	if p3Hdr.PassedCount != 1 || p3Hdr.FailedCount != 1 || p3Hdr.InconclusiveCount != 1 || p3Hdr.ProgressCurrent != 3 {
+		t.Errorf("expected step 3 counters Pass:1 Fail:1 Incon:1 Probes:3/4, got Pass:%d Fail:%d Incon:%d Probes:%d/%d",
+			p3Hdr.PassedCount, p3Hdr.FailedCount, p3Hdr.InconclusiveCount, p3Hdr.ProgressCurrent, p3Hdr.ProgressTotal)
+	}
+
+	// 5. CycleFinished reaches final cycle values and sets CycleIdle
+	bus.Publish(events.CycleFinished{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    4,
+			Total:        4,
+			Passed:       2,
+			Failed:       1,
+			Inconclusive: 1,
+		},
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	finHdr := ad.Header()
+	if finHdr.CycleStatus != viewmodel.CycleIdle {
+		t.Errorf("expected CycleIdle after CycleFinished, got %s", finHdr.CycleStatus)
+	}
+	if finHdr.PassedCount != 2 || finHdr.FailedCount != 1 || finHdr.InconclusiveCount != 1 || finHdr.ProgressCurrent != 4 {
+		t.Errorf("expected final cycle counters Pass:2 Fail:1 Incon:1 Probes:4/4, got Pass:%d Fail:%d Incon:%d Probes:%d/%d",
+			finHdr.PassedCount, finHdr.FailedCount, finHdr.InconclusiveCount, finHdr.ProgressCurrent, finHdr.ProgressTotal)
+	}
+
+	// Verify authoritative aggregate store stats remain intact and correct
+	finalStoreStats := ad.StoreStats()
+	if finalStoreStats.Passed != 2 || finalStoreStats.Failed != 1 || finalStoreStats.Inconclusive != 1 {
+		t.Errorf("expected store aggregate stats to remain correct, got %+v", finalStoreStats)
+	}
+
+	// 6. Next CycleStarted unconditionally resets counters back to 0
+	bus.Publish(events.CycleStarted{StartedAt: time.Now()})
+	time.Sleep(20 * time.Millisecond)
+
+	nextHdr := ad.Header()
+	if nextHdr.CycleStatus != viewmodel.CycleRunning {
+		t.Errorf("expected CycleRunning on next cycle, got %s", nextHdr.CycleStatus)
+	}
+	if nextHdr.PassedCount != 0 || nextHdr.FailedCount != 0 || nextHdr.InconclusiveCount != 0 || nextHdr.ProgressCurrent != 0 {
+		t.Errorf("expected reset to 0 on next cycle start, got Pass:%d Fail:%d Incon:%d Probes:%d",
+			nextHdr.PassedCount, nextHdr.FailedCount, nextHdr.InconclusiveCount, nextHdr.ProgressCurrent)
+	}
+}
+
+func TestAdapter_LostEventBusEventsPreserveCandidateStateProjection(t *testing.T) {
+	ad, st, _, _ := setupTestAdapter(t)
+
+	// Clean initial dirty state
+	_ = ad.CheckAndResetDirty()
+
+	// Simulate complete loss of EventBus events (no bus.Publish calls)
+	// Mutate the authoritative Store directly
+	cand := "vless://authoritative@1.1.1.1:443#AuthNode"
+	st.PutWithTransition(store.Result{
+		Link:     cand,
+		Status:   store.StatusPassed,
+		Latency:  95 * time.Millisecond,
+		TestedAt: time.Now(),
+	})
+
+	// Adapter detects revision divergence via PollSnapshot (which calls CheckAndResetDirty internally)
+	// and projects authoritative candidate state without corruption
+	snap, updated := ad.PollSnapshot(false)
+	if !updated {
+		t.Fatal("expected PollSnapshot updated=true after store revision change")
+	}
+	if len(snap.Rows) != 1 {
+		t.Fatalf("expected 1 candidate row projected, got %d", len(snap.Rows))
+	}
+	if snap.Rows[0].Remark != "AuthNode" || snap.Rows[0].Status != "PASS" {
+		t.Errorf("expected correctly projected AuthNode row, got %+v", snap.Rows[0])
+	}
+	if snap.Header.TotalCandidates != 1 {
+		t.Errorf("expected TotalCandidates 1 in header, got %d", snap.Header.TotalCandidates)
+	}
+}
+
+func TestAdapter_CycleFinishedFinalValuesOnAbort(t *testing.T) {
+	ad, _, bus, _ := setupTestAdapter(t)
+	ad.Subscribe()
+
+	bus.Publish(events.CycleStarted{StartedAt: time.Now()})
+	time.Sleep(20 * time.Millisecond)
+
+	// Cycle aborts early (e.g. empty fetch error)
+	bus.Publish(events.CycleFinished{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    0,
+			Total:        0,
+			Passed:       0,
+			Failed:       0,
+			Inconclusive: 0,
+		},
+		Cancelled: false,
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	hdr := ad.Header()
+	if hdr.CycleStatus != viewmodel.CycleIdle {
+		t.Errorf("expected CycleIdle, got %s", hdr.CycleStatus)
+	}
+	if hdr.PassedCount != 0 || hdr.FailedCount != 0 || hdr.InconclusiveCount != 0 {
+		t.Errorf("expected 0/0/0 counters on aborted cycle, got Pass:%d Fail:%d Incon:%d",
+			hdr.PassedCount, hdr.FailedCount, hdr.InconclusiveCount)
+	}
+}
+
+func TestAdapter_LostIntermediateProbeCompletedEvents(t *testing.T) {
+	ad, _, bus, _ := setupTestAdapter(t)
+	ad.Subscribe()
+
+	bus.Publish(events.CycleStarted{StartedAt: time.Now()})
+	bus.Publish(events.CandidatesLoaded{Total: 10})
+	time.Sleep(20 * time.Millisecond)
+
+	// Probe 1 is published
+	bus.Publish(events.ProbeCompleted{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    1,
+			Total:        10,
+			Passed:       1,
+			Failed:       0,
+			Inconclusive: 0,
+		},
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	h1 := ad.Header()
+	if h1.PassedCount != 1 || h1.ProgressCurrent != 1 {
+		t.Fatalf("expected 1 pass, 1 completed, got Pass:%d Probes:%d", h1.PassedCount, h1.ProgressCurrent)
+	}
+
+	// SIMULATE DROPPED EVENTS: Probes 2, 3, 4, 5 complete, but their events are NEVER delivered (lost due to queue saturation).
+	// Probe 6 arrives with cumulative metrics reflecting all 6 probes:
+	bus.Publish(events.ProbeCompleted{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    6,
+			Total:        10,
+			Passed:       4,
+			Failed:       1,
+			Inconclusive: 1,
+		},
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	// Adapter immediately catches up to cumulative counts without corruption
+	h6 := ad.Header()
+	if h6.PassedCount != 4 || h6.FailedCount != 1 || h6.InconclusiveCount != 1 || h6.ProgressCurrent != 6 {
+		t.Errorf("expected cumulative recovery Pass:4 Fail:1 Incon:1 Probes:6/10, got Pass:%d Fail:%d Incon:%d Probes:%d/%d",
+			h6.PassedCount, h6.FailedCount, h6.InconclusiveCount, h6.ProgressCurrent, h6.ProgressTotal)
+	}
+}
+
+func TestAdapter_LostCycleFinishedRecoverableViaStore(t *testing.T) {
+	ad, st, bus, _ := setupTestAdapter(t)
+	ad.Subscribe()
+
+	// Initial cycle count is 0
+	if st.Stats().CycleCount != 0 {
+		t.Fatalf("expected initial CycleCount 0, got %d", st.Stats().CycleCount)
+	}
+
+	// Cycle starts
+	bus.Publish(events.CycleStarted{StartedAt: time.Now()})
+	bus.Publish(events.CandidatesLoaded{Total: 3})
+	time.Sleep(20 * time.Millisecond)
+
+	hStart := ad.Header()
+	if hStart.CycleStatus != viewmodel.CycleRunning {
+		t.Fatalf("expected CycleRunning, got %s", hStart.CycleStatus)
+	}
+
+	// Candidates tested into Store
+	now := time.Now()
+	st.PutWithTransition(store.Result{Link: "vless://c1@1.1.1.1:443#C1", Status: store.StatusPassed, TestedAt: now})
+	st.PutWithTransition(store.Result{Link: "vless://c2@2.2.2.2:443#C2", Status: store.StatusFailed, TestedAt: now})
+	st.PutWithTransition(store.Result{Link: "vless://c3@3.3.3.3:443#C3", Status: store.StatusInconclusive, TestedAt: now})
+
+	// Probe 1 event delivered
+	bus.Publish(events.ProbeCompleted{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    1,
+			Total:        3,
+			Passed:       1,
+			Failed:       0,
+			Inconclusive: 0,
+		},
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	// SIMULATE SEVERE LOSS: Probe 2, Probe 3, AND CycleFinished events are ALL LOST!
+	// Scheduler calls FinishCycle() on Store (authoritative store completes cycle)
+	st.FinishCycle()
+
+	// Adapter polls on tick (or queries Header)
+	snap, updated := ad.PollSnapshot(false)
+	if !updated {
+		t.Fatal("expected PollSnapshot updated=true due to Store revision and cycle completion")
+	}
+
+	// Verify cycle status reconciled to CycleIdle despite missing CycleFinished event
+	if snap.Header.CycleStatus != viewmodel.CycleIdle {
+		t.Errorf("expected reconciled CycleIdle, got %s", snap.Header.CycleStatus)
+	}
+	// Verify final cycle counts reconciled from authoritative store history
+	if snap.Header.PassedCount != 1 || snap.Header.FailedCount != 1 || snap.Header.InconclusiveCount != 1 {
+		t.Errorf("expected reconciled counts Pass:1 Fail:1 Incon:1, got Pass:%d Fail:%d Incon:%d",
+			snap.Header.PassedCount, snap.Header.FailedCount, snap.Header.InconclusiveCount)
+	}
+	if snap.Header.ProgressCurrent != 3 {
+		t.Errorf("expected ProgressCurrent 3, got %d", snap.Header.ProgressCurrent)
+	}
+	if snap.Header.CycleCount != 1 {
+		t.Errorf("expected CycleCount 1, got %d", snap.Header.CycleCount)
+	}
+}
+
+func TestAdapter_NextCycleStartedUnconditionalReset(t *testing.T) {
+	ad, _, bus, _ := setupTestAdapter(t)
+	ad.Subscribe()
+
+	// Cycle 1 finishes with non-zero counters
+	bus.Publish(events.CycleStarted{StartedAt: time.Now()})
+	bus.Publish(events.CycleFinished{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    8,
+			Total:        8,
+			Passed:       5,
+			Failed:       2,
+			Inconclusive: 1,
+		},
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	hPrev := ad.Header()
+	if hPrev.CycleStatus != viewmodel.CycleIdle || hPrev.PassedCount != 5 || hPrev.FailedCount != 2 || hPrev.InconclusiveCount != 1 {
+		t.Fatalf("expected cycle 1 metrics Pass:5 Fail:2 Incon:1, got %+v", hPrev)
+	}
+
+	// Next cycle begins
+	bus.Publish(events.CycleStarted{StartedAt: time.Now()})
+	time.Sleep(20 * time.Millisecond)
+
+	hNext := ad.Header()
+	if hNext.CycleStatus != viewmodel.CycleRunning {
+		t.Errorf("expected CycleRunning, got %s", hNext.CycleStatus)
+	}
+	if hNext.PassedCount != 0 || hNext.FailedCount != 0 || hNext.InconclusiveCount != 0 {
+		t.Errorf("expected all counters reset to 0, got Pass:%d Fail:%d Incon:%d",
+			hNext.PassedCount, hNext.FailedCount, hNext.InconclusiveCount)
+	}
+	if hNext.ProgressCurrent != 0 || hNext.ProgressTotal != 0 {
+		t.Errorf("expected progress reset to 0/0, got %d/%d", hNext.ProgressCurrent, hNext.ProgressTotal)
+	}
+}
+
+func TestAdapter_CancellationAndAbortPaths(t *testing.T) {
+	ad, _, bus, _ := setupTestAdapter(t)
+	ad.Subscribe()
+
+	// Path 1: Cancellation mid-cycle
+	bus.Publish(events.CycleStarted{StartedAt: time.Now()})
+	bus.Publish(events.CandidatesLoaded{Total: 10})
+	bus.Publish(events.ProbeCompleted{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    2,
+			Total:        10,
+			Passed:       1,
+			Failed:       1,
+			Inconclusive: 0,
+		},
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	// Scheduler cancels and publishes CycleFinished with Cancelled=true and partial metrics
+	bus.Publish(events.CycleFinished{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    2,
+			Total:        10,
+			Passed:       1,
+			Failed:       1,
+			Inconclusive: 0,
+		},
+		Cancelled: true,
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	hCancel := ad.Header()
+	if hCancel.CycleStatus != viewmodel.CycleIdle {
+		t.Errorf("expected CycleIdle on cancellation, got %s", hCancel.CycleStatus)
+	}
+	if hCancel.PassedCount != 1 || hCancel.FailedCount != 1 || hCancel.InconclusiveCount != 0 {
+		t.Errorf("expected partial metrics Pass:1 Fail:1 Incon:0, got Pass:%d Fail:%d Incon:%d",
+			hCancel.PassedCount, hCancel.FailedCount, hCancel.InconclusiveCount)
+	}
+	if hCancel.ProgressCurrent != 2 || hCancel.ProgressTotal != 10 {
+		t.Errorf("expected progress 2/10, got %d/%d", hCancel.ProgressCurrent, hCancel.ProgressTotal)
+	}
+
+	// Path 2: Empty fetch abort
+	bus.Publish(events.CycleStarted{StartedAt: time.Now()})
+	time.Sleep(20 * time.Millisecond)
+	bus.Publish(events.CycleFinished{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    0,
+			Total:        0,
+			Passed:       0,
+			Failed:       0,
+			Inconclusive: 0,
+		},
+		Cancelled: false,
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	hAbort := ad.Header()
+	if hAbort.CycleStatus != viewmodel.CycleIdle {
+		t.Errorf("expected CycleIdle on abort, got %s", hAbort.CycleStatus)
+	}
+	if hAbort.PassedCount != 0 || hAbort.FailedCount != 0 || hAbort.InconclusiveCount != 0 {
+		t.Errorf("expected 0/0/0 on abort, got Pass:%d Fail:%d Incon:%d",
+			hAbort.PassedCount, hAbort.FailedCount, hAbort.InconclusiveCount)
 	}
 }

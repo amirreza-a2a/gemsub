@@ -31,11 +31,12 @@ const (
 	ViewLogs
 )
 
-type tickMsg time.Time
+// TickMsg represents a periodic background refresh tick (bounded at 10 Hz / 100 ms).
+type TickMsg time.Time
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
-		return tickMsg(t)
+		return TickMsg(t)
 	})
 }
 
@@ -101,7 +102,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.terminalTooSmall = (m.width < 80 || m.height < 24)
 		return m, nil
 
-	case tickMsg:
+	case TickMsg:
 		// Background Store/ViewModel refreshes are throttled to a maximum 10 Hz rate (100 ms interval).
 		// When dirty == false, no Store snapshot or ViewModel rebuild is performed.
 		// Interactive navigation (keys, resizes) responds and renders immediately without frame drops.
@@ -446,7 +447,7 @@ func (m *Model) renderHeader() string {
 		progStr = fmt.Sprintf("Probes: %d / %d (%d%%)", m.header.ProgressCurrent, m.header.ProgressTotal, pct)
 	}
 
-	line2 := fmt.Sprintf("Servable: %s / %d  |  Pass: %d  Fail: %d  Incon: %d  |  %s",
+	line2 := fmt.Sprintf("Servable: %s / %d  |  Cycle: Pass: %d  Fail: %d  Incon: %d  |  %s",
 		green.Render(fmt.Sprintf("%d", m.header.ServableCount)),
 		m.header.TotalCandidates,
 		m.header.PassedCount,

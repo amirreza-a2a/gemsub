@@ -176,3 +176,56 @@ func TestModel_DetailIPv6BracketedHostPort(t *testing.T) {
 		t.Errorf("expected bracketed IPv6 Host/Port '[2001:db8::1]:443', got:\n%s", viewDetail)
 	}
 }
+
+func TestModel_HeaderRendersCurrentCycleMetrics(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "state.json")
+
+	st := store.New(stateFile, 2)
+	// Historical records in store: 2 passed, 1 failed
+	now := time.Now()
+	st.PutWithTransition(store.Result{Link: "vless://old1@1.1.1.1:443#Old1", Status: store.StatusPassed, TestedAt: now})
+	st.PutWithTransition(store.Result{Link: "vless://old2@1.1.1.2:443#Old2", Status: store.StatusPassed, TestedAt: now})
+	st.PutWithTransition(store.Result{Link: "vless://old3@1.1.1.3:443#Old3", Status: store.StatusFailed, TestedAt: now})
+
+	bus := events.New()
+	defer bus.Close()
+	ring := logging.NewRingLogHandler(100)
+
+	ad := adapter.New(st, bus, ring)
+	ad.Subscribe()
+	defer ad.Close()
+
+	m := tui.New(ad)
+
+	// Initial render: store has 2 passed, 1 failed, but current cycle metrics must be 0!
+	viewInit := m.View()
+	if !strings.Contains(viewInit, "Cycle: Pass: 0  Fail: 0  Incon: 0") {
+		t.Errorf("expected initial header to render 'Cycle: Pass: 0  Fail: 0  Incon: 0', got:\n%s", viewInit)
+	}
+
+	// Cycle starts and probes complete
+	bus.Publish(events.CycleStarted{StartedAt: time.Now()})
+	bus.Publish(events.ProbeCompleted{
+		ProgressMetrics: events.ProgressMetrics{
+			Completed:    1,
+			Total:        1,
+			Passed:       1,
+			Failed:       0,
+			Inconclusive: 0,
+		},
+	})
+	time.Sleep(30 * time.Millisecond)
+
+	// Exercise the actual tick/update path directly via TickMsg
+	updated, cmd := m.Update(tui.TickMsg(time.Now()))
+	if cmd == nil {
+		t.Fatal("expected non-nil reschedule tick command from Update(TickMsg)")
+	}
+	m = updated.(*tui.Model)
+
+	viewUpdated := m.View()
+	if !strings.Contains(viewUpdated, "Cycle: Pass: 1  Fail: 0  Incon: 0") {
+		t.Errorf("expected updated header to render 'Cycle: Pass: 1  Fail: 0  Incon: 0', got:\n%s", viewUpdated)
+	}
+}

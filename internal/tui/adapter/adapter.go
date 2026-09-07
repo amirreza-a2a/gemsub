@@ -25,11 +25,15 @@ type Adapter struct {
 	bus         *events.EventBus
 	ringHandler *logging.RingLogHandler
 
-	mu              sync.RWMutex
-	dirty           int32
-	cycleStatus     viewmodel.CycleStatus
-	progressCurrent int
-	progressTotal   int
+	mu                      sync.RWMutex
+	dirty                   int32
+	cycleStatus             viewmodel.CycleStatus
+	progressCurrent         int
+	progressTotal           int
+	cyclePassed             int
+	cycleFailed             int
+	cycleInconclusive       int
+	lastCompletedCycleCount int
 
 	// Opaque ID mapping for the current UI snapshot lifecycle
 	idToLink  map[string]string
@@ -52,20 +56,23 @@ type Adapter struct {
 // New creates an unstarted Adapter.
 func New(st *store.Store, bus *events.EventBus, ring *logging.RingLogHandler) *Adapter {
 	var initRev uint64
+	var initCycleCount int
 	if st != nil {
 		initRev = st.Revision()
+		initCycleCount = st.Stats().CycleCount
 	}
 	return &Adapter{
-		st:           st,
-		bus:          bus,
-		ringHandler:  ring,
-		cycleStatus:  viewmodel.CycleIdle,
-		idToLink:     make(map[string]string),
-		linkToID:     make(map[string]string),
-		doneCh:       make(chan struct{}),
-		logLevel:     slog.LevelInfo,
-		followMode:   true,
-		lastRevision: initRev,
+		st:                      st,
+		bus:                     bus,
+		ringHandler:             ring,
+		cycleStatus:             viewmodel.CycleIdle,
+		idToLink:                make(map[string]string),
+		linkToID:                make(map[string]string),
+		doneCh:                  make(chan struct{}),
+		logLevel:                slog.LevelInfo,
+		followMode:              true,
+		lastRevision:            initRev,
+		lastCompletedCycleCount: initCycleCount,
 	}
 }
 
@@ -124,6 +131,9 @@ func (a *Adapter) handleEvent(evt any) {
 		a.cycleStatus = viewmodel.CycleRunning
 		a.progressCurrent = 0
 		a.progressTotal = 0
+		a.cyclePassed = 0
+		a.cycleFailed = 0
+		a.cycleInconclusive = 0
 		atomic.StoreInt32(&a.dirty, 1)
 
 	case events.CandidatesLoaded:
@@ -135,14 +145,66 @@ func (a *Adapter) handleEvent(evt any) {
 		if e.Total > 0 {
 			a.progressTotal = e.Total
 		}
+		a.cyclePassed = e.Passed
+		a.cycleFailed = e.Failed
+		a.cycleInconclusive = e.Inconclusive
 		atomic.StoreInt32(&a.dirty, 1)
 
 	case events.CycleFinished:
 		a.cycleStatus = viewmodel.CycleIdle
 		a.progressCurrent = e.Completed
 		a.progressTotal = e.Total
+		a.cyclePassed = e.Passed
+		a.cycleFailed = e.Failed
+		a.cycleInconclusive = e.Inconclusive
+		if a.st != nil {
+			a.lastCompletedCycleCount = a.st.Stats().CycleCount
+		}
 		atomic.StoreInt32(&a.dirty, 1)
 	}
+}
+
+// reconcileCycleStateLocked detects if Store has completed a cycle whose CycleFinished event
+// was lost, and reconciles cycle status and metrics from authoritative Store state.
+// Caller must hold a.mu Lock.
+func (a *Adapter) reconcileCycleStateLocked() bool {
+	if a.st == nil {
+		return false
+	}
+	stats := a.st.Stats()
+	if a.cycleStatus == viewmodel.CycleRunning && stats.CycleCount > a.lastCompletedCycleCount {
+		a.cycleStatus = viewmodel.CycleIdle
+		a.lastCompletedCycleCount = stats.CycleCount
+
+		if stats.CycleCount > 0 {
+			completedCycleID := uint64(stats.CycleCount - 1)
+			var passed, failed, inconclusive int
+			for _, snap := range a.st.Snapshots() {
+				if lastSample, ok := snap.Record.History.Last(); ok && lastSample.CycleID == completedCycleID {
+					switch lastSample.Status {
+					case store.StatusPassed:
+						passed++
+					case store.StatusFailed:
+						failed++
+					case store.StatusInconclusive:
+						inconclusive++
+					}
+				}
+			}
+			totalObs := passed + failed + inconclusive
+			if totalObs > 0 {
+				a.cyclePassed = passed
+				a.cycleFailed = failed
+				a.cycleInconclusive = inconclusive
+				a.progressCurrent = totalObs
+				if a.progressTotal < totalObs {
+					a.progressTotal = totalObs
+				}
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // CheckAndResetDirty returns true if state has been invalidated since last check,
@@ -158,6 +220,9 @@ func (a *Adapter) CheckAndResetDirty() bool {
 			a.lastRevision = currentRev
 			dirty = true
 		}
+		if a.reconcileCycleStateLocked() {
+			dirty = true
+		}
 	}
 	return dirty
 }
@@ -168,13 +233,19 @@ func (a *Adapter) MarkDirty() {
 }
 
 // Header returns the current HeaderViewModel constructed from authoritative Store.Stats()
-// and ephemeral cycle lifecycle metrics.
+// and ephemeral cycle lifecycle metrics. Pass/Fail/Incon counts represent the active cycle only.
 func (a *Adapter) Header() viewmodel.HeaderViewModel {
-	a.mu.RLock()
+	a.mu.Lock()
+	if a.st != nil {
+		a.reconcileCycleStateLocked()
+	}
 	cycleStatus := a.cycleStatus
 	progCurrent := a.progressCurrent
 	progTotal := a.progressTotal
-	a.mu.RUnlock()
+	cyclePassed := a.cyclePassed
+	cycleFailed := a.cycleFailed
+	cycleIncon := a.cycleInconclusive
+	a.mu.Unlock()
 
 	var stats store.Stats
 	if a.st != nil {
@@ -188,11 +259,19 @@ func (a *Adapter) Header() viewmodel.HeaderViewModel {
 		ProgressCurrent:   progCurrent,
 		ProgressTotal:     progTotal,
 		TotalCandidates:   stats.Total,
-		PassedCount:       stats.Passed,
-		FailedCount:       stats.Failed,
-		InconclusiveCount: stats.Inconclusive,
+		PassedCount:       cyclePassed,
+		FailedCount:       cycleFailed,
+		InconclusiveCount: cycleIncon,
 		ServableCount:     stats.Servable,
 	}
+}
+
+// StoreStats returns the authoritative Store aggregate statistics.
+func (a *Adapter) StoreStats() store.Stats {
+	if a.st != nil {
+		return a.st.Stats()
+	}
+	return store.Stats{}
 }
 
 // CandidateRows queries the authoritative Store, applies the canonical candidate ranking
