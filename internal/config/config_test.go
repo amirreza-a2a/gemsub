@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gemsub/internal/config"
 )
@@ -225,5 +226,249 @@ func TestFlagMode_Validation(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "flag_mode") {
 		t.Errorf("expected error message to mention flag_mode, got: %v", err)
+	}
+}
+
+func TestHealthConfig_Defaults(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Test.HealthURL != "https://www.gstatic.com/generate_204" {
+		t.Errorf("expected default HealthURL='https://www.gstatic.com/generate_204', got %q", cfg.Test.HealthURL)
+	}
+	if cfg.Test.HealthTimeout != 4*time.Second {
+		t.Errorf("expected default HealthTimeout=4s, got %s", cfg.Test.HealthTimeout)
+	}
+}
+
+func TestHealthConfig_InheritDialTimeout(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	testCfg := cfgMap["test"].(map[string]interface{})
+	testCfg["dial_timeout"] = "6s"
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Test.HealthTimeout != 6*time.Second {
+		t.Errorf("expected HealthTimeout to inherit dial_timeout (6s), got %s", cfg.Test.HealthTimeout)
+	}
+}
+
+func TestHealthConfig_ExplicitValues(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	testCfg := cfgMap["test"].(map[string]interface{})
+	testCfg["health_url"] = "https://custom.connectivity.test/check"
+	testCfg["health_timeout"] = "2s"
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Test.HealthURL != "https://custom.connectivity.test/check" {
+		t.Errorf("expected custom HealthURL, got %q", cfg.Test.HealthURL)
+	}
+	if cfg.Test.HealthTimeout != 2*time.Second {
+		t.Errorf("expected HealthTimeout=2s, got %s", cfg.Test.HealthTimeout)
+	}
+}
+
+func TestHealthConfig_InvalidTimeout(t *testing.T) {
+	dir := t.TempDir()
+
+	invalidCases := []struct {
+		val string
+		msg string
+	}{
+		{"invalid_duration", "test.health_timeout"},
+		{"0s", "test.health_timeout must be positive"},
+		{"-5s", "test.health_timeout must be positive"},
+	}
+
+	for _, tc := range invalidCases {
+		cfgMap := baseConfig()
+		testCfg := cfgMap["test"].(map[string]interface{})
+		testCfg["health_timeout"] = tc.val
+		path := writeTestConfig(t, dir, cfgMap)
+
+		_, err := config.Load(path)
+		if err == nil {
+			t.Errorf("expected error for health_timeout=%q, got nil", tc.val)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.msg) {
+			t.Errorf("expected error containing %q, got %q", tc.msg, err.Error())
+		}
+	}
+}
+
+func TestGeminiConfig_LegacyFallback(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	testCfg := cfgMap["test"].(map[string]interface{})
+	testCfg["target_url"] = "https://legacy.gemini.endpoint/test"
+	testCfg["block_phrases"] = []string{"legacy block phrase"}
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Test.Gemini.URL != "https://legacy.gemini.endpoint/test" {
+		t.Errorf("expected Gemini.URL to be populated from target_url, got %q", cfg.Test.Gemini.URL)
+	}
+	if len(cfg.Test.Gemini.BlockPhrases) != 1 || cfg.Test.Gemini.BlockPhrases[0] != "legacy block phrase" {
+		t.Errorf("expected Gemini.BlockPhrases populated from legacy block_phrases, got %v", cfg.Test.Gemini.BlockPhrases)
+	}
+	if cfg.Test.TargetURL != cfg.Test.Gemini.URL {
+		t.Errorf("expected TargetURL to match Gemini.URL for backward compatibility")
+	}
+	if len(cfg.Test.BlockPhrases) != 1 || cfg.Test.BlockPhrases[0] != "legacy block phrase" {
+		t.Errorf("expected BlockPhrases to match Gemini.BlockPhrases for backward compatibility")
+	}
+}
+
+func TestGeminiConfig_NewSyntax(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	testCfg := cfgMap["test"].(map[string]interface{})
+	delete(testCfg, "target_url")
+	delete(testCfg, "block_phrases")
+	testCfg["gemini"] = map[string]interface{}{
+		"url":           "https://new.gemini.endpoint/app",
+		"block_phrases": []string{"new block 1", "new block 2"},
+	}
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Test.Gemini.URL != "https://new.gemini.endpoint/app" {
+		t.Errorf("expected Gemini.URL=%q, got %q", "https://new.gemini.endpoint/app", cfg.Test.Gemini.URL)
+	}
+	if len(cfg.Test.Gemini.BlockPhrases) != 2 || cfg.Test.Gemini.BlockPhrases[0] != "new block 1" {
+		t.Errorf("expected Gemini.BlockPhrases to be populated from new syntax, got %v", cfg.Test.Gemini.BlockPhrases)
+	}
+	if cfg.Test.TargetURL != cfg.Test.Gemini.URL {
+		t.Errorf("expected TargetURL synced to Gemini.URL, got %q", cfg.Test.TargetURL)
+	}
+	if len(cfg.Test.BlockPhrases) != 2 || cfg.Test.BlockPhrases[0] != "new block 1" {
+		t.Errorf("expected BlockPhrases synced to Gemini.BlockPhrases, got %v", cfg.Test.BlockPhrases)
+	}
+}
+
+func TestGeminiConfig_Precedence(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	testCfg := cfgMap["test"].(map[string]interface{})
+	testCfg["target_url"] = "https://legacy.gemini.endpoint/old"
+	testCfg["block_phrases"] = []string{"old phrase"}
+	testCfg["gemini"] = map[string]interface{}{
+		"url":           "https://new.gemini.endpoint/new",
+		"block_phrases": []string{"new phrase"},
+	}
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Test.Gemini.URL != "https://new.gemini.endpoint/new" {
+		t.Errorf("expected new gemini.url to take precedence, got %q", cfg.Test.Gemini.URL)
+	}
+	if len(cfg.Test.Gemini.BlockPhrases) != 1 || cfg.Test.Gemini.BlockPhrases[0] != "new phrase" {
+		t.Errorf("expected new gemini.block_phrases to take precedence, got %v", cfg.Test.Gemini.BlockPhrases)
+	}
+	if cfg.Test.TargetURL != "https://new.gemini.endpoint/new" {
+		t.Errorf("expected TargetURL to sync with winning Gemini.URL, got %q", cfg.Test.TargetURL)
+	}
+	if len(cfg.Test.BlockPhrases) != 1 || cfg.Test.BlockPhrases[0] != "new phrase" {
+		t.Errorf("expected BlockPhrases to sync with winning Gemini.BlockPhrases, got %v", cfg.Test.BlockPhrases)
+	}
+}
+
+func TestGeminiConfig_DefaultURL(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	testCfg := cfgMap["test"].(map[string]interface{})
+	delete(testCfg, "target_url")
+	testCfg["gemini"] = map[string]interface{}{
+		"block_phrases": []string{"block phrase"},
+	}
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Test.Gemini.URL != "https://gemini.google.com/" {
+		t.Errorf("expected default Gemini.URL='https://gemini.google.com/', got %q", cfg.Test.Gemini.URL)
+	}
+	if cfg.Test.TargetURL != "https://gemini.google.com/" {
+		t.Errorf("expected default TargetURL='https://gemini.google.com/', got %q", cfg.Test.TargetURL)
+	}
+}
+
+func TestGeminiConfig_MissingBlockPhrases(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	testCfg := cfgMap["test"].(map[string]interface{})
+	delete(testCfg, "block_phrases")
+	delete(testCfg, "gemini")
+	path := writeTestConfig(t, dir, cfgMap)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected error when block phrases are omitted, got nil")
+	}
+	if !strings.Contains(err.Error(), "block_phrases must not be empty") {
+		t.Errorf("expected error message to mention block_phrases, got: %v", err)
+	}
+}
+
+func TestConfigExample_LoadsSuccessfully(t *testing.T) {
+	path := filepath.Join("..", "..", "config.example.json")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("failed to load config.example.json: %v", err)
+	}
+	if cfg.Test.HealthURL != "https://www.gstatic.com/generate_204" {
+		t.Errorf("expected health_url in config.example.json, got %q", cfg.Test.HealthURL)
+	}
+	if cfg.Test.Gemini.URL != "https://gemini.google.com/" {
+		t.Errorf("expected gemini.url in config.example.json, got %q", cfg.Test.Gemini.URL)
+	}
+	if len(cfg.Test.Gemini.BlockPhrases) == 0 {
+		t.Errorf("expected non-empty block phrases in config.example.json")
+	}
+}
+
+func TestConfigJson_LoadsSuccessfully(t *testing.T) {
+	path := filepath.Join("..", "..", "config.json")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Skip("config.json does not exist, skipping")
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("failed to load existing config.json: %v", err)
+	}
+	if cfg.Test.HealthURL != "https://www.gstatic.com/generate_204" {
+		t.Errorf("expected default health_url for legacy config.json, got %q", cfg.Test.HealthURL)
+	}
+	if cfg.Test.Gemini.URL != "https://gemini.google.com/app" {
+		t.Errorf("expected legacy target_url to populate Gemini.URL, got %q", cfg.Test.Gemini.URL)
+	}
+	if len(cfg.Test.Gemini.BlockPhrases) == 0 {
+		t.Errorf("expected legacy block_phrases to populate Gemini.BlockPhrases")
 	}
 }

@@ -4,12 +4,16 @@
   ],
   "fetch_interval": "3h",
   "test": {
-    "target_url": "https://gemini.google.com/",
-    "block_phrases": [
-      "isn't currently supported in your country",
-      "not available in your country",
-      "not available in your region"
-    ],
+    "health_url": "https://www.gstatic.com/generate_204",
+    "health_timeout": "4s",
+    "gemini": {
+      "url": "https://gemini.google.com/",
+      "block_phrases": [
+        "isn't currently supported in your country",
+        "not available in your country",
+        "not available in your region"
+      ]
+    },
     "timeout": "10s",
     "dial_timeout": "4s",
     "concurrency": 40,

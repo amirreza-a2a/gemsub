@@ -8,22 +8,31 @@ import (
 	"time"
 )
 
+type GeminiConfig struct {
+	URL          string   `json:"url,omitempty"`
+	BlockPhrases []string `json:"block_phrases,omitempty"`
+}
+
 type TestConfig struct {
-	TargetURL             string   `json:"target_url"`
-	BlockPhrases          []string `json:"block_phrases"`
-	TimeoutRaw            string   `json:"timeout"`
-	DialTimeoutRaw        string   `json:"dial_timeout,omitempty"`
-	Concurrency           int      `json:"concurrency"`
-	RateLimitRPS          int      `json:"rate_limit_rps,omitempty"`
-	MaxRetriesRaw         *int     `json:"max_retries,omitempty"` // nil = omitted → default 2; 0 = no retries
-	RetryBackoffRaw       string   `json:"retry_backoff,omitempty"`
-	MaxInconclusiveCycles int      `json:"max_inconclusive_cycles,omitempty"`
+	HealthURL             string       `json:"health_url,omitempty"`
+	HealthTimeoutRaw      string       `json:"health_timeout,omitempty"`
+	Gemini                GeminiConfig `json:"gemini,omitempty"`
+	TargetURL             string       `json:"target_url,omitempty"`
+	BlockPhrases          []string     `json:"block_phrases,omitempty"`
+	TimeoutRaw            string       `json:"timeout"`
+	DialTimeoutRaw        string       `json:"dial_timeout,omitempty"`
+	Concurrency           int          `json:"concurrency"`
+	RateLimitRPS          int          `json:"rate_limit_rps,omitempty"`
+	MaxRetriesRaw         *int         `json:"max_retries,omitempty"` // nil = omitted → default 2; 0 = no retries
+	RetryBackoffRaw       string       `json:"retry_backoff,omitempty"`
+	MaxInconclusiveCycles int          `json:"max_inconclusive_cycles,omitempty"`
 
 	// Parsed fields, populated by Validate.
-	Timeout      time.Duration `json:"-"`
-	DialTimeout  time.Duration `json:"-"`
-	RetryBackoff time.Duration `json:"-"`
-	MaxRetries   int           `json:"-"` // Resolved retry count: 0 = exactly one attempt
+	HealthTimeout time.Duration `json:"-"`
+	Timeout       time.Duration `json:"-"`
+	DialTimeout   time.Duration `json:"-"`
+	RetryBackoff  time.Duration `json:"-"`
+	MaxRetries    int           `json:"-"` // Resolved retry count: 0 = exactly one attempt
 }
 
 type ServeConfig struct {
@@ -89,11 +98,27 @@ func (c *Config) Validate() error {
 	}
 	c.FetchInterval = fetchInterval
 
-	if c.Test.TargetURL == "" {
-		return fmt.Errorf("test.target_url must not be empty")
+	// Normalize Gemini URL and legacy TargetURL (new syntax takes precedence).
+	if c.Test.Gemini.URL == "" {
+		if c.Test.TargetURL != "" {
+			c.Test.Gemini.URL = c.Test.TargetURL
+		} else {
+			c.Test.Gemini.URL = "https://gemini.google.com/"
+		}
 	}
-	if len(c.Test.BlockPhrases) == 0 {
-		return fmt.Errorf("test.block_phrases must not be empty")
+	c.Test.TargetURL = c.Test.Gemini.URL
+
+	// Normalize Gemini BlockPhrases and legacy BlockPhrases (new syntax takes precedence).
+	if len(c.Test.Gemini.BlockPhrases) == 0 && len(c.Test.BlockPhrases) > 0 {
+		c.Test.Gemini.BlockPhrases = c.Test.BlockPhrases
+	}
+	if len(c.Test.Gemini.BlockPhrases) == 0 {
+		return fmt.Errorf("test.gemini.block_phrases must not be empty")
+	}
+	c.Test.BlockPhrases = c.Test.Gemini.BlockPhrases
+
+	if c.Test.HealthURL == "" {
+		c.Test.HealthURL = "https://www.gstatic.com/generate_204"
 	}
 
 	timeout, err := time.ParseDuration(c.Test.TimeoutRaw)
@@ -116,6 +141,23 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("test.dial_timeout must be positive")
 		}
 		c.Test.DialTimeout = dialTimeout
+	}
+
+	if c.Test.HealthTimeoutRaw == "" {
+		if c.Test.DialTimeoutRaw != "" {
+			c.Test.HealthTimeout = c.Test.DialTimeout
+		} else {
+			c.Test.HealthTimeout = 4 * time.Second
+		}
+	} else {
+		healthTimeout, err := time.ParseDuration(c.Test.HealthTimeoutRaw)
+		if err != nil {
+			return fmt.Errorf("test.health_timeout: %w", err)
+		}
+		if healthTimeout <= 0 {
+			return fmt.Errorf("test.health_timeout must be positive")
+		}
+		c.Test.HealthTimeout = healthTimeout
 	}
 
 	if c.Test.RetryBackoffRaw == "" {
