@@ -27,10 +27,10 @@ Harden the `gemsub` core engine by resolving all critical blockers, concurrency 
 - [15: audit(pipeline): preserve network-healthy and target-incompatible candidates](issues/15-preserve-network-healthy-target-incompatible-candidates.md): Trace candidate lifecycle and identify semantic collapse where Gemini target-incompatible nodes are physically retained but excluded from query projections.
 - [16: feat(store): preserve and project network-healthy candidates](issues/16-preserve-network-healthy-candidates.md): Preserve and project network-healthy candidates that pass proxy transport but fail Gemini-specific verification without breaking Gemini servability or default publications.
 - [17: feat(config): separate transport and gemini probe configuration](issues/17-separate-transport-and-gemini-probe-configuration.md): Separate generic transport settings from Gemini application settings, adding namespaced `gemini` config and `health_url` with transparent backward compatibility.
+- [18: feat(tester): standalone transport health probe module](issues/18-standalone-transport-health-probe-module.md): Create an un-opinionated HTTPS transport health check (defaulting to `https://www.gstatic.com/generate_204`) with redirect disabling and zero body reading.
 
 ## Active issues
 
-- [18: feat(tester): standalone transport health probe module](issues/18-standalone-transport-health-probe-module.md): Create an un-opinionated HTTPS transport health check (defaulting to `https://www.gstatic.com/generate_204`) with redirect disabling and zero body reading.
 - [19: refactor(tester): isolate gemini application probe](issues/19-isolate-gemini-application-probe.md): Extract Gemini-specific classification, browser headers, WIZ_global_data, and brand verification into an isolated target probe module.
 - [20: feat(store): integrate explicit in-memory transport evidence](issues/20-integrate-explicit-in-memory-transport-evidence.md): Add explicit `TransportOK` and `TransportLatency` to in-memory `store.Result` and prioritize explicit evidence in `networkHealthyStateLocked` with legacy fallback.
 - [21: feat(tester): two-stage probe orchestrator](issues/21-two-stage-probe-orchestrator.md): Implement sequential two-stage probe execution with a single shared Box/dialer, early exit on transport failure, bounded health sub-timeout, and candidate-level retries.
