@@ -1,6 +1,8 @@
 package store
 
 import (
+	"bytes"
+	"encoding/json"
 	"math"
 	"time"
 )
@@ -64,6 +66,9 @@ func (h *BoundedHistory) NormalizeAndValidate(maxCapacity int) {
 	if len(h.Samples) != h.Capacity {
 		newSamples := make([]ProbeSample, h.Capacity)
 		if h.Count > 0 && len(h.Samples) > 0 {
+			if h.Count > len(h.Samples) {
+				h.Count = len(h.Samples)
+			}
 			validCount := 0
 			start := h.Start
 			if start < 0 || start >= len(h.Samples) {
@@ -108,6 +113,67 @@ func (h BoundedHistory) Clone() BoundedHistory {
 		cp.Samples = make([]ProbeSample, h.Capacity)
 	}
 	return cp
+}
+
+// MarshalJSON serializes BoundedHistory compactly, persisting only logically valid
+// samples in chronological order and omitting uninitialized capacity padding.
+func (h BoundedHistory) MarshalJSON() ([]byte, error) {
+	samples := h.ChronologicalSamples()
+	if samples == nil {
+		samples = []ProbeSample{}
+	}
+	return json.Marshal(struct {
+		Capacity int           `json:"capacity"`
+		Count    int           `json:"count"`
+		Samples  []ProbeSample `json:"samples"`
+	}{
+		Capacity: h.Capacity,
+		Count:    h.Count,
+		Samples:  samples,
+	})
+}
+
+// UnmarshalJSON deserializes BoundedHistory, maintaining full backward compatibility
+// with both the legacy full-capacity V2 JSON ({capacity, count, start, samples: [10]})
+// and the new compact representation ({capacity, count, samples: [k]}).
+// It also accepts an array of ProbeSample directly.
+func (h *BoundedHistory) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+		return nil
+	}
+	if data[0] == '[' {
+		var samples []ProbeSample
+		if err := json.Unmarshal(data, &samples); err != nil {
+			return err
+		}
+		h.Samples = samples
+		h.Count = len(samples)
+		h.Capacity = len(samples)
+		h.Start = 0
+		return nil
+	}
+
+	var raw struct {
+		Capacity int           `json:"capacity"`
+		Count    int           `json:"count"`
+		Start    int           `json:"start"`
+		Samples  []ProbeSample `json:"samples"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	h.Capacity = raw.Capacity
+	h.Count = raw.Count
+	h.Start = raw.Start
+	h.Samples = raw.Samples
+
+	// If count was omitted in compact format with fewer samples than capacity
+	if h.Count == 0 && len(h.Samples) > 0 {
+		h.Count = len(h.Samples)
+	}
+
+	return nil
 }
 
 // Push adds a new probe sample to the circular buffer, evicting the oldest sample if capacity is reached.

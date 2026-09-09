@@ -1,7 +1,9 @@
 package store_test
 
 import (
+	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -303,5 +305,255 @@ func TestBoundedHistory_LastPassedLatency(t *testing.T) {
 	lat, ok = h.LastPassedLatency()
 	if !ok || lat != 120*time.Millisecond {
 		t.Fatalf("expected last passed latency to remain 120ms, got %v (ok=%v)", lat, ok)
+	}
+}
+
+func TestBoundedHistory_Serialization_Empty(t *testing.T) {
+	h := store.NewBoundedHistory(10)
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal empty: %v", err)
+	}
+
+	var h2 store.BoundedHistory
+	if err := json.Unmarshal(data, &h2); err != nil {
+		t.Fatalf("unmarshal empty: %v", err)
+	}
+	h2.NormalizeAndValidate(10)
+	if h2.Count != 0 {
+		t.Errorf("expected count 0, got %d", h2.Count)
+	}
+	if h2.Capacity != 10 {
+		t.Errorf("expected capacity 10, got %d", h2.Capacity)
+	}
+	if len(h2.ChronologicalSamples()) != 0 {
+		t.Errorf("expected 0 chronological samples")
+	}
+}
+
+func TestBoundedHistory_Serialization_OneSample(t *testing.T) {
+	h := store.NewBoundedHistory(10)
+	now := time.Now().Truncate(time.Millisecond)
+	h.Push(store.ProbeSample{
+		CycleID:     1,
+		TestedAt:    now,
+		Status:      store.StatusPassed,
+		Category:    store.ErrNone,
+		Latency:     50 * time.Millisecond,
+		Attempts:    1,
+		TransportOK: true,
+	})
+
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal 1 sample: %v", err)
+	}
+
+	// Confirm that no dummy sample padding is serialized
+	if strings.Contains(string(data), "0001-01-01T00:00:00Z") {
+		t.Errorf("compact payload must not contain dummy zero-value timestamps: %s", string(data))
+	}
+
+	var h2 store.BoundedHistory
+	if err := json.Unmarshal(data, &h2); err != nil {
+		t.Fatalf("unmarshal 1 sample: %v", err)
+	}
+	h2.NormalizeAndValidate(10)
+	if h2.Count != 1 {
+		t.Fatalf("expected count 1, got %d", h2.Count)
+	}
+	if h2.Capacity != 10 {
+		t.Fatalf("expected capacity 10, got %d", h2.Capacity)
+	}
+	samples := h2.ChronologicalSamples()
+	if len(samples) != 1 {
+		t.Fatalf("expected 1 sample, got %d", len(samples))
+	}
+	if samples[0].CycleID != 1 || samples[0].Status != store.StatusPassed || samples[0].Latency != 50*time.Millisecond {
+		t.Errorf("sample content mismatch: %+v", samples[0])
+	}
+}
+
+func TestBoundedHistory_Serialization_PartialHistory(t *testing.T) {
+	h := store.NewBoundedHistory(10)
+	for i := uint64(1); i <= 4; i++ {
+		h.Push(store.ProbeSample{
+			CycleID:  i,
+			Status:   store.StatusPassed,
+			Latency:  time.Duration(i*10) * time.Millisecond,
+			Attempts: 1,
+		})
+	}
+
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal partial: %v", err)
+	}
+
+	var h2 store.BoundedHistory
+	if err := json.Unmarshal(data, &h2); err != nil {
+		t.Fatalf("unmarshal partial: %v", err)
+	}
+	h2.NormalizeAndValidate(10)
+	if h2.Count != 4 {
+		t.Fatalf("expected count 4, got %d", h2.Count)
+	}
+	samples := h2.ChronologicalSamples()
+	if len(samples) != 4 {
+		t.Fatalf("expected 4 samples, got %d", len(samples))
+	}
+	for i := 0; i < 4; i++ {
+		if samples[i].CycleID != uint64(i+1) {
+			t.Errorf("sample %d: expected CycleID %d, got %d", i, i+1, samples[i].CycleID)
+		}
+	}
+}
+
+func TestBoundedHistory_Serialization_FullHistory(t *testing.T) {
+	h := store.NewBoundedHistory(5)
+	for i := uint64(1); i <= 5; i++ {
+		h.Push(store.ProbeSample{
+			CycleID:  i,
+			Status:   store.StatusPassed,
+			Latency:  time.Duration(i*10) * time.Millisecond,
+			Attempts: 1,
+		})
+	}
+
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal full: %v", err)
+	}
+
+	var h2 store.BoundedHistory
+	if err := json.Unmarshal(data, &h2); err != nil {
+		t.Fatalf("unmarshal full: %v", err)
+	}
+	h2.NormalizeAndValidate(5)
+	if h2.Count != 5 {
+		t.Fatalf("expected count 5, got %d", h2.Count)
+	}
+	samples := h2.ChronologicalSamples()
+	if len(samples) != 5 {
+		t.Fatalf("expected 5 samples, got %d", len(samples))
+	}
+	for i := 0; i < 5; i++ {
+		if samples[i].CycleID != uint64(i+1) {
+			t.Errorf("sample %d: expected CycleID %d, got %d", i, i+1, samples[i].CycleID)
+		}
+	}
+}
+
+func TestBoundedHistory_Serialization_WrappedCircularHistory(t *testing.T) {
+	h := store.NewBoundedHistory(3)
+	// Push 5 samples into capacity 3 buffer: evicts 1 and 2, retaining [3, 4, 5]
+	for i := uint64(1); i <= 5; i++ {
+		h.Push(store.ProbeSample{
+			CycleID:  i,
+			Status:   store.StatusPassed,
+			Latency:  time.Duration(i*10) * time.Millisecond,
+			Attempts: 1,
+		})
+	}
+
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal wrapped: %v", err)
+	}
+
+	var h2 store.BoundedHistory
+	if err := json.Unmarshal(data, &h2); err != nil {
+		t.Fatalf("unmarshal wrapped: %v", err)
+	}
+	h2.NormalizeAndValidate(3)
+	if h2.Count != 3 {
+		t.Fatalf("expected count 3, got %d", h2.Count)
+	}
+	samples := h2.ChronologicalSamples()
+	expectedIDs := []uint64{3, 4, 5}
+	for i := 0; i < 3; i++ {
+		if samples[i].CycleID != expectedIDs[i] {
+			t.Errorf("sample %d: expected CycleID %d, got %d", i, expectedIDs[i], samples[i].CycleID)
+		}
+	}
+
+	// Push 6th sample to verify continued FIFO operation after unmarshaling
+	h2.Push(store.ProbeSample{CycleID: 6, Status: store.StatusPassed})
+	samplesAfter := h2.ChronologicalSamples()
+	expectedAfter := []uint64{4, 5, 6}
+	for i := 0; i < 3; i++ {
+		if samplesAfter[i].CycleID != expectedAfter[i] {
+			t.Errorf("sample after push %d: expected CycleID %d, got %d", i, expectedAfter[i], samplesAfter[i].CycleID)
+		}
+	}
+}
+
+func TestBoundedHistory_Serialization_LegacyFullCapacityV2(t *testing.T) {
+	// Legacy V2 with 10 preallocated samples where only 2 are valid and 8 are dummy
+	legacyJSON := `{
+		"capacity": 10,
+		"count": 2,
+		"start": 0,
+		"samples": [
+			{"cycle_id": 1, "tested_at": "2026-09-01T12:00:00Z", "status": "passed", "attempts": 1},
+			{"cycle_id": 2, "tested_at": "2026-09-01T12:01:00Z", "status": "passed", "attempts": 1},
+			{"cycle_id": 0, "tested_at": "0001-01-01T00:00:00Z", "status": "", "attempts": 0},
+			{"cycle_id": 0, "tested_at": "0001-01-01T00:00:00Z", "status": "", "attempts": 0},
+			{"cycle_id": 0, "tested_at": "0001-01-01T00:00:00Z", "status": "", "attempts": 0},
+			{"cycle_id": 0, "tested_at": "0001-01-01T00:00:00Z", "status": "", "attempts": 0},
+			{"cycle_id": 0, "tested_at": "0001-01-01T00:00:00Z", "status": "", "attempts": 0},
+			{"cycle_id": 0, "tested_at": "0001-01-01T00:00:00Z", "status": "", "attempts": 0},
+			{"cycle_id": 0, "tested_at": "0001-01-01T00:00:00Z", "status": "", "attempts": 0},
+			{"cycle_id": 0, "tested_at": "0001-01-01T00:00:00Z", "status": "", "attempts": 0}
+		]
+	}`
+
+	var h store.BoundedHistory
+	if err := json.Unmarshal([]byte(legacyJSON), &h); err != nil {
+		t.Fatalf("unmarshal legacy V2: %v", err)
+	}
+	h.NormalizeAndValidate(10)
+	if h.Count != 2 {
+		t.Fatalf("expected count 2, got %d", h.Count)
+	}
+	if h.Capacity != 10 {
+		t.Fatalf("expected capacity 10, got %d", h.Capacity)
+	}
+	samples := h.ChronologicalSamples()
+	if len(samples) != 2 {
+		t.Fatalf("expected 2 chronological samples, got %d", len(samples))
+	}
+	if samples[0].CycleID != 1 || samples[1].CycleID != 2 {
+		t.Errorf("samples mismatch: %+v", samples)
+	}
+}
+
+func TestBoundedHistory_Serialization_InvalidAndCorruptHandling(t *testing.T) {
+	// Negative capacity and out of range count
+	corruptJSON := `{
+		"capacity": -5,
+		"count": 999,
+		"start": -1,
+		"samples": [
+			{"cycle_id": 1, "status": "passed"}
+		]
+	}`
+
+	var h store.BoundedHistory
+	if err := json.Unmarshal([]byte(corruptJSON), &h); err != nil {
+		t.Fatalf("unmarshal corrupt: %v", err)
+	}
+	h.NormalizeAndValidate(10)
+	if h.Capacity != 10 {
+		t.Errorf("expected clamped capacity 10, got %d", h.Capacity)
+	}
+	if h.Count != 1 {
+		t.Errorf("expected clamped count 1, got %d", h.Count)
+	}
+
+	// Malformed JSON syntax
+	var h2 store.BoundedHistory
+	if err := json.Unmarshal([]byte(`{not-json}`), &h2); err == nil {
+		t.Errorf("expected error on malformed JSON")
 	}
 }

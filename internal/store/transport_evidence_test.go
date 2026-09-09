@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -369,13 +370,19 @@ func TestTransportEvidence_SerializationRoundTrip(t *testing.T) {
 		t.Fatalf("failed to save snapshot: %v", err)
 	}
 
-	// Verify disk file is valid JSON
-	content, err := os.ReadFile(statePath)
+	// Verify disk file is valid JSON inside gzip
+	f, err := os.Open(st1.PrimaryPath())
 	if err != nil {
-		t.Fatalf("failed to read state file: %v", err)
+		t.Fatalf("failed to open state file: %v", err)
 	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("failed to create gzip reader: %v", err)
+	}
+	defer gz.Close()
 	var raw map[string]any
-	if err := json.Unmarshal(content, &raw); err != nil {
+	if err := json.NewDecoder(gz).Decode(&raw); err != nil {
 		t.Fatalf("corrupt JSON output: %v", err)
 	}
 	if v, ok := raw["version"].(float64); !ok || int(v) != 2 {

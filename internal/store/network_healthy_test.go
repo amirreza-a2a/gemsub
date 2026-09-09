@@ -452,7 +452,7 @@ func TestStore_PersistenceCompatibility_NetworkPassing(t *testing.T) {
 	}
 
 	// Ensure saved file is valid
-	if _, err := os.Stat(statePath); err != nil {
+	if _, err := os.Stat(st.PrimaryPath()); err != nil {
 		t.Fatalf("state file not created: %v", err)
 	}
 

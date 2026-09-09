@@ -5,14 +5,24 @@
 package store
 
 import (
+	"bufio"
+	"bytes"
+	"cmp"
+	"compress/gzip"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"math"
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // Status is the canonical internal state of a candidate probe outcome.
@@ -52,9 +62,9 @@ func (c ErrorCategory) IsTargetSpecific() bool {
 
 // Result is the outcome of testing a single candidate link.
 type Result struct {
-	Link                    string        `json:"link"`
+	Link                    string        `json:"link,omitempty"`
 	Status                  Status        `json:"status"` // Canonical internal state
-	Passed                  bool          `json:"passed"` // Outcome of latest probe (Status == StatusPassed)
+	Passed                  bool          `json:"passed,omitempty"` // Outcome of latest probe (Status == StatusPassed)
 	Reason                  string        `json:"reason"`
 	Category                ErrorCategory `json:"category,omitempty"`
 	StatusCode              int           `json:"status_code,omitempty"`
@@ -138,6 +148,22 @@ func (s *Store) Config() ScoringConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.cfg.Clone()
+}
+
+// PrimaryPath returns the physical primary persistence file path.
+// If the configured path already ends with ".gz", it is returned as-is;
+// otherwise ".gz" is appended.
+func (s *Store) PrimaryPath() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.primaryPathLocked()
+}
+
+func (s *Store) primaryPathLocked() string {
+	if strings.HasSuffix(s.path, ".gz") {
+		return s.path
+	}
+	return s.path + ".gz"
 }
 
 // servabilityGateLocked evaluates the 4 operational policy gates for candidate servability
@@ -307,20 +333,71 @@ func (s *Store) IsServable(r Result) bool {
 
 // Load reads a previously saved snapshot from disk, if present.
 // Missing file is not an error — it just means a cold start.
+// It checks the primary compressed path (<path>.gz) first, falling back to legacy raw JSON (<path>).
+// Gzip compression is detected via magic bytes 0x1f 0x8b regardless of file extension.
 // When Version 2 snapshot is found, BoundedHistory is authoritative and Score is recomputed.
 // When legacy Version 1 snapshot is found, results are deterministically migrated.
 func (s *Store) Load() error {
-	data, err := os.ReadFile(s.path)
+	primary := s.PrimaryPath()
+
+	s.mu.RLock()
+	legacyPath := s.path
+	s.mu.RUnlock()
+
+	f, err := os.Open(primary)
 	if os.IsNotExist(err) {
-		return nil
+		if primary != legacyPath {
+			f, err = os.Open(legacyPath)
+			if os.IsNotExist(err) {
+				return nil // Clean cold start
+			}
+		} else {
+			return nil // Clean cold start
+		}
 	}
 	if err != nil {
 		return err
 	}
+	defer f.Close()
+
+	// Inspect magic bytes (0x1f 0x8b) to detect gzip
+	br := bufio.NewReaderSize(f, 256*1024)
+	magic, peekErr := br.Peek(2)
+	var isGzip bool
+	if peekErr == nil && len(magic) >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+		isGzip = true
+	}
+
+	var data []byte
+	if isGzip {
+		gz, err := gzip.NewReader(br)
+		if err != nil {
+			return err
+		}
+		defer gz.Close()
+		decomp, err := io.ReadAll(gz)
+		if err != nil {
+			return err
+		}
+		data = decomp
+	} else {
+		uncompressed, err := io.ReadAll(br)
+		if err != nil {
+			return err
+		}
+		data = uncompressed
+	}
 
 	var snap Snapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return err
+	var decoded bool
+	if sDec, ok := fastDecodeSnapshot(data); ok {
+		snap = *sDec
+		decoded = true
+	}
+	if !decoded {
+		if err := json.Unmarshal(data, &snap); err != nil {
+			return err
+		}
 	}
 
 	s.mu.Lock()
@@ -343,6 +420,9 @@ func (s *Store) Load() error {
 			}
 			if rec.ActiveLink == "" && rec.CanonicalLink != "" {
 				rec.ActiveLink = rec.CanonicalLink
+			}
+			if rec.Latest.Link == "" {
+				rec.Latest.Link = rec.ActiveLink
 			}
 			// Validate and normalize circular buffer invariants
 			rec.History.NormalizeAndValidate(s.cfg.HistoryCapacity)
@@ -479,50 +559,1151 @@ func deriveCategory(reason string, statusCode int) ErrorCategory {
 }
 
 // Save writes the current state to disk atomically (write to temp file,
-// flush/sync, then rename) so a crash mid-write cannot corrupt the snapshot.
+// flush/sync, then rename) using transparent gzip compression.
+// A crash mid-write cannot corrupt the primary snapshot or the existing file.
 func (s *Store) Save() error {
 	s.mu.RLock()
+	n := len(s.records)
+	recordPool := make([]CandidateRecord, n)
+	records := make([]*CandidateRecord, n)
+
+	totalSamples := 0
+	for _, rec := range s.records {
+		totalSamples += rec.History.Count
+	}
+	samplePool := make([]ProbeSample, totalSamples)
+
+	sampleOffset := 0
+	idx := 0
+	for _, rec := range s.records {
+		recordPool[idx] = *rec
+		if len(rec.Latest.Warnings) > 0 {
+			recordPool[idx].Latest.Warnings = slices.Clone(rec.Latest.Warnings)
+		}
+		if rec.History.Count > 0 {
+			samples := samplePool[sampleOffset : sampleOffset+rec.History.Count]
+			cap := rec.History.Capacity
+			if cap <= 0 || cap > len(rec.History.Samples) {
+				cap = len(rec.History.Samples)
+			}
+			start := rec.History.Start
+			if start < 0 || start >= cap {
+				start = 0
+			}
+			for j := 0; j < rec.History.Count; j++ {
+				samples[j] = rec.History.Samples[(start+j)%cap]
+			}
+			recordPool[idx].History.Samples = samples
+			recordPool[idx].History.Start = 0
+			sampleOffset += rec.History.Count
+		} else {
+			recordPool[idx].History.Samples = nil
+		}
+		records[idx] = &recordPool[idx]
+		idx++
+	}
 	snap := Snapshot{
 		Version:    2,
 		LastCycle:  s.lastCycle,
 		CycleCount: s.cycleCount,
-		Records:    make([]*CandidateRecord, 0, len(s.records)),
-	}
-	for _, rec := range s.records {
-		snap.Records = append(snap.Records, rec.Clone())
+		Records:    records,
 	}
 	s.mu.RUnlock()
 
-	// Sort records deterministically by CanonicalLink
-	sort.Slice(snap.Records, func(i, j int) bool {
-		return snap.Records[i].CanonicalLink < snap.Records[j].CanonicalLink
+	// Sort records deterministically by CanonicalLink without reflection
+	slices.SortFunc(snap.Records, func(a, b *CandidateRecord) int {
+		return cmp.Compare(a.CanonicalLink, b.CanonicalLink)
 	})
 
-	data, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	tmp := s.path + ".tmp"
+	primary := s.PrimaryPath()
+	tmp := primary + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmp)
+
+	bw := bufio.NewWriterSize(f, 256*1024)
+	gw, err := gzip.NewWriterLevel(bw, gzip.BestSpeed)
+	if err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
+
+	if err := writeSnapshotJSON(gw, snap); err != nil {
+		_ = gw.Close()
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	// CRITICAL: gzip.Writer MUST be closed BEFORE f.Sync() so the gzip trailer
+	// (CRC-32 and uncompressed length) is flushed to the OS file descriptor.
+	if err := gw.Close(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	if err := bw.Flush(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+
 	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
+
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, s.path)
+
+	if err := os.Rename(tmp, primary); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	// If legacy uncompressed file still exists on disk, emit informational log
+	s.mu.RLock()
+	legacyPath := s.path
+	s.mu.RUnlock()
+	if primary != legacyPath {
+		if _, err := os.Stat(legacyPath); err == nil {
+			slog.Info("legacy raw state file is superseded by compressed state", "legacy", legacyPath, "primary", primary)
+		}
+	}
+
+	return nil
+}
+
+const hexChars = "0123456789abcdef"
+
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '"' || c == '\\' || c < 0x20 {
+			if i > start {
+				dst = append(dst, s[start:i]...)
+			}
+			switch c {
+			case '"':
+				dst = append(dst, '\\', '"')
+			case '\\':
+				dst = append(dst, '\\', '\\')
+			case '\b':
+				dst = append(dst, '\\', 'b')
+			case '\f':
+				dst = append(dst, '\\', 'f')
+			case '\n':
+				dst = append(dst, '\\', 'n')
+			case '\r':
+				dst = append(dst, '\\', 'r')
+			case '\t':
+				dst = append(dst, '\\', 't')
+			default:
+				dst = append(dst, `\u00`...)
+				dst = append(dst, hexChars[c>>4], hexChars[c&0x0f])
+			}
+			start = i + 1
+		}
+	}
+	if start == 0 {
+		dst = append(dst, s...)
+	} else if start < len(s) {
+		dst = append(dst, s[start:]...)
+	}
+	return append(dst, '"')
+}
+
+func writeSnapshotJSON(w io.Writer, snap Snapshot) error {
+	bw := bufio.NewWriterSize(w, 256*1024)
+	scratch := make([]byte, 0, 2048)
+
+	scratch = append(scratch, `{"version":`...)
+	scratch = strconv.AppendInt(scratch, int64(snap.Version), 10)
+	scratch = append(scratch, `,"last_cycle":"`...)
+	scratch = snap.LastCycle.AppendFormat(scratch, time.RFC3339Nano)
+	scratch = append(scratch, `","cycle_count":`...)
+	scratch = strconv.AppendInt(scratch, int64(snap.CycleCount), 10)
+	scratch = append(scratch, `,"records":[`...)
+	if _, err := bw.Write(scratch); err != nil {
+		return err
+	}
+
+	for i, rec := range snap.Records {
+		if rec == nil {
+			continue
+		}
+		scratch = scratch[:0]
+		if i > 0 {
+			scratch = append(scratch, ',')
+		}
+		scratch = append(scratch, `{"canonical_link":`...)
+		scratch = appendJSONString(scratch, rec.CanonicalLink)
+		scratch = append(scratch, `,"active_link":`...)
+		scratch = appendJSONString(scratch, rec.ActiveLink)
+		if rec.AbsentCycles > 0 {
+			scratch = append(scratch, `,"absent_cycles":`...)
+			scratch = strconv.AppendInt(scratch, int64(rec.AbsentCycles), 10)
+		}
+
+		// latest
+		scratch = append(scratch, `,"latest":{`...)
+		firstL := true
+		if rec.Latest.Link != "" && rec.Latest.Link != rec.ActiveLink {
+			scratch = append(scratch, `"link":`...)
+			scratch = appendJSONString(scratch, rec.Latest.Link)
+			firstL = false
+		}
+		if !firstL {
+			scratch = append(scratch, ',')
+		}
+		scratch = append(scratch, `"status":`...)
+		scratch = appendJSONString(scratch, string(rec.Latest.Status))
+		scratch = append(scratch, `,"reason":`...)
+		scratch = appendJSONString(scratch, rec.Latest.Reason)
+		if rec.Latest.Category != "" {
+			scratch = append(scratch, `,"category":`...)
+			scratch = appendJSONString(scratch, string(rec.Latest.Category))
+		}
+		if rec.Latest.StatusCode != 0 {
+			scratch = append(scratch, `,"status_code":`...)
+			scratch = strconv.AppendInt(scratch, int64(rec.Latest.StatusCode), 10)
+		}
+		scratch = append(scratch, `,"latency":`...)
+		scratch = strconv.AppendInt(scratch, int64(rec.Latest.Latency), 10)
+		scratch = append(scratch, `,"tested_at":"`...)
+		scratch = rec.Latest.TestedAt.AppendFormat(scratch, time.RFC3339Nano)
+		scratch = append(scratch, `","attempts":`...)
+		scratch = strconv.AppendInt(scratch, int64(rec.Latest.Attempts), 10)
+		if rec.Latest.TransportOK {
+			scratch = append(scratch, `,"transport_ok":true`...)
+		}
+		if rec.Latest.TransportLatency > 0 {
+			scratch = append(scratch, `,"transport_latency":`...)
+			scratch = strconv.AppendInt(scratch, int64(rec.Latest.TransportLatency), 10)
+		}
+		if rec.Latest.TransportEvidenceKnown {
+			scratch = append(scratch, `,"transport_evidence_known":true`...)
+		}
+		if len(rec.Latest.Warnings) > 0 {
+			scratch = append(scratch, `,"warnings":[`...)
+			for wIdx, w := range rec.Latest.Warnings {
+				if wIdx > 0 {
+					scratch = append(scratch, ',')
+				}
+				scratch = appendJSONString(scratch, w)
+			}
+			scratch = append(scratch, ']')
+		}
+		scratch = append(scratch, '}')
+
+		// history
+		scratch = append(scratch, `,"history":{"capacity":`...)
+		scratch = strconv.AppendInt(scratch, int64(rec.History.Capacity), 10)
+		scratch = append(scratch, `,"count":`...)
+		scratch = strconv.AppendInt(scratch, int64(rec.History.Count), 10)
+		scratch = append(scratch, `,"samples":[`...)
+		for sIdx, smp := range rec.History.Samples {
+			if sIdx > 0 {
+				scratch = append(scratch, ',')
+			}
+			scratch = append(scratch, `{"cycle_id":`...)
+			scratch = strconv.AppendUint(scratch, smp.CycleID, 10)
+			scratch = append(scratch, `,"tested_at":"`...)
+			scratch = smp.TestedAt.AppendFormat(scratch, time.RFC3339Nano)
+			scratch = append(scratch, `","status":`...)
+			scratch = appendJSONString(scratch, string(smp.Status))
+			scratch = append(scratch, `,"category":`...)
+			scratch = appendJSONString(scratch, string(smp.Category))
+			if smp.StatusCode != 0 {
+				scratch = append(scratch, `,"status_code":`...)
+				scratch = strconv.AppendInt(scratch, int64(smp.StatusCode), 10)
+			}
+			if smp.Latency > 0 {
+				scratch = append(scratch, `,"latency":`...)
+				scratch = strconv.AppendInt(scratch, int64(smp.Latency), 10)
+			}
+			scratch = append(scratch, `,"attempts":`...)
+			scratch = strconv.AppendInt(scratch, int64(smp.Attempts), 10)
+			if smp.TransportOK {
+				scratch = append(scratch, `,"transport_ok":true`...)
+			}
+			if smp.TransportLatency > 0 {
+				scratch = append(scratch, `,"transport_latency":`...)
+				scratch = strconv.AppendInt(scratch, int64(smp.TransportLatency), 10)
+			}
+			if smp.TransportEvidenceKnown {
+				scratch = append(scratch, `,"transport_evidence_known":true`...)
+			}
+			scratch = append(scratch, '}')
+		}
+		scratch = append(scratch, `]}}`...)
+		if _, err := bw.Write(scratch); err != nil {
+			return err
+		}
+	}
+
+	if _, err := bw.WriteString("]}"); err != nil {
+		return err
+	}
+	return bw.Flush()
+}
+
+type fastJSONParser struct {
+	data []byte
+	pos  int
+}
+
+func (p *fastJSONParser) skipWhitespace() {
+	for p.pos < len(p.data) {
+		b := p.data[p.pos]
+		if b == ' ' || b == '\t' || b == '\r' || b == '\n' {
+			p.pos++
+		} else {
+			break
+		}
+	}
+}
+
+func (p *fastJSONParser) peek() byte {
+	p.skipWhitespace()
+	if p.pos < len(p.data) {
+		return p.data[p.pos]
+	}
+	return 0
+}
+
+func (p *fastJSONParser) consume(expected byte) bool {
+	p.skipWhitespace()
+	if p.pos < len(p.data) && p.data[p.pos] == expected {
+		p.pos++
+		return true
+	}
+	return false
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func parseHex4(b []byte) (rune, bool) {
+	if len(b) < 4 {
+		return 0, false
+	}
+	for i := 0; i < 4; i++ {
+		if !isHexDigit(b[i]) {
+			return 0, false
+		}
+	}
+	val, err := strconv.ParseUint(string(b[:4]), 16, 16)
+	if err != nil {
+		return 0, false
+	}
+	return rune(val), true
+}
+
+func unescapeJSON(b []byte) ([]byte, bool) {
+	out := make([]byte, 0, len(b))
+	for i := 0; i < len(b); i++ {
+		if b[i] == '\\' {
+			i++
+			if i >= len(b) {
+				return nil, false
+			}
+			switch b[i] {
+			case '"':
+				out = append(out, '"')
+			case '\\':
+				out = append(out, '\\')
+			case '/':
+				out = append(out, '/')
+			case 'b':
+				out = append(out, '\b')
+			case 'f':
+				out = append(out, '\f')
+			case 'n':
+				out = append(out, '\n')
+			case 'r':
+				out = append(out, '\r')
+			case 't':
+				out = append(out, '\t')
+			case 'u':
+				if i+4 >= len(b) {
+					return nil, false
+				}
+				r1, ok := parseHex4(b[i+1 : i+5])
+				if !ok {
+					return nil, false
+				}
+				i += 4
+
+				// Check for UTF-16 surrogate pair
+				if utf16.IsSurrogate(r1) {
+					if i+6 < len(b) && b[i+1] == '\\' && b[i+2] == 'u' {
+						r2, ok := parseHex4(b[i+3 : i+7])
+						if ok {
+							combined := utf16.DecodeRune(r1, r2)
+							if combined != unicode.ReplacementChar {
+								out = utf8.AppendRune(out, combined)
+								i += 6
+								continue
+							}
+						}
+					}
+					out = utf8.AppendRune(out, unicode.ReplacementChar)
+					continue
+				}
+				out = utf8.AppendRune(out, r1)
+			default:
+				return nil, false
+			}
+		} else {
+			out = append(out, b[i])
+		}
+	}
+	return out, true
+}
+
+func (p *fastJSONParser) parseStringBytes() ([]byte, bool) {
+	p.skipWhitespace()
+	if p.pos >= len(p.data) || p.data[p.pos] != '"' {
+		return nil, false
+	}
+	p.pos++
+	start := p.pos
+	hasEscapes := false
+	for p.pos < len(p.data) {
+		b := p.data[p.pos]
+		if b == '"' {
+			res := p.data[start:p.pos]
+			p.pos++
+			if !hasEscapes {
+				return res, true
+			}
+			return unescapeJSON(res)
+		}
+		if b < 0x20 {
+			// RFC 8259 Section 7: Unescaped control characters < 0x20 are forbidden in strings
+			return nil, false
+		}
+		if b == '\\' {
+			hasEscapes = true
+			p.pos++
+			if p.pos >= len(p.data) {
+				return nil, false
+			}
+			esc := p.data[p.pos]
+			switch esc {
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+				p.pos++
+			case 'u':
+				p.pos++
+				if p.pos+4 > len(p.data) {
+					return nil, false
+				}
+				for k := 0; k < 4; k++ {
+					if !isHexDigit(p.data[p.pos+k]) {
+						return nil, false
+					}
+				}
+				p.pos += 4
+			default:
+				return nil, false
+			}
+			continue
+		}
+		p.pos++
+	}
+	return nil, false
+}
+
+func isIdentChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+func (p *fastJSONParser) parseInt() (int64, bool) {
+	p.skipWhitespace()
+	if p.pos >= len(p.data) {
+		return 0, false
+	}
+	start := p.pos
+	if p.data[p.pos] == '-' {
+		p.pos++
+		if p.pos >= len(p.data) {
+			return 0, false
+		}
+	}
+	if p.data[p.pos] == '0' {
+		p.pos++
+		if p.pos < len(p.data) && p.data[p.pos] >= '0' && p.data[p.pos] <= '9' {
+			return 0, false // leading zeros forbidden in JSON
+		}
+	} else if p.data[p.pos] >= '1' && p.data[p.pos] <= '9' {
+		p.pos++
+		for p.pos < len(p.data) && p.data[p.pos] >= '0' && p.data[p.pos] <= '9' {
+			p.pos++
+		}
+	} else {
+		return 0, false
+	}
+	if p.pos < len(p.data) {
+		b := p.data[p.pos]
+		if b != ',' && b != '}' && b != ']' && b != ' ' && b != '\t' && b != '\r' && b != '\n' {
+			return 0, false
+		}
+	}
+	v, err := strconv.ParseInt(string(p.data[start:p.pos]), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+func (p *fastJSONParser) parseUint() (uint64, bool) {
+	p.skipWhitespace()
+	if p.pos >= len(p.data) {
+		return 0, false
+	}
+	start := p.pos
+	if p.data[p.pos] == '0' {
+		p.pos++
+		if p.pos < len(p.data) && p.data[p.pos] >= '0' && p.data[p.pos] <= '9' {
+			return 0, false
+		}
+	} else if p.data[p.pos] >= '1' && p.data[p.pos] <= '9' {
+		p.pos++
+		for p.pos < len(p.data) && p.data[p.pos] >= '0' && p.data[p.pos] <= '9' {
+			p.pos++
+		}
+	} else {
+		return 0, false
+	}
+	if p.pos < len(p.data) {
+		b := p.data[p.pos]
+		if b != ',' && b != '}' && b != ']' && b != ' ' && b != '\t' && b != '\r' && b != '\n' {
+			return 0, false
+		}
+	}
+	v, err := strconv.ParseUint(string(p.data[start:p.pos]), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+func (p *fastJSONParser) parseBool() (bool, bool) {
+	p.skipWhitespace()
+	if p.pos+4 <= len(p.data) && bytes.Equal(p.data[p.pos:p.pos+4], []byte("true")) {
+		end := p.pos + 4
+		if end < len(p.data) && isIdentChar(p.data[end]) {
+			return false, false
+		}
+		p.pos = end
+		return true, true
+	}
+	if p.pos+5 <= len(p.data) && bytes.Equal(p.data[p.pos:p.pos+5], []byte("false")) {
+		end := p.pos + 5
+		if end < len(p.data) && isIdentChar(p.data[end]) {
+			return false, false
+		}
+		p.pos = end
+		return false, true
+	}
+	return false, false
+}
+
+func (p *fastJSONParser) skipValue() bool {
+	p.skipWhitespace()
+	if p.pos >= len(p.data) {
+		return false
+	}
+	b := p.data[p.pos]
+	if b == '"' {
+		_, ok := p.parseStringBytes()
+		return ok
+	}
+	if b == '{' {
+		p.pos++
+		p.skipWhitespace()
+		if p.consume('}') {
+			return true
+		}
+		for {
+			_, ok := p.parseStringBytes()
+			if !ok || !p.consume(':') {
+				return false
+			}
+			if !p.skipValue() {
+				return false
+			}
+			p.skipWhitespace()
+			if p.consume('}') {
+				return true
+			}
+			if !p.consume(',') {
+				return false
+			}
+			p.skipWhitespace()
+			if p.pos < len(p.data) && p.data[p.pos] == '}' {
+				return false // trailing comma
+			}
+		}
+	}
+	if b == '[' {
+		p.pos++
+		p.skipWhitespace()
+		if p.consume(']') {
+			return true
+		}
+		for {
+			if !p.skipValue() {
+				return false
+			}
+			p.skipWhitespace()
+			if p.consume(']') {
+				return true
+			}
+			if !p.consume(',') {
+				return false
+			}
+			p.skipWhitespace()
+			if p.pos < len(p.data) && p.data[p.pos] == ']' {
+				return false // trailing comma
+			}
+		}
+	}
+	if b == 't' || b == 'f' {
+		_, ok := p.parseBool()
+		return ok
+	}
+	if b == 'n' {
+		if p.pos+4 <= len(p.data) && bytes.Equal(p.data[p.pos:p.pos+4], []byte("null")) {
+			end := p.pos + 4
+			if end < len(p.data) && isIdentChar(p.data[end]) {
+				return false
+			}
+			p.pos = end
+			return true
+		}
+		return false
+	}
+	if b == '-' || (b >= '0' && b <= '9') {
+		return p.parseNumber()
+	}
+	return false
+}
+
+func (p *fastJSONParser) parseNumber() bool {
+	p.skipWhitespace()
+	if p.pos >= len(p.data) {
+		return false
+	}
+	if p.data[p.pos] == '-' {
+		p.pos++
+		if p.pos >= len(p.data) {
+			return false
+		}
+	}
+	if p.data[p.pos] == '0' {
+		p.pos++
+		if p.pos < len(p.data) && p.data[p.pos] >= '0' && p.data[p.pos] <= '9' {
+			return false // leading zero forbidden
+		}
+	} else if p.data[p.pos] >= '1' && p.data[p.pos] <= '9' {
+		p.pos++
+		for p.pos < len(p.data) && p.data[p.pos] >= '0' && p.data[p.pos] <= '9' {
+			p.pos++
+		}
+	} else {
+		return false
+	}
+	// Frac
+	if p.pos < len(p.data) && p.data[p.pos] == '.' {
+		p.pos++
+		if p.pos >= len(p.data) || p.data[p.pos] < '0' || p.data[p.pos] > '9' {
+			return false
+		}
+		p.pos++
+		for p.pos < len(p.data) && p.data[p.pos] >= '0' && p.data[p.pos] <= '9' {
+			p.pos++
+		}
+	}
+	// Exp
+	if p.pos < len(p.data) && (p.data[p.pos] == 'e' || p.data[p.pos] == 'E') {
+		p.pos++
+		if p.pos < len(p.data) && (p.data[p.pos] == '+' || p.data[p.pos] == '-') {
+			p.pos++
+		}
+		if p.pos >= len(p.data) || p.data[p.pos] < '0' || p.data[p.pos] > '9' {
+			return false
+		}
+		p.pos++
+		for p.pos < len(p.data) && p.data[p.pos] >= '0' && p.data[p.pos] <= '9' {
+			p.pos++
+		}
+	}
+	if p.pos < len(p.data) {
+		b := p.data[p.pos]
+		if b != ',' && b != '}' && b != ']' && b != ' ' && b != '\t' && b != '\r' && b != '\n' {
+			return false
+		}
+	}
+	return true
+}
+
+func fastDecodeSnapshot(data []byte) (*Snapshot, bool) {
+	p := &fastJSONParser{data: data}
+	p.skipWhitespace()
+	if !p.consume('{') {
+		return nil, false
+	}
+	snap := &Snapshot{}
+	var hasRecords bool
+
+	p.skipWhitespace()
+	if !p.consume('}') {
+		for {
+			key, ok := p.parseStringBytes()
+			if !ok || !p.consume(':') {
+				return nil, false
+			}
+			switch string(key) {
+			case "version":
+				v, ok := p.parseInt()
+				if !ok {
+					return nil, false
+				}
+				snap.Version = int(v)
+			case "last_cycle":
+				s, ok := p.parseStringBytes()
+				if !ok {
+					return nil, false
+				}
+				t, err := time.Parse(time.RFC3339Nano, string(s))
+				if err != nil {
+					t, err = time.Parse(time.RFC3339, string(s))
+					if err != nil {
+						return nil, false
+					}
+				}
+				snap.LastCycle = t
+			case "cycle_count":
+				c, ok := p.parseInt()
+				if !ok {
+					return nil, false
+				}
+				snap.CycleCount = int(c)
+			case "records":
+				hasRecords = true
+				if !p.consume('[') {
+					return nil, false
+				}
+				records := make([]*CandidateRecord, 0, 60000)
+				p.skipWhitespace()
+				if !p.consume(']') {
+					for {
+						if !p.consume('{') {
+							return nil, false
+						}
+						rec := &CandidateRecord{}
+						p.skipWhitespace()
+						if !p.consume('}') {
+							for {
+								rkey, ok := p.parseStringBytes()
+								if !ok || !p.consume(':') {
+									return nil, false
+								}
+								switch string(rkey) {
+								case "canonical_link":
+									s, ok := p.parseStringBytes()
+									if !ok {
+										return nil, false
+									}
+									rec.CanonicalLink = string(s)
+								case "active_link":
+									s, ok := p.parseStringBytes()
+									if !ok {
+										return nil, false
+									}
+									rec.ActiveLink = string(s)
+								case "absent_cycles":
+									c, ok := p.parseInt()
+									if !ok {
+										return nil, false
+									}
+									rec.AbsentCycles = int(c)
+								case "score", "has_passed", "last_passed_latency":
+									if !p.skipValue() {
+										return nil, false
+									}
+								case "latest":
+									if !p.consume('{') {
+										return nil, false
+									}
+									p.skipWhitespace()
+									if !p.consume('}') {
+										for {
+											lkey, ok := p.parseStringBytes()
+											if !ok || !p.consume(':') {
+												return nil, false
+											}
+											switch string(lkey) {
+											case "link":
+												s, ok := p.parseStringBytes()
+												if !ok {
+													return nil, false
+												}
+												rec.Latest.Link = string(s)
+											case "status":
+												s, ok := p.parseStringBytes()
+												if !ok {
+													return nil, false
+												}
+												rec.Latest.Status = Status(s)
+											case "reason":
+												s, ok := p.parseStringBytes()
+												if !ok {
+													return nil, false
+												}
+												rec.Latest.Reason = string(s)
+											case "category":
+												s, ok := p.parseStringBytes()
+												if !ok {
+													return nil, false
+												}
+												rec.Latest.Category = ErrorCategory(s)
+											case "status_code":
+												sc, ok := p.parseInt()
+												if !ok {
+													return nil, false
+												}
+												rec.Latest.StatusCode = int(sc)
+											case "latency":
+												lat, ok := p.parseInt()
+												if !ok {
+													return nil, false
+												}
+												rec.Latest.Latency = time.Duration(lat)
+											case "tested_at":
+												s, ok := p.parseStringBytes()
+												if !ok {
+													return nil, false
+												}
+												t, err := time.Parse(time.RFC3339Nano, string(s))
+												if err != nil {
+													t, err = time.Parse(time.RFC3339, string(s))
+													if err != nil {
+														return nil, false
+													}
+												}
+												rec.Latest.TestedAt = t
+											case "attempts":
+												att, ok := p.parseInt()
+												if !ok {
+													return nil, false
+												}
+												rec.Latest.Attempts = int(att)
+											case "transport_ok":
+												tok, ok := p.parseBool()
+												if !ok {
+													return nil, false
+												}
+												rec.Latest.TransportOK = tok
+											case "transport_latency":
+												tlat, ok := p.parseInt()
+												if !ok {
+													return nil, false
+												}
+												rec.Latest.TransportLatency = time.Duration(tlat)
+											case "transport_evidence_known":
+												tek, ok := p.parseBool()
+												if !ok {
+													return nil, false
+												}
+												rec.Latest.TransportEvidenceKnown = tek
+											case "warnings":
+												if !p.consume('[') {
+													return nil, false
+												}
+												var warnings []string
+												p.skipWhitespace()
+												if !p.consume(']') {
+													for {
+														ws, ok := p.parseStringBytes()
+														if !ok {
+															return nil, false
+														}
+														warnings = append(warnings, string(ws))
+														p.skipWhitespace()
+														if p.consume(']') {
+															break
+														}
+														if !p.consume(',') {
+															return nil, false
+														}
+														p.skipWhitespace()
+														if p.pos < len(p.data) && p.data[p.pos] == ']' {
+															return nil, false // trailing comma
+														}
+													}
+												}
+												rec.Latest.Warnings = warnings
+											default:
+												if !p.skipValue() {
+													return nil, false
+												}
+											}
+											p.skipWhitespace()
+											if p.consume('}') {
+												break
+											}
+											if !p.consume(',') {
+												return nil, false
+											}
+											p.skipWhitespace()
+											if p.pos < len(p.data) && p.data[p.pos] == '}' {
+												return nil, false // trailing comma
+											}
+										}
+									}
+								case "history":
+									if !p.consume('{') {
+										return nil, false
+									}
+									p.skipWhitespace()
+									if !p.consume('}') {
+										for {
+											hkey, ok := p.parseStringBytes()
+											if !ok || !p.consume(':') {
+												return nil, false
+											}
+											switch string(hkey) {
+											case "capacity":
+												cap, ok := p.parseInt()
+												if !ok {
+													return nil, false
+												}
+												rec.History.Capacity = int(cap)
+											case "count":
+												cnt, ok := p.parseInt()
+												if !ok {
+													return nil, false
+												}
+												rec.History.Count = int(cnt)
+											case "start":
+												st, ok := p.parseInt()
+												if !ok {
+													return nil, false
+												}
+												rec.History.Start = int(st)
+											case "samples":
+												if !p.consume('[') {
+													return nil, false
+												}
+												samples := make([]ProbeSample, 0, rec.History.Count)
+												p.skipWhitespace()
+												if !p.consume(']') {
+													for {
+														if !p.consume('{') {
+															return nil, false
+														}
+														var smp ProbeSample
+														p.skipWhitespace()
+														if !p.consume('}') {
+															for {
+																skey, ok := p.parseStringBytes()
+																if !ok || !p.consume(':') {
+																	return nil, false
+																}
+																switch string(skey) {
+																case "cycle_id":
+																	cid, ok := p.parseUint()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.CycleID = cid
+																case "tested_at":
+																	s, ok := p.parseStringBytes()
+																	if !ok {
+																		return nil, false
+																	}
+																	t, err := time.Parse(time.RFC3339Nano, string(s))
+																	if err != nil {
+																		t, err = time.Parse(time.RFC3339, string(s))
+																		if err != nil {
+																			return nil, false
+																		}
+																	}
+																	smp.TestedAt = t
+																case "status":
+																	s, ok := p.parseStringBytes()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.Status = Status(s)
+																case "category":
+																	s, ok := p.parseStringBytes()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.Category = ErrorCategory(s)
+																case "status_code":
+																	sc, ok := p.parseInt()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.StatusCode = int(sc)
+																case "latency":
+																	lat, ok := p.parseInt()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.Latency = time.Duration(lat)
+																case "attempts":
+																	att, ok := p.parseInt()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.Attempts = int(att)
+																case "transport_ok":
+																	tok, ok := p.parseBool()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.TransportOK = tok
+																case "transport_latency":
+																	tlat, ok := p.parseInt()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.TransportLatency = time.Duration(tlat)
+																case "transport_evidence_known":
+																	tek, ok := p.parseBool()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.TransportEvidenceKnown = tek
+																default:
+																	if !p.skipValue() {
+																		return nil, false
+																	}
+																}
+																p.skipWhitespace()
+																if p.consume('}') {
+																	break
+																}
+																if !p.consume(',') {
+																	return nil, false
+																}
+																p.skipWhitespace()
+																if p.pos < len(p.data) && p.data[p.pos] == '}' {
+																	return nil, false // trailing comma
+																}
+															}
+														}
+														samples = append(samples, smp)
+														p.skipWhitespace()
+														if p.consume(']') {
+															break
+														}
+														if !p.consume(',') {
+															return nil, false
+														}
+														p.skipWhitespace()
+														if p.pos < len(p.data) && p.data[p.pos] == ']' {
+															return nil, false // trailing comma
+														}
+													}
+												}
+												rec.History.Samples = samples
+											default:
+												if !p.skipValue() {
+													return nil, false
+												}
+											}
+											p.skipWhitespace()
+											if p.consume('}') {
+												break
+											}
+											if !p.consume(',') {
+												return nil, false
+											}
+											p.skipWhitespace()
+											if p.pos < len(p.data) && p.data[p.pos] == '}' {
+												return nil, false // trailing comma
+											}
+										}
+									}
+								default:
+									if !p.skipValue() {
+										return nil, false
+									}
+								}
+								p.skipWhitespace()
+								if p.consume('}') {
+									break
+								}
+								if !p.consume(',') {
+									return nil, false
+								}
+								p.skipWhitespace()
+								if p.pos < len(p.data) && p.data[p.pos] == '}' {
+									return nil, false // trailing comma
+								}
+							}
+						}
+						records = append(records, rec)
+						p.skipWhitespace()
+						if p.consume(']') {
+							break
+						}
+						if !p.consume(',') {
+							return nil, false
+						}
+						p.skipWhitespace()
+						if p.pos < len(p.data) && p.data[p.pos] == ']' {
+							return nil, false // trailing comma
+						}
+					}
+				}
+				snap.Records = records
+			default:
+				if !p.skipValue() {
+					return nil, false
+				}
+			}
+			p.skipWhitespace()
+			if p.consume('}') {
+				break
+			}
+			if !p.consume(',') {
+				return nil, false
+			}
+			p.skipWhitespace()
+			if p.pos < len(p.data) && p.data[p.pos] == '}' {
+				return nil, false // trailing comma
+			}
+		}
+	}
+
+	if !hasRecords {
+		return nil, false
+	}
+
+	// CRITICAL: Proof of full consumption. Only whitespace is allowed after root object.
+	p.skipWhitespace()
+	if p.pos != len(p.data) {
+		return nil, false // trailing garbage!
+	}
+
+	return snap, true
 }
 
 // PutWithTransition applies canonical state transitions, records a probe sample,
