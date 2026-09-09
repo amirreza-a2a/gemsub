@@ -12,7 +12,7 @@ The canonical local register for non-blocking findings, deferred hardening items
 | **Future Hardening & Observability (P2)** | 4 | Non-blocking enhancements to metrics, operational logging, scheduling fairness, or optional configuration. |
 | **Code Quality & Test Cleanup (P2)** | 7 | Maintainability, naming clarity, deduplication, and test fixture consolidation. |
 | **External & Upstream Tracking** | 1 | Issues rooted in external dependencies tracked across upstream releases. |
-| **Promoted / Resolved** | 2 | Items promoted to active GitHub issues or resolved in implementation commits. |
+| **Promoted / Resolved** | 3 | Items promoted to active GitHub issues or resolved in implementation commits. |
 | **Total Registered Items** | **14** | |
 
 ---
@@ -21,7 +21,7 @@ The canonical local register for non-blocking findings, deferred hardening items
 
 | ID | Title | Priority | Area | Origin | Status |
 |:---|:---|:---:|:---|:---|:---:|
-| [TD-001](#td-001--publisher-atomic-publication) | Publisher atomic publication | P1 | Publisher | Ticket 23 Review / Post-Ticket-23 Audit | Promoted (Ticket 26, #4) |
+| [TD-001](#td-001--publisher-atomic-publication) | Publisher atomic publication | P1 | Publisher | Ticket 23 Review / Post-Ticket-23 Audit | Resolved (Ticket 26, e02c9c0) |
 | [TD-002](#td-002--scheduler-candidate-rotation-under-probelimit) | Scheduler candidate rotation under ProbeLimit | P2 | Scheduler / Scheduling Fairness | Post-Ticket-23 Audit / TD-002 Audit | Open / Deferred |
 | [TD-003](#td-003--tui-dual-projection-observability) | TUI dual-projection observability | P1 | TUI | Post-Ticket-23 Audit | Resolved (Ticket 25, 33329c0) |
 | [TD-004](#td-004--scheduler-generic-servability-metrics) | Scheduler generic servability metrics | P2 | Scheduler / Observability | Post-Ticket-23 Audit | Open |
@@ -46,10 +46,11 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **Title:** Publisher atomic publication and rollback semantics
 - **Priority:** P1
 - **Area:** Publisher
-- **Status:** Promoted
-- **Promoted to Ticket:** Ticket 26
+- **Status:** Resolved
+- **Resolution Ticket:** Ticket 26
 - **GitHub Issue:** #4
-- **Date Promoted:** 2026-09-09
+- **Commit:** `e02c9c08da79624287c3e2098b5d97e8e9295fcf`
+- **Date Resolved:** 2026-09-09
 - **Origin:** Ticket 23 independent code review / Post-Ticket-23 architecture audit
 - **Problem:**
   The Publisher writes generated projection files (`generic/*.txt`, `gemini/*.txt`, `meta.json`) directly into the active working tree of the target publication repository prior to Git staging. If a filesystem write fails mid-cycle (e.g. out of disk space, permission error, process interruption), the publication directory is left in a partially updated state. In subsequent cycles, `checkWorkingTreeSafety` detects uncommitted modifications and halts further automated publishing until manual intervention.
@@ -359,10 +360,11 @@ The canonical local register for non-blocking findings, deferred hardening items
 ## 7. Promoted & Closed Items
 
 ### TD-001 — Publisher atomic publication
-- **Status:** Promoted
-- **Promoted to Ticket:** Ticket 26
+- **Status:** Resolved
+- **Resolution Ticket:** Ticket 26
 - **GitHub Issue:** #4
-- **Date Promoted:** 2026-09-09
+- **Commit:** `e02c9c08da79624287c3e2098b5d97e8e9295fcf`
+- **Date Resolved:** 2026-09-09
 
 ### TD-003 — TUI dual-projection observability
 - **Status:** Resolved
