@@ -23,7 +23,7 @@ The canonical local register for non-blocking findings, deferred hardening items
 |:---|:---|:---:|:---|:---|:---:|
 | [TD-001](#td-001--publisher-atomic-publication) | Publisher atomic publication | P1 | Publisher | Ticket 23 Review / Post-Ticket-23 Audit | Open |
 | [TD-002](#td-002--scheduler-candidate-rotation-under-probelimit) | Scheduler candidate rotation under ProbeLimit | P2 | Scheduler / Scheduling Fairness | Post-Ticket-23 Audit / TD-002 Audit | Open / Deferred |
-| [TD-003](#td-003--tui-dual-projection-observability) | TUI dual-projection observability | P1 | TUI | Post-Ticket-23 Audit | Promoted (Ticket 25, #3) |
+| [TD-003](#td-003--tui-dual-projection-observability) | TUI dual-projection observability | P1 | TUI | Post-Ticket-23 Audit | Resolved (Ticket 25, 33329c0) |
 | [TD-004](#td-004--scheduler-generic-servability-metrics) | Scheduler generic servability metrics | P2 | Scheduler / Observability | Post-Ticket-23 Audit | Open |
 | [TD-005](#td-005--serveconfig-projection-alignment) | ServeConfig projection alignment | P2 | Configuration / Subserver | Post-Ticket-23 Audit | Open / Deferred |
 | [TD-006](#td-006--publishertest-code-cleanup) | Publisher test fixture cleanup | P2 | Test / Code Quality | Ticket 23 Review | Open |
@@ -63,10 +63,11 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **Title:** TUI dual-projection observability (Generic vs. Gemini)
 - **Priority:** P1
 - **Area:** TUI
-- **Status:** Promoted
-- **Promoted to Ticket:** Ticket 25
+- **Status:** Resolved
+- **Resolution Ticket:** Ticket 25
 - **GitHub Issue:** #3
-- **Date Promoted:** 2026-09-09
+- **Commit:** `33329c08334a2bbf6c1212b11eeac4ef8bd02006`
+- **Date Resolved:** 2026-09-09
 - **Origin:** Post-Ticket-23 architecture audit
 - **Problem:**
   The Terminal User Interface (TUI) was built around a single-projection mental model (`Store.Passing()`). In the current TUI, candidates that pass Stage 1 transport health but fail Stage 2 Gemini application verification (such as `ErrRegionBlocked` or `ErrTargetDenied`) appear as generic failures. There is no visible indicator or counter showing the health of the generic/network-healthy candidate pool (`Store.NetworkPassing()`).
@@ -289,10 +290,11 @@ The canonical local register for non-blocking findings, deferred hardening items
 ## 7. Promoted & Closed Items
 
 ### TD-003 — TUI dual-projection observability
-- **Status:** Promoted
-- **Promoted to Ticket:** Ticket 25
+- **Status:** Resolved
+- **Resolution Ticket:** Ticket 25
 - **GitHub Issue:** #3
-- **Date Promoted:** 2026-09-09
+- **Commit:** `33329c08334a2bbf6c1212b11eeac4ef8bd02006`
+- **Date Resolved:** 2026-09-09
 
 ### Record Template for Promoted Items
 
