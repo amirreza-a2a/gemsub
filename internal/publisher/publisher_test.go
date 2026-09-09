@@ -1664,3 +1664,577 @@ func TestPublisher_MetadataPreservation_RecomputesOnInconsistentLegacyCounts(t *
 		t.Errorf("expected total_servable == 1, got %d", updatedMeta.TotalServable)
 	}
 }
+
+// --- Ticket 26: Atomic publication and transactional rollback tests ---
+
+func setupTestGitRepo(t *testing.T) (bareRemoteDir, repoDir string, runGit func(args ...string) string) {
+	t.Helper()
+	bareRemoteDir = t.TempDir()
+	initBare := exec.Command("git", "init", "--bare", "-b", "main")
+	initBare.Dir = bareRemoteDir
+	if out, err := initBare.CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare failed: %v: %s", err, out)
+	}
+
+	repoDir = t.TempDir()
+	runGit = func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s failed: %v: %s", strings.Join(args, " "), err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init", "-b", "main")
+	runGit("config", "user.name", "Gemsub Test")
+	runGit("config", "user.email", "test@example.com")
+	runGit("remote", "add", "origin", bareRemoteDir)
+
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# gemsub\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "README.md")
+	runGit("commit", "-m", "initial readme")
+	runGit("push", "origin", "main")
+
+	return bareRemoteDir, repoDir, runGit
+}
+
+type commandFailingGitRunner struct {
+	failOnCmd string
+	failOnce  bool
+	failed    bool
+}
+
+func (r *commandFailingGitRunner) Run(ctx context.Context, dir string, args ...string) (string, error) {
+	if len(args) > 0 && args[0] == r.failOnCmd {
+		if !r.failed || !r.failOnce {
+			r.failed = true
+			return "", fmt.Errorf("simulated git %s failure", r.failOnCmd)
+		}
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
+func TestPublisher_AtomicWriteFile_Guarantees(t *testing.T) {
+	tmpDir := t.TempDir()
+	targetFile := filepath.Join(tmpDir, "sub", "target.txt")
+
+	// 1. Initial write creates directory and file atomically
+	content1 := []byte("first content version\n")
+	if err := publisher.AtomicWriteFile(targetFile, content1, 0o644); err != nil {
+		t.Fatalf("AtomicWriteFile failed: %v", err)
+	}
+
+	read1, err := os.ReadFile(targetFile)
+	if err != nil {
+		t.Fatalf("read targetFile: %v", err)
+	}
+	if string(read1) != string(content1) {
+		t.Fatalf("expected content %q, got %q", string(content1), string(read1))
+	}
+
+	// Sibling temp file must not remain
+	if _, err := os.Stat(targetFile + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temporary sibling file still exists after success")
+	}
+
+	// 2. Overwrite replaces existing file
+	content2 := []byte("second updated content\n")
+	if err := publisher.AtomicWriteFile(targetFile, content2, 0o644); err != nil {
+		t.Fatalf("AtomicWriteFile overwrite failed: %v", err)
+	}
+
+	read2, err := os.ReadFile(targetFile)
+	if err != nil {
+		t.Fatalf("read targetFile after overwrite: %v", err)
+	}
+	if string(read2) != string(content2) {
+		t.Fatalf("expected content %q, got %q", string(content2), string(read2))
+	}
+
+	// 3. Failed write cleans up temporary file
+	// If targetPath is an existing directory, os.Rename(tempPath, targetPath) fails (EISDIR),
+	// triggering the cleanup of tempPath.
+	targetDir := filepath.Join(tmpDir, "existing_dir")
+	if err := os.Mkdir(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err = publisher.AtomicWriteFile(targetDir, []byte("data"), 0o644)
+	if err == nil {
+		t.Fatalf("expected error writing file over directory")
+	}
+	if _, statErr := os.Stat(targetDir + ".tmp"); !os.IsNotExist(statErr) {
+		t.Fatalf("temp file was not cleaned up after rename error")
+	}
+
+	// 4. Reader concurrency / truncation test:
+	// A file with 50,000 bytes of 'A' is updated to 50,000 bytes of 'B'.
+	// A concurrent reader must NEVER observe an empty file (0 bytes) or partial length.
+	concurrentFile := filepath.Join(tmpDir, "concurrent.txt")
+	chunkA := strings.Repeat("A", 50000)
+	chunkB := strings.Repeat("B", 50000)
+	if err := os.WriteFile(concurrentFile, []byte(chunkA), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	readerErrCh := make(chan error, 1)
+
+	go func() {
+		for {
+			select {
+			case <-stop:
+				readerErrCh <- nil
+				return
+			default:
+				data, err := os.ReadFile(concurrentFile)
+				if err != nil {
+					readerErrCh <- fmt.Errorf("read error: %w", err)
+					return
+				}
+				if len(data) == 0 {
+					readerErrCh <- fmt.Errorf("read observed 0-byte truncated file (O_TRUNC exposure)")
+					return
+				}
+				if len(data) != 50000 {
+					readerErrCh <- fmt.Errorf("read observed partial data length: %d", len(data))
+					return
+				}
+				first := data[0]
+				for _, b := range data {
+					if b != first {
+						readerErrCh <- fmt.Errorf("read observed torn read with mixed bytes")
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	// Perform multiple atomic overwrites
+	for i := 0; i < 20; i++ {
+		var toWrite string
+		if i%2 == 0 {
+			toWrite = chunkB
+		} else {
+			toWrite = chunkA
+		}
+		if err := publisher.AtomicWriteFile(concurrentFile, []byte(toWrite), 0o644); err != nil {
+			t.Fatalf("concurrent AtomicWriteFile %d failed: %v", i, err)
+		}
+	}
+
+	close(stop)
+	if err := <-readerErrCh; err != nil {
+		t.Fatalf("concurrent reader check failed: %v", err)
+	}
+}
+
+func TestPublisher_MidBatchWriteFailure_RollbackAndSelfHealing(t *testing.T) {
+	bareRemoteDir, repoDir, runGit := setupTestGitRepo(t)
+
+	// Pre-populate with initial legacy file and initial dual-projection files committed
+	if err := os.WriteFile(filepath.Join(repoDir, "all.txt"), []byte("legacy-root\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "all.txt")
+	runGit("commit", "-m", "commit legacy file")
+	runGit("push", "origin", "main")
+	headInitial := runGit("rev-parse", "HEAD")
+
+	// Add an untracked unrelated user file (notes.txt) and modify README.md (uncommitted)
+	// These must remain completely untouched by rollback.
+	notesPath := filepath.Join(repoDir, "notes.txt")
+	if err := os.WriteFile(notesPath, []byte("user notes to preserve\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	readmePath := filepath.Join(repoDir, "README.md")
+	if err := os.WriteFile(readmePath, []byte("# gemsub - modified readme\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create store with passing candidates
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+	st.PutWithTransition(store.Result{
+		Link:                   "vless://pass-1",
+		Status:                 store.StatusPassed,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TestedAt:               time.Now(),
+	})
+	st.PutWithTransition(store.Result{
+		Link:                   "vmess://pass-2",
+		Status:                 store.StatusPassed,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TestedAt:               time.Now(),
+	})
+	st.FinishCycle()
+
+	cfg := &config.PublishingConfig{
+		Enabled:    true,
+		Repository: repoDir,
+		Branch:     "main",
+		RemoteURL:  bareRemoteDir,
+	}
+
+	// Simulate failure on writing generic/vmess.txt (midway through target files)
+	failingPub := publisher.New(cfg, st).WithFSOverrides(
+		func(targetPath string, content []byte, perm os.FileMode) error {
+			if strings.HasSuffix(targetPath, filepath.Join("generic", "vmess.txt")) {
+				return fmt.Errorf("injected disk full error ENOSPC")
+			}
+			return publisher.AtomicWriteFile(targetPath, content, perm)
+		},
+		nil,
+	)
+
+	// Cycle 1: publish fails midway
+	err := failingPub.Publish(context.Background())
+	if err == nil {
+		t.Fatalf("expected error on mid-batch write failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "injected disk full error ENOSPC") {
+		t.Fatalf("expected ENOSPC error, got: %v", err)
+	}
+
+	// Assertions after rollback:
+	// 1. No temporary files remain anywhere
+	err = filepath.Walk(repoDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if strings.HasSuffix(path, ".tmp") {
+			return fmt.Errorf("lingering temp file: %s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("found temporary files after failed publication: %v", err)
+	}
+
+	// 2. Legacy file was restored from HEAD
+	legacyBytes, err := os.ReadFile(filepath.Join(repoDir, "all.txt"))
+	if err != nil {
+		t.Fatalf("expected all.txt to be restored: %v", err)
+	}
+	if string(legacyBytes) != "legacy-root\n" {
+		t.Fatalf("all.txt content mismatch: %q", string(legacyBytes))
+	}
+
+	// 3. New files written before the failure (e.g. generic/all.txt, generic/vless.txt) were cleaned up
+	if _, err := os.Stat(filepath.Join(repoDir, "generic", "all.txt")); !os.IsNotExist(err) {
+		t.Errorf("generic/all.txt should have been removed during rollback")
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "generic", "vless.txt")); !os.IsNotExist(err) {
+		t.Errorf("generic/vless.txt should have been removed during rollback")
+	}
+
+	// 4. Unrelated files are preserved
+	notesBytes, err := os.ReadFile(notesPath)
+	if err != nil || string(notesBytes) != "user notes to preserve\n" {
+		t.Fatalf("unrelated notes.txt was modified or deleted: %v", err)
+	}
+	readmeBytes, err := os.ReadFile(readmePath)
+	if err != nil || string(readmeBytes) != "# gemsub - modified readme\n" {
+		t.Fatalf("unrelated README.md modification was reverted or deleted: %v", err)
+	}
+
+	// 5. Git HEAD is unchanged
+	headAfterFail := runGit("rev-parse", "HEAD")
+	if headAfterFail != headInitial {
+		t.Fatalf("HEAD changed after failed publication: %s != %s", headAfterFail, headInitial)
+	}
+
+	// 6. Working tree safety check on publisher-owned files passes cleanly!
+	// Cycle 2: Self-healing run with healthy writer succeeds without manual intervention
+	healthyPub := publisher.New(cfg, st)
+	if err := healthyPub.Publish(context.Background()); err != nil {
+		t.Fatalf("cycle 2 (self-healing) publish failed: %v", err)
+	}
+
+	// Verify cycle 2 created and pushed new commit
+	headCycle2 := runGit("rev-parse", "HEAD")
+	if headCycle2 == headInitial {
+		t.Fatalf("expected new commit after successful cycle 2")
+	}
+
+	// Verify dual projections exist and legacy file was cleanly removed
+	if _, err := os.Stat(filepath.Join(repoDir, "generic", "all.txt")); err != nil {
+		t.Errorf("generic/all.txt missing after cycle 2: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "gemini", "all.txt")); err != nil {
+		t.Errorf("gemini/all.txt missing after cycle 2: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "all.txt")); !os.IsNotExist(err) {
+		t.Errorf("legacy all.txt should have been removed in cycle 2")
+	}
+
+	// Verify notes.txt and README.md are still intact
+	notesBytes2, _ := os.ReadFile(notesPath)
+	if string(notesBytes2) != "user notes to preserve\n" {
+		t.Errorf("notes.txt was lost after cycle 2")
+	}
+}
+
+func TestPublisher_LegacyRemovalFailure_RollbackRestoresDeletedFiles(t *testing.T) {
+	bareRemoteDir, repoDir, runGit := setupTestGitRepo(t)
+
+	// Commit multiple legacy root files
+	if err := os.WriteFile(filepath.Join(repoDir, "all.txt"), []byte("all\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "vless.txt"), []byte("vless\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "all.txt", "vless.txt")
+	runGit("commit", "-m", "add legacy files")
+	runGit("push", "origin", "main")
+	headBefore := runGit("rev-parse", "HEAD")
+
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+	st.PutWithTransition(store.Result{
+		Link:                   "vless://pass-1",
+		Status:                 store.StatusPassed,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+	})
+	st.FinishCycle()
+
+	cfg := &config.PublishingConfig{
+		Enabled:    true,
+		Repository: repoDir,
+		Branch:     "main",
+		RemoteURL:  bareRemoteDir,
+	}
+
+	// Inject failure on removing vless.txt (after all.txt has already been deleted)
+	failingPub := publisher.New(cfg, st).WithFSOverrides(
+		nil,
+		func(path string) error {
+			if strings.HasSuffix(path, "vless.txt") {
+				return fmt.Errorf("injected error removing vless.txt")
+			}
+			return os.Remove(path)
+		},
+	)
+
+	err := failingPub.Publish(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "injected error removing vless.txt") {
+		t.Fatalf("expected injected error removing vless.txt, got: %v", err)
+	}
+
+	// Assert that all.txt was restored by rollback
+	if _, err := os.Stat(filepath.Join(repoDir, "all.txt")); err != nil {
+		t.Fatalf("expected all.txt to be restored after rollback: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "vless.txt")); err != nil {
+		t.Fatalf("expected vless.txt to still exist: %v", err)
+	}
+
+	// Git HEAD unchanged
+	headAfter := runGit("rev-parse", "HEAD")
+	if headAfter != headBefore {
+		t.Fatalf("HEAD changed after rollback: %s != %s", headAfter, headBefore)
+	}
+
+	// Next cycle with healthy removal succeeds
+	healthyPub := publisher.New(cfg, st)
+	if err := healthyPub.Publish(context.Background()); err != nil {
+		t.Fatalf("healthy cycle publish failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "all.txt")); !os.IsNotExist(err) {
+		t.Fatalf("all.txt should be deleted after successful publish")
+	}
+}
+
+func TestPublisher_GitAddFailure_RollbackRestoresTree(t *testing.T) {
+	bareRemoteDir, repoDir, runGit := setupTestGitRepo(t)
+
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+	st.PutWithTransition(store.Result{
+		Link:                   "vless://pass-1",
+		Status:                 store.StatusPassed,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+	})
+	st.FinishCycle()
+
+	cfg := &config.PublishingConfig{
+		Enabled:    true,
+		Repository: repoDir,
+		Branch:     "main",
+		RemoteURL:  bareRemoteDir,
+	}
+
+	runner := &commandFailingGitRunner{failOnCmd: "add", failOnce: true}
+	pub := publisher.NewWithGit(cfg, st, runner)
+
+	// Cycle 1: git add fails
+	err := pub.Publish(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "git add failed") {
+		t.Fatalf("expected git add failed error, got: %v", err)
+	}
+
+	// Verify working tree is clean for publisher files
+	statusOut := runGit("status", "--porcelain", "--", "generic/all.txt", "gemini/all.txt", "meta.json")
+	if strings.TrimSpace(statusOut) != "" {
+		t.Fatalf("expected clean working tree after git add failure rollback, got: %q", statusOut)
+	}
+
+	// Cycle 2: succeeds automatically
+	if err := pub.Publish(context.Background()); err != nil {
+		t.Fatalf("cycle 2 publish failed: %v", err)
+	}
+}
+
+func TestPublisher_GitCommitFailure_RollbackRestoresTree(t *testing.T) {
+	bareRemoteDir, repoDir, runGit := setupTestGitRepo(t)
+
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+	st.PutWithTransition(store.Result{
+		Link:                   "vless://pass-1",
+		Status:                 store.StatusPassed,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+	})
+	st.FinishCycle()
+
+	cfg := &config.PublishingConfig{
+		Enabled:    true,
+		Repository: repoDir,
+		Branch:     "main",
+		RemoteURL:  bareRemoteDir,
+	}
+
+	runner := &commandFailingGitRunner{failOnCmd: "commit", failOnce: true}
+	pub := publisher.NewWithGit(cfg, st, runner)
+
+	// Cycle 1: git commit fails
+	err := pub.Publish(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "git commit failed") {
+		t.Fatalf("expected git commit failed error, got: %v", err)
+	}
+
+	// Verify working tree is clean and unstaged
+	statusOut := runGit("status", "--porcelain", "--", "generic/all.txt", "gemini/all.txt", "meta.json")
+	if strings.TrimSpace(statusOut) != "" {
+		t.Fatalf("expected clean working tree after git commit failure rollback, got: %q", statusOut)
+	}
+
+	// Cycle 2: succeeds automatically
+	if err := pub.Publish(context.Background()); err != nil {
+		t.Fatalf("cycle 2 publish failed: %v", err)
+	}
+}
+
+func TestPublisher_PreExistingManualEdit_AbortsWithoutRollbackOrOverwrite(t *testing.T) {
+	bareRemoteDir, repoDir, _ := setupTestGitRepo(t)
+
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+	st.PutWithTransition(store.Result{
+		Link:                   "vless://pass-1",
+		Status:                 store.StatusPassed,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+	})
+	st.FinishCycle()
+
+	cfg := &config.PublishingConfig{
+		Enabled:    true,
+		Repository: repoDir,
+		Branch:     "main",
+		RemoteURL:  bareRemoteDir,
+	}
+	pub := publisher.New(cfg, st)
+
+	// Initial publication succeeds
+	if err := pub.Publish(context.Background()); err != nil {
+		t.Fatalf("initial publish failed: %v", err)
+	}
+
+	// Operator manually edits generic/all.txt without committing
+	targetPath := filepath.Join(repoDir, "generic", "all.txt")
+	manualContent := "manual edit that must be protected\n"
+	if err := os.WriteFile(targetPath, []byte(manualContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Next publication must abort due to safety check
+	err := pub.Publish(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "pre-existing uncommitted changes") {
+		t.Fatalf("expected pre-existing uncommitted changes error, got: %v", err)
+	}
+
+	// The manual content must NOT have been overwritten or rolled back
+	currentContent, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(currentContent) != manualContent {
+		t.Fatalf("manual edit was lost! expected %q, got %q", manualContent, string(currentContent))
+	}
+}
+
+func TestPublisher_RollbackFailure_SurfacesBothErrors(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+	st.PutWithTransition(store.Result{Link: "vless://1", Status: store.StatusPassed, TransportEvidenceKnown: true, TransportOK: true})
+	st.FinishCycle()
+
+	mock := &mockGitRunner{
+		runFunc: func(ctx context.Context, dir string, args ...string) (string, error) {
+			if len(args) > 0 {
+				cmd := args[0]
+				if cmd == "rev-parse" {
+					return "true\n", nil
+				}
+				if cmd == "config" {
+					return "git@github.com:example/repo.git\n", nil
+				}
+				if cmd == "status" {
+					return "", nil
+				}
+				if cmd == "add" {
+					return "", fmt.Errorf("primary add failure")
+				}
+				if cmd == "reset" || cmd == "checkout" {
+					return "", fmt.Errorf("secondary rollback git failure")
+				}
+			}
+			return "", nil
+		},
+	}
+
+	cfg := &config.PublishingConfig{
+		Enabled:    true,
+		Repository: tmpDir,
+		RemoteURL:  "git@github.com:example/repo.git",
+	}
+	pub := publisher.NewWithGit(cfg, st, mock)
+
+	err := pub.Publish(context.Background())
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	// Both primary error and rollback error must be included
+	if !strings.Contains(err.Error(), "primary add failure") {
+		t.Errorf("expected primary add failure in error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "rollback failed") {
+		t.Errorf("expected rollback failure in error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "secondary rollback git failure") {
+		t.Errorf("expected secondary rollback git failure in error: %v", err)
+	}
+}

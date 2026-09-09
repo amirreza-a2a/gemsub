@@ -8,12 +8,12 @@ The canonical local register for non-blocking findings, deferred hardening items
 
 | Classification | Count | Description |
 |:---|:---:|:---|
-| **Active Technical Debt (P1)** | 1 | Material architectural, product, or reliability issues requiring planned engineering tickets. |
+| **Active Technical Debt (P1)** | 0 | Material architectural, product, or reliability issues requiring planned engineering tickets. |
 | **Future Hardening & Observability (P2)** | 4 | Non-blocking enhancements to metrics, operational logging, scheduling fairness, or optional configuration. |
-| **Code Quality & Test Cleanup (P2)** | 4 | Maintainability, naming clarity, deduplication, and test fixture consolidation. |
+| **Code Quality & Test Cleanup (P2)** | 7 | Maintainability, naming clarity, deduplication, and test fixture consolidation. |
 | **External & Upstream Tracking** | 1 | Issues rooted in external dependencies tracked across upstream releases. |
-| **Promoted / Resolved** | 1 | Items promoted to active GitHub issues or resolved in implementation commits. |
-| **Total Registered Items** | **11** | |
+| **Promoted / Resolved** | 2 | Items promoted to active GitHub issues or resolved in implementation commits. |
+| **Total Registered Items** | **14** | |
 
 ---
 
@@ -21,7 +21,7 @@ The canonical local register for non-blocking findings, deferred hardening items
 
 | ID | Title | Priority | Area | Origin | Status |
 |:---|:---|:---:|:---|:---|:---:|
-| [TD-001](#td-001--publisher-atomic-publication) | Publisher atomic publication | P1 | Publisher | Ticket 23 Review / Post-Ticket-23 Audit | Open |
+| [TD-001](#td-001--publisher-atomic-publication) | Publisher atomic publication | P1 | Publisher | Ticket 23 Review / Post-Ticket-23 Audit | Promoted (Ticket 26, #4) |
 | [TD-002](#td-002--scheduler-candidate-rotation-under-probelimit) | Scheduler candidate rotation under ProbeLimit | P2 | Scheduler / Scheduling Fairness | Post-Ticket-23 Audit / TD-002 Audit | Open / Deferred |
 | [TD-003](#td-003--tui-dual-projection-observability) | TUI dual-projection observability | P1 | TUI | Post-Ticket-23 Audit | Resolved (Ticket 25, 33329c0) |
 | [TD-004](#td-004--scheduler-generic-servability-metrics) | Scheduler generic servability metrics | P2 | Scheduler / Observability | Post-Ticket-23 Audit | Open |
@@ -32,6 +32,9 @@ The canonical local register for non-blocking findings, deferred hardening items
 | [TD-009](#td-009--tui-narrow-terminal-header-layout) | TUI narrow-terminal header layout | P2 | TUI / Presentation | Ticket 25 independent review | Open |
 | [TD-010](#td-010--tui-presentation-ranking-divergence-documentation) | TUI presentation ranking divergence documentation | P2 | TUI / Architecture Documentation | Ticket 25 independent review | Open / Documentation |
 | [TD-011](#td-011--tui-legacyunknown-transport-detail-test-coverage) | TUI legacy/unknown transport detail test coverage | P2 | TUI / Tests | Ticket 25 independent review | Open |
+| [TD-012](#td-012--publisher-atomicwritefile-api-visibility) | Publisher AtomicWriteFile API visibility | P2 | Publisher / Code Quality | Ticket 26 independent code review | Open |
+| [TD-013](#td-013--publisher-filesystem-failure-injection-api-visibility) | Publisher filesystem failure-injection API visibility | P2 | Publisher / Testability | Ticket 26 independent code review | Open |
+| [TD-014](#td-014--publisher-owned-path-slice-deduplication) | Publisher owned-path slice deduplication | P2 | Publisher / Code Quality | Ticket 26 independent code review | Open |
 
 ---
 
@@ -43,7 +46,10 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **Title:** Publisher atomic publication and rollback semantics
 - **Priority:** P1
 - **Area:** Publisher
-- **Status:** Open
+- **Status:** Promoted
+- **Promoted to Ticket:** Ticket 26
+- **GitHub Issue:** #4
+- **Date Promoted:** 2026-09-09
 - **Origin:** Ticket 23 independent code review / Post-Ticket-23 architecture audit
 - **Problem:**
   The Publisher writes generated projection files (`generic/*.txt`, `gemini/*.txt`, `meta.json`) directly into the active working tree of the target publication repository prior to Git staging. If a filesystem write fails mid-cycle (e.g. out of disk space, permission error, process interruption), the publication directory is left in a partially updated state. In subsequent cycles, `checkWorkingTreeSafety` detects uncommitted modifications and halts further automated publishing until manual intervention.
@@ -265,6 +271,69 @@ The canonical local register for non-blocking findings, deferred hardening items
 
 ---
 
+### TD-012 — Publisher AtomicWriteFile API visibility
+
+- **ID:** `TD-012`
+- **Title:** Publisher AtomicWriteFile API visibility
+- **Priority:** P2
+- **Area:** Publisher / Code Quality
+- **Status:** Open
+- **Origin:** Ticket 26 independent code review
+- **Problem:**
+  `AtomicWriteFile` is exported on package `publisher` although it is an internal helper whose production callers are inside the publisher package. The current black-box tests access it directly.
+- **Impact:**
+  Unnecessary package API surface expansion within `internal/publisher`. Since the package is internal, there is no risk of external module leakage, but repository conventions favor keeping internal utilities unexported.
+- **Proposed Future Remediation:**
+  Consider making the helper unexported or using an `export_test.go` bridge during future test maintenance.
+  - This is non-blocking and requires no immediate remediation.
+- **Dependencies:** `internal/publisher/publisher.go`, `internal/publisher/publisher_test.go`
+- **Promotion Criteria:**
+  Promote during future publisher test refactoring or code maintenance.
+
+---
+
+### TD-013 — Publisher filesystem failure-injection API visibility
+
+- **ID:** `TD-013`
+- **Title:** Publisher filesystem failure-injection API visibility
+- **Priority:** P2
+- **Area:** Publisher / Testability
+- **Status:** Open
+- **Origin:** Ticket 26 independent code review
+- **Problem:**
+  `WithFSOverrides` is exported on `Publisher` for filesystem failure injection in tests.
+- **Impact:**
+  Exposes a test-specific configuration method on the production `Publisher` struct.
+- **Proposed Future Remediation:**
+  Evaluate whether a narrower test-only seam or constructor would reduce package API surface while preserving hermetic failure testing.
+  - This is non-blocking and requires no immediate remediation.
+- **Dependencies:** `internal/publisher/publisher.go`, `internal/publisher/publisher_test.go`
+- **Promotion Criteria:**
+  Promote during a dedicated test harness maintenance or code-hygiene pass.
+
+---
+
+### TD-014 — Publisher owned-path slice deduplication
+
+- **ID:** `TD-014`
+- **Title:** Publisher owned-path slice deduplication
+- **Priority:** P2
+- **Area:** Publisher / Code Quality
+- **Status:** Open
+- **Origin:** Ticket 26 independent code review
+- **Problem:**
+  The combined `targetFiles + legacyRootFiles` slice construction is duplicated in multiple locations.
+- **Impact:**
+  Minor code duplication and repetitive slice allocations across publication operations.
+- **Proposed Future Remediation:**
+  Consider extracting an immutable `allPublisherFiles` package-level slice/helper.
+  - This is non-blocking cleanup only.
+- **Dependencies:** `internal/publisher/publisher.go`
+- **Promotion Criteria:**
+  Promote during future code cleanup or optimization of `internal/publisher`.
+
+---
+
 ## 6. External & Upstream Tracking
 
 ### TD-008 — Upstream sing-box race tracking
@@ -288,6 +357,12 @@ The canonical local register for non-blocking findings, deferred hardening items
 ---
 
 ## 7. Promoted & Closed Items
+
+### TD-001 — Publisher atomic publication
+- **Status:** Promoted
+- **Promoted to Ticket:** Ticket 26
+- **GitHub Issue:** #4
+- **Date Promoted:** 2026-09-09
 
 ### TD-003 — TUI dual-projection observability
 - **Status:** Resolved

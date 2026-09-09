@@ -6,6 +6,7 @@ package publisher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -130,6 +131,9 @@ type Publisher struct {
 	cfg *config.PublishingConfig
 	st  *store.Store
 	git GitRunner
+
+	writeFileFn  func(targetPath string, content []byte, perm os.FileMode) error
+	removeFileFn func(path string) error
 }
 
 // New creates a new Publisher with default exec-based GitRunner.
@@ -144,6 +148,149 @@ func NewWithGit(cfg *config.PublishingConfig, st *store.Store, git GitRunner) *P
 		st:  st,
 		git: git,
 	}
+}
+
+// WithFSOverrides configures custom filesystem write and remove hooks for testing failure injection.
+func (p *Publisher) WithFSOverrides(writeFn func(path string, content []byte, perm os.FileMode) error, removeFn func(path string) error) *Publisher {
+	p.writeFileFn = writeFn
+	p.removeFileFn = removeFn
+	return p
+}
+
+// AtomicWriteFile writes content to a temporary sibling file in targetPath's directory,
+// synchronizes it to disk (Sync), closes it, and atomically renames it over targetPath.
+// If any step fails, the temporary file is removed.
+//
+// POSIX rename(2) atomicity guarantees:
+// 1. Sibling temp file resides on the same filesystem mount, avoiding cross-device link errors (EXDEV).
+// 2. Renaming atomically replaces the destination file without truncation (eliminating the O_TRUNC window).
+// 3. Direct filesystem readers never observe empty or partially written files.
+func AtomicWriteFile(targetPath string, content []byte, perm os.FileMode) error {
+	dir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+
+	tempPath := targetPath + ".tmp"
+	f, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return fmt.Errorf("create temp file %s: %w", tempPath, err)
+	}
+
+	writeErr := func() error {
+		if _, err := f.Write(content); err != nil {
+			return fmt.Errorf("write temp file %s: %w", tempPath, err)
+		}
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("sync temp file %s: %w", tempPath, err)
+		}
+		return nil
+	}()
+
+	closeErr := f.Close()
+	if writeErr != nil {
+		_ = os.Remove(tempPath)
+		return writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("close temp file %s: %w", tempPath, closeErr)
+	}
+
+	if err := os.Rename(tempPath, targetPath); err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("rename %s to %s: %w", tempPath, targetPath, err)
+	}
+
+	return nil
+}
+
+func (p *Publisher) atomicWriteFile(targetPath string, content []byte, perm os.FileMode) error {
+	if p.writeFileFn != nil {
+		return p.writeFileFn(targetPath, content, perm)
+	}
+	return AtomicWriteFile(targetPath, content, perm)
+}
+
+func (p *Publisher) removeFile(path string) error {
+	if p.removeFileFn != nil {
+		return p.removeFileFn(path)
+	}
+	return os.Remove(path)
+}
+
+func (p *Publisher) hasHEAD(ctx context.Context, repoDir string) bool {
+	_, err := p.git.Run(ctx, repoDir, "rev-parse", "--verify", "HEAD")
+	return err == nil
+}
+
+type pathSnapshot struct {
+	existedBefore bool
+}
+
+// rollback restores publisher-owned files to their pre-transaction state if publication fails.
+// It is strictly scoped to targetFiles and legacyRootFiles; unrelated files are never touched.
+func (p *Publisher) rollback(ctx context.Context, repoDir string, snapshot map[string]pathSnapshot, hasHEAD bool) error {
+	slog.Warn("publisher: rolling back uncommitted publication changes", "repo", repoDir)
+	var errs []error
+
+	// 1. Clean up any lingering sibling temporary files for target files.
+	for _, target := range targetFiles {
+		tempPath := filepath.Join(repoDir, target+".tmp")
+		if err := os.Remove(tempPath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove temp file %s: %w", tempPath, err))
+		}
+	}
+
+	// 2. Separate publisher-owned files into files to restore vs files to remove.
+	allPublisherFiles := append(append([]string{}, targetFiles...), legacyRootFiles...)
+	var toRestore []string
+	var toRemove []string
+
+	for _, relPath := range allPublisherFiles {
+		snap, ok := snapshot[relPath]
+		if ok && snap.existedBefore {
+			toRestore = append(toRestore, relPath)
+		} else {
+			toRemove = append(toRemove, relPath)
+		}
+	}
+
+	// 3. For newly created files (did not exist before transaction):
+	// Unstage from Git index and remove from working tree.
+	if len(toRemove) > 0 {
+		if hasHEAD {
+			resetArgs := append([]string{"reset", "HEAD", "--"}, toRemove...)
+			if _, err := p.git.Run(ctx, repoDir, resetArgs...); err != nil {
+				errs = append(errs, fmt.Errorf("git reset newly created files: %w", err))
+			}
+		} else {
+			rmArgs := append([]string{"rm", "--cached", "-f", "--"}, toRemove...)
+			_, _ = p.git.Run(ctx, repoDir, rmArgs...)
+		}
+
+		for _, relPath := range toRemove {
+			fullPath := filepath.Join(repoDir, relPath)
+			if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, fmt.Errorf("remove uncommitted publisher file %s: %w", relPath, err))
+			}
+		}
+
+		// Clean up empty projection directories if created.
+		_ = os.Remove(filepath.Join(repoDir, DirGeneric))
+		_ = os.Remove(filepath.Join(repoDir, DirGemini))
+	}
+
+	// 4. For files that existed before publication:
+	// Restore index and working tree to pre-transaction HEAD state.
+	if len(toRestore) > 0 && hasHEAD {
+		checkoutArgs := append([]string{"checkout", "HEAD", "--"}, toRestore...)
+		if _, err := p.git.Run(ctx, repoDir, checkoutArgs...); err != nil {
+			errs = append(errs, fmt.Errorf("git checkout HEAD restored files: %w", err))
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // partitionLinks deduplicates, sorts, and partitions raw candidate links by protocol scheme.
@@ -322,7 +469,7 @@ func (p *Publisher) isAheadOfRemote(ctx context.Context, repoDir, branch string)
 
 // Publish generates subscription files, stages them in the Git repository,
 // and pushes them if changes or unpushed commits are detected.
-func (p *Publisher) Publish(ctx context.Context) error {
+func (p *Publisher) Publish(ctx context.Context) (err error) {
 	if p.cfg == nil || !p.cfg.Enabled {
 		return nil
 	}
@@ -368,6 +515,30 @@ func (p *Publisher) Publish(ctx context.Context) error {
 	if err := p.checkWorkingTreeSafety(ctx, repoDir); err != nil {
 		return err
 	}
+
+	// Transaction boundary: capture pre-mutation existence state of publisher-owned files.
+	// Any mid-transaction failure triggers automated rollback scoped strictly to publisher files.
+	hasHEAD := p.hasHEAD(ctx, repoDir)
+	snapshot := make(map[string]pathSnapshot, len(targetFiles)+len(legacyRootFiles))
+	for _, relPath := range append(append([]string{}, targetFiles...), legacyRootFiles...) {
+		fullPath := filepath.Join(repoDir, relPath)
+		_, lstatErr := os.Lstat(fullPath)
+		snapshot[relPath] = pathSnapshot{existedBefore: lstatErr == nil}
+	}
+
+	committedOrClean := false
+	defer func() {
+		if !committedOrClean {
+			rbErr := p.rollback(ctx, repoDir, snapshot, hasHEAD)
+			if rbErr != nil {
+				if err != nil {
+					err = errors.Join(err, fmt.Errorf("publisher: rollback failed: %w", rbErr))
+				} else {
+					err = fmt.Errorf("publisher: rollback failed: %w", rbErr)
+				}
+			}
+		}
+	}()
 
 	slog.Info("publisher: generating subscription files")
 	files, meta := p.RenderSubscriptionFiles()
@@ -441,19 +612,20 @@ func (p *Publisher) Publish(ctx context.Context) error {
 			}
 			return fmt.Errorf("publisher: lstat legacy file %s: %w", legacy, err)
 		}
-		if err := os.Remove(legacyPath); err != nil {
+		if err := p.removeFile(legacyPath); err != nil {
 			return fmt.Errorf("publisher: remove legacy file %s: %w", legacy, err)
 		}
 		removedLegacyFiles = append(removedLegacyFiles, legacy)
 	}
 
-	// Write generated files to repository directory
-	for name, content := range files {
-		filePath := filepath.Join(repoDir, name)
-		if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
-			return fmt.Errorf("publisher: mkdir %s: %w", filepath.Dir(filePath), err)
+	// Write generated files to repository directory using atomic sibling temporary files
+	for _, name := range targetFiles {
+		content, ok := files[name]
+		if !ok {
+			continue
 		}
-		if err := os.WriteFile(filePath, content, 0o644); err != nil {
+		filePath := filepath.Join(repoDir, name)
+		if err := p.atomicWriteFile(filePath, content, 0o644); err != nil {
 			return fmt.Errorf("publisher: write %s: %w", name, err)
 		}
 	}
@@ -488,6 +660,8 @@ func (p *Publisher) Publish(ctx context.Context) error {
 			return fmt.Errorf("publisher: git commit failed: %w", err)
 		}
 
+		committedOrClean = true
+
 		// Push to branch
 		slog.Info("publisher: pushing to origin", "branch", branch)
 		if _, err := p.git.Run(ctx, repoDir, "push", "origin", branch); err != nil {
@@ -497,6 +671,8 @@ func (p *Publisher) Publish(ctx context.Context) error {
 		slog.Info("publisher: publish completed")
 		return nil
 	}
+
+	committedOrClean = true
 
 	// No staged changes. Check if local branch is ahead of remote (e.g. from previous failed push).
 	ahead, err := p.isAheadOfRemote(ctx, repoDir, branch)
