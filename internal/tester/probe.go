@@ -100,6 +100,9 @@ func ProbeWithExecutor(ctx context.Context, cand parser.Candidate, cfg *config.T
 	result.Category = lastClassResult.Category
 	result.StatusCode = lastClassResult.StatusCode
 	result.Reason = lastClassResult.Reason
+	result.TransportOK = lastClassResult.TransportOK
+	result.TransportLatency = lastClassResult.TransportLatency
+	result.TransportEvidenceKnown = lastClassResult.TransportEvidenceKnown
 
 	// If retries were exhausted on a retryable error, mark as Inconclusive
 	if lastClassResult.Retryable && result.Attempts > maxRetries {

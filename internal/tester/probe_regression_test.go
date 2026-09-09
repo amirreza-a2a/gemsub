@@ -349,3 +349,54 @@ func TestExecuteAttempt_TransportErrorsNotCollapsed(t *testing.T) {
 		}
 	})
 }
+
+// TestProbeWithExecutor_PropagatesExplicitTransportEvidence verifies that ProbeWithExecutor
+// propagates TransportOK and TransportLatency from ClassificationResult to store.Result.
+func TestProbeWithExecutor_PropagatesExplicitTransportEvidence(t *testing.T) {
+	cand := parser.Candidate{Link: "vless://test-node"}
+	cfg := &config.TestConfig{MaxRetries: 0}
+
+	// Case 1: Explicit TransportOK=true
+	execSuccess := func(ctx context.Context, c parser.Candidate, conf *config.TestConfig) (ClassificationResult, bool, *time.Duration) {
+		return ClassificationResult{
+			Status:                 store.StatusPassed,
+			Category:               store.ErrNone,
+			TransportOK:            true,
+			TransportLatency:       42 * time.Millisecond,
+			TransportEvidenceKnown: true,
+		}, false, nil
+	}
+
+	resSuccess := ProbeWithExecutor(context.Background(), cand, cfg, nil, execSuccess)
+	if !resSuccess.TransportOK {
+		t.Errorf("expected resSuccess.TransportOK == true")
+	}
+	if !resSuccess.TransportEvidenceKnown {
+		t.Errorf("expected resSuccess.TransportEvidenceKnown == true")
+	}
+	if resSuccess.TransportLatency != 42*time.Millisecond {
+		t.Errorf("expected resSuccess.TransportLatency == 42ms, got %v", resSuccess.TransportLatency)
+	}
+
+	// Case 2: Explicit TransportOK=false
+	execFailure := func(ctx context.Context, c parser.Candidate, conf *config.TestConfig) (ClassificationResult, bool, *time.Duration) {
+		return ClassificationResult{
+			Status:                 store.StatusFailed,
+			Category:               store.ErrConnRefused,
+			TransportOK:            false,
+			TransportLatency:       15 * time.Millisecond,
+			TransportEvidenceKnown: true,
+		}, false, nil
+	}
+
+	resFailure := ProbeWithExecutor(context.Background(), cand, cfg, nil, execFailure)
+	if resFailure.TransportOK {
+		t.Errorf("expected resFailure.TransportOK == false")
+	}
+	if !resFailure.TransportEvidenceKnown {
+		t.Errorf("expected resFailure.TransportEvidenceKnown == true")
+	}
+	if resFailure.TransportLatency != 15*time.Millisecond {
+		t.Errorf("expected resFailure.TransportLatency == 15ms, got %v", resFailure.TransportLatency)
+	}
+}

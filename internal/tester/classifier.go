@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
 	"gemsub/internal/store"
 	"gemsub/internal/tester/textutil"
@@ -19,11 +20,14 @@ func NormalizeBytes(b []byte) string { return textutil.NormalizeBytes(b) }
 
 // ClassificationResult represents the structured outcome of evaluating a probe.
 type ClassificationResult struct {
-	Status     store.Status
-	Category   store.ErrorCategory
-	StatusCode int
-	Reason     string
-	Retryable  bool
+	Status                 store.Status
+	Category               store.ErrorCategory
+	StatusCode             int
+	Reason                 string
+	Retryable              bool
+	TransportOK            bool
+	TransportLatency       time.Duration
+	TransportEvidenceKnown bool
 }
 
 // ClassifyDialError determines whether an error encountered during dial or HTTP

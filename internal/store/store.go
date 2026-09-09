@@ -64,6 +64,9 @@ type Result struct {
 	ConsecutiveInconclusive int           `json:"consecutive_inconclusive,omitempty"`
 	PreviouslyPassed        bool          `json:"previously_passed,omitempty"`
 	Warnings                []string      `json:"warnings,omitempty"` // Observable parser normalization notes
+	TransportOK             bool          `json:"transport_ok,omitempty"`
+	TransportLatency        time.Duration `json:"transport_latency,omitempty"`
+	TransportEvidenceKnown  bool          `json:"transport_evidence_known,omitempty"`
 }
 
 // Snapshot is the full persisted state.
@@ -228,23 +231,42 @@ func (s *Store) networkHealthyStateLocked(rec *CandidateRecord) (healthy bool, s
 		return false, false
 	}
 
-	// If candidate satisfies the standard servability gate (passed Gemini), it is network-healthy and servable.
+	// Tier 1: If candidate satisfies the standard servability gate (passed Gemini), it is network-healthy and servable.
 	if s.isServableRecordLocked(rec) {
 		return true, true
 	}
 
-	// Otherwise, check if the candidate is healthy at the network/transport layer
-	// despite failing target-specific criteria (e.g. ErrRegionBlocked or ErrTargetDenied).
+	// Tier 2 (New Explicit Evidence):
+	// If explicit transport evidence is known on Latest, it is authoritative:
+	if rec.Latest.TransportEvidenceKnown {
+		if rec.Latest.TransportOK {
+			return true, false
+		}
+		// Explicit transport failure in latest observation: candidate is not network-healthy
+		return false, false
+	}
+
+	// If Latest had no explicit evidence (e.g. trailing inconclusive or legacy), check latest conclusive sample:
 	sample, ok := rec.History.LatestConclusive()
 	if !ok {
 		sample = ProbeSample{
-			Status:   rec.Latest.Status,
-			Category: rec.Latest.Category,
+			Status:                 rec.Latest.Status,
+			Category:               rec.Latest.Category,
+			TransportOK:            rec.Latest.TransportOK,
+			TransportLatency:       rec.Latest.TransportLatency,
+			TransportEvidenceKnown: rec.Latest.TransportEvidenceKnown,
 		}
 	}
+	if sample.TransportEvidenceKnown {
+		if sample.TransportOK {
+			return true, false
+		}
+		return false, false
+	}
 
-	// Transport is healthy if the latest authoritative conclusive observation was rejected solely by
-	// target-specific restrictions where proxy dial and HTTP round-trip succeeded.
+	// Tier 3 (Historical Compatibility Bridge): Fall back to Ticket 16's logic checking if
+	// the latest authoritative conclusive observation was rejected solely by target-specific restrictions
+	// where proxy dial and HTTP round-trip succeeded.
 	if sample.Status == StatusFailed && sample.Category.IsTargetSpecific() {
 		return true, false
 	}
@@ -393,13 +415,16 @@ func (s *Store) Load() error {
 		// DO NOT fabricate timestamps or status codes.
 		// DO NOT duplicate samples from ConsecutiveInconclusive.
 		sample := ProbeSample{
-			CycleID:    uint64(snap.CycleCount),
-			TestedAt:   r.TestedAt,
-			Status:     r.Status,
-			Category:   r.Category,
-			StatusCode: r.StatusCode,
-			Latency:    r.Latency,
-			Attempts:   attempts,
+			CycleID:                uint64(snap.CycleCount),
+			TestedAt:               r.TestedAt,
+			Status:                 r.Status,
+			Category:               r.Category,
+			StatusCode:             r.StatusCode,
+			Latency:                r.Latency,
+			Attempts:               attempts,
+			TransportOK:            r.TransportOK,
+			TransportLatency:       r.TransportLatency,
+			TransportEvidenceKnown: r.TransportEvidenceKnown,
 		}
 		rec.History.Push(sample)
 
@@ -558,13 +583,16 @@ func (s *Store) PutWithTransition(r Result) {
 	}
 
 	sample := ProbeSample{
-		CycleID:    s.cycleID,
-		TestedAt:   testedAt,
-		Status:     r.Status,
-		Category:   r.Category,
-		StatusCode: r.StatusCode,
-		Latency:    r.Latency,
-		Attempts:   attempts,
+		CycleID:                s.cycleID,
+		TestedAt:               testedAt,
+		Status:                 r.Status,
+		Category:               r.Category,
+		StatusCode:             r.StatusCode,
+		Latency:                r.Latency,
+		Attempts:               attempts,
+		TransportOK:            r.TransportOK,
+		TransportLatency:       r.TransportLatency,
+		TransportEvidenceKnown: r.TransportEvidenceKnown,
 	}
 
 	rec.History.Push(sample)
@@ -787,6 +815,8 @@ func (s *Store) NetworkPassingRanked() []string {
 			} else {
 				if l, ok := rec.History.LastNetworkHealthyLatency(); ok && l > 0 {
 					lat = l
+				} else if rec.Latest.TransportLatency > 0 {
+					lat = rec.Latest.TransportLatency
 				} else if rec.Latest.Latency > 0 {
 					lat = rec.Latest.Latency
 				} else {
@@ -915,10 +945,13 @@ func (s *Store) GetRecord(link string) (*CandidateRecord, bool) {
 
 // CandidateSnapshot pairs a cloned CandidateRecord with its atomic servability status and gate reason.
 type CandidateSnapshot struct {
-	Record         *CandidateRecord
-	Servable       bool
-	Gate           string
-	NetworkHealthy bool
+	Record                 *CandidateRecord
+	Servable               bool
+	Gate                   string
+	NetworkHealthy         bool
+	TransportOK            bool
+	TransportLatency       time.Duration
+	TransportEvidenceKnown bool
 }
 
 // Snapshots returns a consistent snapshot of all candidate records and their servability evaluations.
@@ -930,10 +963,13 @@ func (s *Store) Snapshots() []CandidateSnapshot {
 	for _, rec := range s.records {
 		servable, gate := s.servabilityGateLocked(rec)
 		out = append(out, CandidateSnapshot{
-			Record:         rec.Clone(),
-			Servable:       servable,
-			Gate:           gate,
-			NetworkHealthy: s.isNetworkHealthyRecordLocked(rec),
+			Record:                 rec.Clone(),
+			Servable:               servable,
+			Gate:                   gate,
+			NetworkHealthy:         s.isNetworkHealthyRecordLocked(rec),
+			TransportOK:            rec.Latest.TransportOK,
+			TransportLatency:       rec.Latest.TransportLatency,
+			TransportEvidenceKnown: rec.Latest.TransportEvidenceKnown,
 		})
 	}
 	return out

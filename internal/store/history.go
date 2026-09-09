@@ -7,13 +7,16 @@ import (
 
 // ProbeSample records the discrete outcome of testing a single candidate during a cycle.
 type ProbeSample struct {
-	CycleID    uint64        `json:"cycle_id"`
-	TestedAt   time.Time     `json:"tested_at"`
-	Status     Status        `json:"status"`
-	Category   ErrorCategory `json:"category"`
-	StatusCode int           `json:"status_code,omitempty"`
-	Latency    time.Duration `json:"latency,omitempty"`
-	Attempts   int           `json:"attempts"`
+	CycleID                uint64        `json:"cycle_id"`
+	TestedAt               time.Time     `json:"tested_at"`
+	Status                 Status        `json:"status"`
+	Category               ErrorCategory `json:"category"`
+	StatusCode             int           `json:"status_code,omitempty"`
+	Latency                time.Duration `json:"latency,omitempty"`
+	Attempts               int           `json:"attempts"`
+	TransportOK            bool          `json:"transport_ok,omitempty"`
+	TransportLatency       time.Duration `json:"transport_latency,omitempty"`
+	TransportEvidenceKnown bool          `json:"transport_evidence_known,omitempty"`
 }
 
 // BoundedHistory is a fixed-capacity circular buffer of probe samples with strict O(1) memory per candidate.
@@ -140,9 +143,9 @@ func (h *BoundedHistory) LastPassedLatency() (time.Duration, bool) {
 }
 
 // LastNetworkHealthyLatency returns the latency of the most recent network-healthy sample
-// (StatusPassed, or StatusFailed with a target-specific category like ErrRegionBlocked or ErrTargetDenied).
-// If a conclusive transport failure (StatusFailed with a non-target-specific error category) occurred
-// more recently than any network-healthy sample, scanning halts and returns (0, false), ensuring that
+// (explicit TransportEvidenceKnown && TransportOK == true, StatusPassed, or StatusFailed with a target-specific category like ErrRegionBlocked or ErrTargetDenied).
+// If a conclusive transport failure (explicit TransportEvidenceKnown && !TransportOK, or historical StatusFailed with a non-target-specific error category)
+// occurred more recently than any network-healthy sample, scanning halts and returns (0, false), ensuring that
 // a subsequent conclusive transport failure invalidates previous network-health evidence.
 func (h *BoundedHistory) LastNetworkHealthyLatency() (time.Duration, bool) {
 	if h.Count == 0 {
@@ -152,7 +155,22 @@ func (h *BoundedHistory) LastNetworkHealthyLatency() (time.Duration, bool) {
 		idx := (h.Start + i) % h.Capacity
 		s := h.Samples[idx]
 
-		// 1. Success or target-layer rejection proves network transport succeeded
+		// 1. Explicit transport evidence (highest precedence)
+		if s.TransportEvidenceKnown {
+			if s.TransportOK {
+				if s.TransportLatency > 0 {
+					return s.TransportLatency, true
+				}
+				if s.Latency > 0 {
+					return s.Latency, true
+				}
+				return 0, true
+			}
+			// Explicit transport failure conclusively invalidates prior network-health evidence
+			return 0, false
+		}
+
+		// 2. Historical fallback: Success or target-layer rejection proves network transport succeeded
 		if s.Status == StatusPassed || (s.Status == StatusFailed && s.Category.IsTargetSpecific()) {
 			if s.Latency > 0 {
 				return s.Latency, true
@@ -160,12 +178,12 @@ func (h *BoundedHistory) LastNetworkHealthyLatency() (time.Duration, bool) {
 			return 0, true
 		}
 
-		// 2. Conclusive transport failure invalidates prior network-health evidence
+		// 3. Historical fallback: Conclusive transport failure invalidates prior network-health evidence
 		if s.Status == StatusFailed && !s.Category.IsTargetSpecific() {
 			return 0, false
 		}
 
-		// 3. StatusInconclusive (e.g. timeout) is non-conclusive: continue scanning backward
+		// 4. StatusInconclusive (e.g. timeout) is non-conclusive: continue scanning backward
 	}
 	return 0, false
 }
