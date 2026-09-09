@@ -16,8 +16,8 @@ import (
 // without performing application-state projection or retaining references to internal
 // adapters or stores.
 type Controller interface {
-	Snapshot(servableOnly bool) viewmodel.SnapshotViewModel
-	PollSnapshot(servableOnly bool) (viewmodel.SnapshotViewModel, bool)
+	Snapshot(filter viewmodel.FilterMode) viewmodel.SnapshotViewModel
+	PollSnapshot(filter viewmodel.FilterMode) (viewmodel.SnapshotViewModel, bool)
 	CandidateDetail(opaqueID string) (viewmodel.CandidateDetailViewModel, bool)
 	CycleLogLevel() (viewmodel.LogViewModel, string)
 	CopyCandidateLink(opaqueID string) error
@@ -54,7 +54,7 @@ type Model struct {
 
 	// View state
 	activeView       ActiveView
-	servableFilter   bool
+	filterMode       viewmodel.FilterMode
 	cursorIndex      int
 	tableOffset      int
 	showDetail       bool
@@ -79,7 +79,7 @@ func New(ctrl Controller) *Model {
 		logFollow:  true,
 	}
 	if ctrl != nil {
-		m.applySnapshot(ctrl.Snapshot(false), true)
+		m.applySnapshot(ctrl.Snapshot(viewmodel.FilterAll), true)
 	}
 	return m
 }
@@ -107,7 +107,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// When dirty == false, no Store snapshot or ViewModel rebuild is performed.
 		// Interactive navigation (keys, resizes) responds and renders immediately without frame drops.
 		if m.ctrl != nil {
-			if snap, ok := m.ctrl.PollSnapshot(m.servableFilter); ok {
+			if snap, ok := m.ctrl.PollSnapshot(m.filterMode); ok {
 				m.applySnapshot(snap, false)
 			}
 		}
@@ -138,14 +138,22 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "s":
-		m.servableFilter = !m.servableFilter
-		if m.ctrl != nil {
-			m.applySnapshot(m.ctrl.Snapshot(m.servableFilter), true)
-		}
-		if m.servableFilter {
-			m.setStatus("Filter: Servable only")
-		} else {
+		switch m.filterMode {
+		case viewmodel.FilterAll:
+			m.filterMode = viewmodel.FilterGemini
+			m.setStatus("Filter: Gemini servable")
+		case viewmodel.FilterGemini:
+			m.filterMode = viewmodel.FilterGeneric
+			m.setStatus("Filter: Generic servable")
+		case viewmodel.FilterGeneric:
+			m.filterMode = viewmodel.FilterAll
 			m.setStatus("Filter: All candidates")
+		default:
+			m.filterMode = viewmodel.FilterAll
+			m.setStatus("Filter: All candidates")
+		}
+		if m.ctrl != nil {
+			m.applySnapshot(m.ctrl.Snapshot(m.filterMode), true)
 		}
 		return m, nil
 
@@ -447,8 +455,9 @@ func (m *Model) renderHeader() string {
 		progStr = fmt.Sprintf("Probes: %d / %d (%d%%)", m.header.ProgressCurrent, m.header.ProgressTotal, pct)
 	}
 
-	line2 := fmt.Sprintf("Servable: %s / %d  |  Cycle: Pass: %d  Fail: %d  Incon: %d  |  %s",
+	line2 := fmt.Sprintf("Servable: Gemini: %s  Generic: %s / %d  |  Cycle: Pass: %d  Fail: %d  Incon: %d  |  %s",
 		green.Render(fmt.Sprintf("%d", m.header.ServableCount)),
+		green.Render(fmt.Sprintf("%d", m.header.GenericServableCount)),
 		m.header.TotalCandidates,
 		m.header.PassedCount,
 		m.header.FailedCount,
@@ -469,7 +478,7 @@ func (m *Model) renderCandidateTable() string {
 	selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("236")).Bold(true)
 
 	// Column header
-	headerStr := fmt.Sprintf("  %-4s %-6s %-6s %-6s %-7s %-12s %s",
+	headerStr := fmt.Sprintf("  %-4s %-6s %-7s %-6s %-7s %-12s %s",
 		"SERV", "PROTO", "STATUS", "SCORE", "LAT", "HISTORY", "ENDPOINT / REMARK")
 	var sb strings.Builder
 	sb.WriteString(bold.Render(headerStr))
@@ -487,7 +496,7 @@ func (m *Model) renderCandidateTable() string {
 		end = len(m.rows)
 	}
 
-	endpointWidth := m.width - 48
+	endpointWidth := m.width - 49
 	if endpointWidth < 15 {
 		endpointWidth = 15
 	}
@@ -495,9 +504,11 @@ func (m *Model) renderCandidateTable() string {
 	for i := m.tableOffset; i < end; i++ {
 		row := m.rows[i]
 
-		servChar := "[ ]"
+		servChar := "[  ]"
 		if row.Servable {
-			servChar = green.Render("[✓]")
+			servChar = green.Render("[✓✓]")
+		} else if row.NetworkHealthy {
+			servChar = yellow.Render("[G ]")
 		}
 
 		statusColor := dim
@@ -507,6 +518,8 @@ func (m *Model) renderCandidateTable() string {
 		case "FAIL":
 			statusColor = red
 		case "INCON":
+			statusColor = yellow
+		case "BLOCKED", "DENIED":
 			statusColor = yellow
 		}
 
@@ -523,11 +536,11 @@ func (m *Model) renderCandidateTable() string {
 			cursor = "> "
 		}
 
-		line := fmt.Sprintf("%s%-4s %-6s %-6s %-6s %-7s %-12s %s",
+		line := fmt.Sprintf("%s%-4s %-6s %-7s %-6s %-7s %-12s %s",
 			cursor,
 			servChar,
 			row.Protocol,
-			statusColor.Render(fmt.Sprintf("%-6s", row.Status)),
+			statusColor.Render(fmt.Sprintf("%-7s", row.Status)),
 			row.ScoreFormatted,
 			row.LatencyFormatted,
 			row.HistoryGlyphs,
@@ -556,10 +569,43 @@ func (m *Model) renderDetail() string {
 	sb.WriteString("  " + dim.Render("[Esc/Enter] Close  [y] Copy Raw Link"))
 	sb.WriteString("\n\n")
 
-	servStr := red.Render("NO")
+	gemStr := red.Render("NO")
 	if m.detail.Servable {
-		servStr = green.Render("YES")
+		gemStr = green.Render("YES")
 	}
+	genStr := red.Render("NO")
+	if m.detail.NetworkHealthy {
+		genStr = green.Render("YES")
+	}
+
+	var transStatusStr, evidenceStr, transLatStr string
+	if m.detail.TransportEvidenceKnown {
+		evidenceStr = "explicit"
+		if m.detail.TransportOK {
+			transStatusStr = green.Render("OK")
+		} else {
+			transStatusStr = red.Render("FAILED")
+		}
+		if m.detail.TransportLatency > 0 {
+			transLatStr = m.detail.TransportLatency.Round(time.Millisecond).String()
+		} else {
+			transLatStr = "---"
+		}
+	} else {
+		evidenceStr = "legacy"
+		if m.detail.NetworkHealthy {
+			transStatusStr = green.Render("OK")
+			if m.detail.TransportLatency > 0 {
+				transLatStr = m.detail.TransportLatency.Round(time.Millisecond).String()
+			} else {
+				transLatStr = "---"
+			}
+		} else {
+			transStatusStr = dim.Render("UNKNOWN")
+			transLatStr = "---"
+		}
+	}
+
 	sb.WriteString(fmt.Sprintf("  ID:        %s\n", m.detail.ID))
 	sb.WriteString(fmt.Sprintf("  Protocol:  %s\n", m.detail.Protocol))
 	sb.WriteString(fmt.Sprintf("  Endpoint:  %s\n", m.detail.Endpoint))
@@ -575,7 +621,8 @@ func (m *Model) renderDetail() string {
 	if m.detail.Remark != "" {
 		sb.WriteString(fmt.Sprintf("  Remark:    %s\n", m.detail.Remark))
 	}
-	sb.WriteString(fmt.Sprintf("  Servable:  %s (Gate: %s)\n", servStr, m.detail.ServabilityGate))
+	sb.WriteString(fmt.Sprintf("  Servable:  Gemini: %s (Gate: %s)  |  Generic: %s\n", gemStr, m.detail.ServabilityGate, genStr))
+	sb.WriteString(fmt.Sprintf("  Transport: Status=%s  Latency=%s  Evidence=%s\n", transStatusStr, transLatStr, evidenceStr))
 	sb.WriteString(fmt.Sprintf("  Score:     %s  |  Proven: %t (Lat: %s)  |  AbsentCycles: %d\n",
 		m.detail.ScoreFormatted, m.detail.HasPassed, m.detail.ProvenLatencyFormatted, m.detail.AbsentCycles))
 	sb.WriteString(fmt.Sprintf("  Latest:    Status=%s  Category=%s  Code=%d  Lat=%v  Attempts=%d\n",
@@ -682,8 +729,11 @@ func (m *Model) renderFooter() string {
 	}
 
 	filterState := "[All]"
-	if m.servableFilter {
-		filterState = "[Servable Only]"
+	switch m.filterMode {
+	case viewmodel.FilterGemini:
+		filterState = "[Gemini]"
+	case viewmodel.FilterGeneric:
+		filterState = "[Generic]"
 	}
 
 	var hints string

@@ -13,32 +13,46 @@ const (
 	CycleRunning CycleStatus = "Running"
 )
 
+// FilterMode controls candidate projection filtering in the table view.
+type FilterMode int
+
+const (
+	FilterAll FilterMode = iota
+	FilterGemini
+	FilterGeneric
+)
+
 // HeaderViewModel contains global cycle stats and progress metrics.
 type HeaderViewModel struct {
-	CycleCount        int
-	LastCycle         time.Time
-	CycleStatus       CycleStatus
-	ProgressCurrent   int
-	ProgressTotal     int
-	TotalCandidates   int
-	PassedCount       int // Active cycle passed count
-	FailedCount       int // Active cycle failed count
-	InconclusiveCount int // Active cycle inconclusive count
-	ServableCount     int
+	CycleCount           int
+	LastCycle            time.Time
+	CycleStatus          CycleStatus
+	ProgressCurrent      int
+	ProgressTotal        int
+	TotalCandidates      int
+	PassedCount          int // Active cycle passed count
+	FailedCount          int // Active cycle failed count
+	InconclusiveCount    int // Active cycle inconclusive count
+	ServableCount        int
+	GenericServableCount int
 }
 
 // CandidateRowViewModel represents an opaque, pre-sorted candidate row for the table.
 type CandidateRowViewModel struct {
-	ID               string // Opaque presentation identifier
-	Protocol         string // vless, vmess, trojan, ss
-	Endpoint         string // host:port
-	Remark           string // user remark/tag
-	Status           string // PASS, FAIL, INCON, PEND
-	ScoreFormatted   string // e.g. "0.85" or "---"
-	LatencyFormatted string // e.g. "142ms" or "---"
-	HistoryGlyphs    string // e.g. "[●●○×●●●●●●]"
-	Servable         bool
-	HasPassed        bool
+	ID                     string // Opaque presentation identifier
+	Protocol               string // vless, vmess, trojan, ss
+	Endpoint               string // host:port
+	Remark                 string // user remark/tag
+	Status                 string // PASS, FAIL, INCON, PEND, BLOCKED, DENIED
+	ScoreFormatted         string // e.g. "0.85" or "---"
+	LatencyFormatted       string // e.g. "142ms" or "---"
+	HistoryGlyphs          string // e.g. "[●●○×●●●●●●]"
+	Servable               bool
+	NetworkHealthy         bool
+	TransportOK            bool
+	TransportEvidenceKnown bool
+	TransportLatency       time.Duration
+	HasPassed              bool
 }
 
 // SampleViewModel represents a single historical observation in bounded history.
@@ -71,6 +85,10 @@ type CandidateDetailViewModel struct {
 	ScoreFormatted         string
 	Servable               bool
 	ServabilityGate        string // Failure reason if unservable
+	NetworkHealthy         bool
+	TransportEvidenceKnown bool
+	TransportOK            bool
+	TransportLatency       time.Duration
 	HasPassed              bool
 	ProvenLatencyFormatted string // e.g. "120ms" or "---" if unproven
 	AbsentCycles           int

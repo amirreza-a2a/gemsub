@@ -57,10 +57,10 @@ func TestAdapter_DeterministicOrdering(t *testing.T) {
 	// Put multiple inconclusive to test unproven ordering
 	st.PutWithTransition(store.Result{Link: c3, Status: store.StatusInconclusive, TestedAt: now})
 
-	// c4: Failed target
-	st.PutWithTransition(store.Result{Link: c4, Status: store.StatusFailed, Category: store.ErrRegionBlocked, TestedAt: now})
+	// c4: Failed transport (unservable)
+	st.PutWithTransition(store.Result{Link: c4, Status: store.StatusFailed, Category: store.ErrProxyError, TestedAt: now})
 
-	rows := ad.CandidateRows(false)
+	rows := ad.CandidateRows(viewmodel.FilterAll)
 	if len(rows) != 4 {
 		t.Fatalf("expected 4 rows, got %d", len(rows))
 	}
@@ -97,7 +97,7 @@ func TestAdapter_OpaqueIDMappingAndDetail(t *testing.T) {
 		TestedAt: time.Now(),
 	})
 
-	rows := ad.CandidateRows(false)
+	rows := ad.CandidateRows(viewmodel.FilterAll)
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(rows))
 	}
@@ -143,12 +143,12 @@ func TestAdapter_FilterServableOnly(t *testing.T) {
 	st.PutWithTransition(store.Result{Link: linkPass, Status: store.StatusPassed, TestedAt: time.Now()})
 	st.PutWithTransition(store.Result{Link: linkFail, Status: store.StatusFailed, Category: store.ErrRegionBlocked, TestedAt: time.Now()})
 
-	allRows := ad.CandidateRows(false)
+	allRows := ad.CandidateRows(viewmodel.FilterAll)
 	if len(allRows) != 2 {
 		t.Fatalf("expected 2 all rows, got %d", len(allRows))
 	}
 
-	servableRows := ad.CandidateRows(true)
+	servableRows := ad.CandidateRows(viewmodel.FilterGemini)
 	if len(servableRows) != 1 {
 		t.Fatalf("expected 1 servable row, got %d", len(servableRows))
 	}
@@ -287,7 +287,7 @@ func TestAdapter_OpaqueIDPruning(t *testing.T) {
 	st.PutWithTransition(store.Result{Link: "vless://a@1.1.1.1:443#NodeA", Status: store.StatusPassed, TestedAt: time.Now()})
 	st.PutWithTransition(store.Result{Link: "vless://b@2.2.2.2:443#NodeB", Status: store.StatusPassed, TestedAt: time.Now()})
 
-	rows1 := ad.CandidateRows(false)
+	rows1 := ad.CandidateRows(viewmodel.FilterAll)
 	if len(rows1) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(rows1))
 	}
@@ -325,7 +325,7 @@ func TestAdapter_OpaqueIDPruning(t *testing.T) {
 	}
 
 	// Call CandidateRows on the SAME adapter `ad`
-	rows2 := ad.CandidateRows(false)
+	rows2 := ad.CandidateRows(viewmodel.FilterAll)
 	if len(rows2) != 2 {
 		t.Fatalf("expected 2 rows after reload, got %d", len(rows2))
 	}
@@ -418,7 +418,7 @@ func TestAdapter_LatencySemantics(t *testing.T) {
 		TestedAt: time.Now(),
 	})
 
-	rows := ad.CandidateRows(false)
+	rows := ad.CandidateRows(viewmodel.FilterAll)
 	var rowProven, rowUnproven viewmodel.CandidateRowViewModel
 	for _, r := range rows {
 		if r.Remark == "Proven" {
@@ -462,7 +462,7 @@ func TestAdapter_ControllerMethods(t *testing.T) {
 	})
 
 	// Snapshot
-	snap := ad.Snapshot(false)
+	snap := ad.Snapshot(viewmodel.FilterAll)
 	if len(snap.Rows) != 1 {
 		t.Fatalf("expected 1 row in snapshot, got %d", len(snap.Rows))
 	}
@@ -472,7 +472,7 @@ func TestAdapter_ControllerMethods(t *testing.T) {
 
 	// PollSnapshot when dirty
 	ad.MarkDirty()
-	snap2, updated := ad.PollSnapshot(false)
+	snap2, updated := ad.PollSnapshot(viewmodel.FilterAll)
 	if !updated {
 		t.Fatal("expected PollSnapshot updated=true when dirty")
 	}
@@ -481,7 +481,7 @@ func TestAdapter_ControllerMethods(t *testing.T) {
 	}
 
 	// PollSnapshot when clean
-	_, updatedClean := ad.PollSnapshot(false)
+	_, updatedClean := ad.PollSnapshot(viewmodel.FilterAll)
 	if updatedClean {
 		t.Error("expected PollSnapshot updated=false when clean")
 	}
@@ -668,7 +668,7 @@ func TestAdapter_LostEventBusEventsPreserveCandidateStateProjection(t *testing.T
 
 	// Adapter detects revision divergence via PollSnapshot (which calls CheckAndResetDirty internally)
 	// and projects authoritative candidate state without corruption
-	snap, updated := ad.PollSnapshot(false)
+	snap, updated := ad.PollSnapshot(viewmodel.FilterAll)
 	if !updated {
 		t.Fatal("expected PollSnapshot updated=true after store revision change")
 	}
@@ -801,7 +801,7 @@ func TestAdapter_LostCycleFinishedRecoverableViaStore(t *testing.T) {
 	st.FinishCycle()
 
 	// Adapter polls on tick (or queries Header)
-	snap, updated := ad.PollSnapshot(false)
+	snap, updated := ad.PollSnapshot(viewmodel.FilterAll)
 	if !updated {
 		t.Fatal("expected PollSnapshot updated=true due to Store revision and cycle completion")
 	}
@@ -958,7 +958,7 @@ func TestAdapter_FlagPresentationModes(t *testing.T) {
 		t.Fatalf("expected FlagMode ASCII, got %v", ad.FlagMode())
 	}
 
-	rowsASCII := ad.CandidateRows(false)
+	rowsASCII := ad.CandidateRows(viewmodel.FilterAll)
 	if len(rowsASCII) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(rowsASCII))
 	}
@@ -985,7 +985,7 @@ func TestAdapter_FlagPresentationModes(t *testing.T) {
 		t.Fatalf("expected FlagMode Unicode, got %v", ad.FlagMode())
 	}
 
-	rowsUnicode := ad.CandidateRows(false)
+	rowsUnicode := ad.CandidateRows(viewmodel.FilterAll)
 	for _, r := range rowsUnicode {
 		if r.Endpoint == "1.1.1.1:443" {
 			if r.Remark != "🇩🇪 Germany" {
@@ -1010,5 +1010,215 @@ func TestAdapter_FlagPresentationModes(t *testing.T) {
 	rawLink, ok := ad.ActiveLink(rowsASCII[0].ID)
 	if !ok || (rawLink != cand1 && rawLink != cand2) {
 		t.Errorf("ActiveLink corrupted: got %q", rawLink)
+	}
+}
+
+func TestAdapter_DualServabilityStats(t *testing.T) {
+	ad, st, _, _ := setupTestAdapter(t)
+
+	now := time.Now()
+	// To satisfy MinObservationsForServing (which is 2 in setupTestAdapter):
+	// c1: Gemini-servable and Generic-servable (2 passed observations)
+	c1 := "vless://c1@1.1.1.1:443#GeminiServable"
+	st.PutWithTransition(store.Result{Link: c1, Status: store.StatusPassed, TestedAt: now.Add(-time.Minute)})
+	st.PutWithTransition(store.Result{Link: c1, Status: store.StatusPassed, TestedAt: now})
+
+	// c2: Generic-servable only (2 observations with Stage 1 TransportOK, Stage 2 RegionBlocked)
+	c2 := "vless://c2@2.2.2.2:443#GenericServable"
+	st.PutWithTransition(store.Result{
+		Link:                   c2,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TransportLatency:       50 * time.Millisecond,
+		TestedAt:               now.Add(-time.Minute),
+	})
+	st.PutWithTransition(store.Result{
+		Link:                   c2,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TransportLatency:       45 * time.Millisecond,
+		TestedAt:               now,
+	})
+
+	// c3: Unservable dead candidate (Stage 1 transport failed)
+	c3 := "vless://c3@3.3.3.3:443#DeadNode"
+	st.PutWithTransition(store.Result{
+		Link:                   c3,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrProxyError,
+		TransportEvidenceKnown: true,
+		TransportOK:            false,
+		TestedAt:               now.Add(-time.Minute),
+	})
+	st.PutWithTransition(store.Result{
+		Link:                   c3,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrProxyError,
+		TransportEvidenceKnown: true,
+		TransportOK:            false,
+		TestedAt:               now,
+	})
+
+	hdr := ad.Header()
+	if hdr.TotalCandidates != 3 {
+		t.Fatalf("expected 3 total candidates, got %d", hdr.TotalCandidates)
+	}
+	if hdr.ServableCount != 1 {
+		t.Errorf("expected 1 ServableCount (Gemini), got %d", hdr.ServableCount)
+	}
+	if hdr.GenericServableCount != 2 {
+		t.Errorf("expected 2 GenericServableCount (Gemini + Generic), got %d", hdr.GenericServableCount)
+	}
+}
+
+func TestAdapter_TieredRankingAndFiltering(t *testing.T) {
+	ad, st, _, _ := setupTestAdapter(t)
+
+	now := time.Now()
+	// c1: Tier 1 (Gemini-servable)
+	c1 := "vless://c1@1.1.1.1:443#Tier1"
+	st.PutWithTransition(store.Result{
+		Link:                   c1,
+		Status:                 store.StatusPassed,
+		Latency:                150 * time.Millisecond,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TransportLatency:       150 * time.Millisecond,
+		TestedAt:               now.Add(-time.Minute),
+	})
+	st.PutWithTransition(store.Result{
+		Link:                   c1,
+		Status:                 store.StatusPassed,
+		Latency:                120 * time.Millisecond,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TransportLatency:       120 * time.Millisecond,
+		TestedAt:               now,
+	})
+
+	// c2: Tier 2 (Generic-servable only)
+	c2 := "vless://c2@2.2.2.2:443#Tier2"
+	st.PutWithTransition(store.Result{
+		Link:                   c2,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TransportLatency:       80 * time.Millisecond,
+		TestedAt:               now.Add(-time.Minute),
+	})
+	st.PutWithTransition(store.Result{
+		Link:                   c2,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TransportLatency:       75 * time.Millisecond,
+		TestedAt:               now,
+	})
+
+	// c3: Tier 3 (Unservable)
+	c3 := "vless://c3@3.3.3.3:443#Tier3"
+	st.PutWithTransition(store.Result{
+		Link:                   c3,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrProxyError,
+		TransportEvidenceKnown: true,
+		TransportOK:            false,
+		TestedAt:               now.Add(-time.Minute),
+	})
+	st.PutWithTransition(store.Result{
+		Link:                   c3,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrProxyError,
+		TransportEvidenceKnown: true,
+		TransportOK:            false,
+		TestedAt:               now,
+	})
+
+	// 1. Check 3-tier ordering under FilterAll
+	rowsAll := ad.CandidateRows(viewmodel.FilterAll)
+	if len(rowsAll) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rowsAll))
+	}
+	if rowsAll[0].Remark != "Tier1" {
+		t.Errorf("expected row 0 to be Tier1, got %q", rowsAll[0].Remark)
+	}
+	if rowsAll[1].Remark != "Tier2" {
+		t.Errorf("expected row 1 to be Tier2, got %q", rowsAll[1].Remark)
+	}
+	if rowsAll[2].Remark != "Tier3" {
+		t.Errorf("expected row 2 to be Tier3, got %q", rowsAll[2].Remark)
+	}
+
+	// 2. Check FilterGemini: only Tier 1
+	rowsGemini := ad.CandidateRows(viewmodel.FilterGemini)
+	if len(rowsGemini) != 1 {
+		t.Fatalf("expected 1 row for FilterGemini, got %d", len(rowsGemini))
+	}
+	if rowsGemini[0].Remark != "Tier1" {
+		t.Errorf("expected FilterGemini row to be Tier1, got %q", rowsGemini[0].Remark)
+	}
+
+	// 3. Check FilterGeneric: Tier 1 + Tier 2 (both are network healthy)
+	rowsGeneric := ad.CandidateRows(viewmodel.FilterGeneric)
+	if len(rowsGeneric) != 2 {
+		t.Fatalf("expected 2 rows for FilterGeneric, got %d", len(rowsGeneric))
+	}
+	if rowsGeneric[0].Remark != "Tier1" || rowsGeneric[1].Remark != "Tier2" {
+		t.Errorf("expected FilterGeneric rows [Tier1, Tier2], got [%s, %s]",
+			rowsGeneric[0].Remark, rowsGeneric[1].Remark)
+	}
+
+	// 4. Verify CandidateRowViewModel fields and status mapping
+	// Tier 1 row
+	r1 := rowsAll[0]
+	if !r1.Servable || !r1.NetworkHealthy || !r1.TransportOK || !r1.TransportEvidenceKnown {
+		t.Errorf("Tier1 row flags unexpected: Servable=%v NetworkHealthy=%v TransportOK=%v TransportEvidenceKnown=%v",
+			r1.Servable, r1.NetworkHealthy, r1.TransportOK, r1.TransportEvidenceKnown)
+	}
+	if r1.Status != "PASS" {
+		t.Errorf("expected Tier1 Status PASS, got %s", r1.Status)
+	}
+
+	// Tier 2 row (RegionBlocked target restriction)
+	r2 := rowsAll[1]
+	if r2.Servable || !r2.NetworkHealthy || !r2.TransportOK || !r2.TransportEvidenceKnown {
+		t.Errorf("Tier2 row flags unexpected: Servable=%v NetworkHealthy=%v TransportOK=%v TransportEvidenceKnown=%v",
+			r2.Servable, r2.NetworkHealthy, r2.TransportOK, r2.TransportEvidenceKnown)
+	}
+	if r2.Status != "BLOCKED" {
+		t.Errorf("expected Tier2 Status BLOCKED, got %s", r2.Status)
+	}
+	if r2.TransportLatency != 75*time.Millisecond {
+		t.Errorf("expected Tier2 TransportLatency 75ms, got %v", r2.TransportLatency)
+	}
+
+	// Tier 3 row (transport failure)
+	r3 := rowsAll[2]
+	if r3.Servable || r3.NetworkHealthy || r3.TransportOK || !r3.TransportEvidenceKnown {
+		t.Errorf("Tier3 row flags unexpected: Servable=%v NetworkHealthy=%v TransportOK=%v TransportEvidenceKnown=%v",
+			r3.Servable, r3.NetworkHealthy, r3.TransportOK, r3.TransportEvidenceKnown)
+	}
+	if r3.Status != "FAIL" {
+		t.Errorf("expected Tier3 Status FAIL, got %s", r3.Status)
+	}
+
+	// 5. Verify CandidateDetailViewModel fields
+	detail2, ok := ad.CandidateDetail(r2.ID)
+	if !ok {
+		t.Fatalf("expected CandidateDetail for Tier2")
+	}
+	if detail2.Servable != false || detail2.NetworkHealthy != true {
+		t.Errorf("expected Tier2 detail Servable=false NetworkHealthy=true, got Servable=%v NetworkHealthy=%v",
+			detail2.Servable, detail2.NetworkHealthy)
+	}
+	if !detail2.TransportEvidenceKnown || !detail2.TransportOK || detail2.TransportLatency != 75*time.Millisecond {
+		t.Errorf("expected Tier2 detail transport evidence known=true ok=true lat=75ms, got known=%v ok=%v lat=%v",
+			detail2.TransportEvidenceKnown, detail2.TransportOK, detail2.TransportLatency)
 	}
 }

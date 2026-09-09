@@ -8,12 +8,12 @@ The canonical local register for non-blocking findings, deferred hardening items
 
 | Classification | Count | Description |
 |:---|:---:|:---|
-| **Active Technical Debt (P1)** | 2 | Material architectural, product, or reliability issues requiring planned engineering tickets. |
-| **Future Hardening & Observability (P2)** | 3 | Non-blocking enhancements to metrics, operational logging, scheduling fairness, or optional configuration. |
-| **Code Quality & Test Cleanup (P2)** | 2 | Maintainability, naming clarity, deduplication, and test fixture consolidation. |
+| **Active Technical Debt (P1)** | 1 | Material architectural, product, or reliability issues requiring planned engineering tickets. |
+| **Future Hardening & Observability (P2)** | 4 | Non-blocking enhancements to metrics, operational logging, scheduling fairness, or optional configuration. |
+| **Code Quality & Test Cleanup (P2)** | 4 | Maintainability, naming clarity, deduplication, and test fixture consolidation. |
 | **External & Upstream Tracking** | 1 | Issues rooted in external dependencies tracked across upstream releases. |
-| **Promoted / Resolved** | 0 | Items promoted to active GitHub issues or resolved in implementation commits. |
-| **Total Registered Items** | **8** | |
+| **Promoted / Resolved** | 1 | Items promoted to active GitHub issues or resolved in implementation commits. |
+| **Total Registered Items** | **11** | |
 
 ---
 
@@ -23,12 +23,15 @@ The canonical local register for non-blocking findings, deferred hardening items
 |:---|:---|:---:|:---|:---|:---:|
 | [TD-001](#td-001--publisher-atomic-publication) | Publisher atomic publication | P1 | Publisher | Ticket 23 Review / Post-Ticket-23 Audit | Open |
 | [TD-002](#td-002--scheduler-candidate-rotation-under-probelimit) | Scheduler candidate rotation under ProbeLimit | P2 | Scheduler / Scheduling Fairness | Post-Ticket-23 Audit / TD-002 Audit | Open / Deferred |
-| [TD-003](#td-003--tui-dual-projection-observability) | TUI dual-projection observability | P1 | TUI | Post-Ticket-23 Audit | Open |
+| [TD-003](#td-003--tui-dual-projection-observability) | TUI dual-projection observability | P1 | TUI | Post-Ticket-23 Audit | Promoted (Ticket 25, #3) |
 | [TD-004](#td-004--scheduler-generic-servability-metrics) | Scheduler generic servability metrics | P2 | Scheduler / Observability | Post-Ticket-23 Audit | Open |
 | [TD-005](#td-005--serveconfig-projection-alignment) | ServeConfig projection alignment | P2 | Configuration / Subserver | Post-Ticket-23 Audit | Open / Deferred |
 | [TD-006](#td-006--publishertest-code-cleanup) | Publisher test fixture cleanup | P2 | Test / Code Quality | Ticket 23 Review | Open |
 | [TD-007](#td-007--subserver-code-hygiene) | Subserver code hygiene | P2 | Subserver | Ticket 24 Review | Open |
 | [TD-008](#td-008--upstream-sing-box-race-tracking) | Upstream sing-box race tracking | External | Dependency (`sing-box`) | Tickets 18/21/22 / Post-Ticket-23 Audit | Monitoring |
+| [TD-009](#td-009--tui-narrow-terminal-header-layout) | TUI narrow-terminal header layout | P2 | TUI / Presentation | Ticket 25 independent review | Open |
+| [TD-010](#td-010--tui-presentation-ranking-divergence-documentation) | TUI presentation ranking divergence documentation | P2 | TUI / Architecture Documentation | Ticket 25 independent review | Open / Documentation |
+| [TD-011](#td-011--tui-legacyunknown-transport-detail-test-coverage) | TUI legacy/unknown transport detail test coverage | P2 | TUI / Tests | Ticket 25 independent review | Open |
 
 ---
 
@@ -60,7 +63,10 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **Title:** TUI dual-projection observability (Generic vs. Gemini)
 - **Priority:** P1
 - **Area:** TUI
-- **Status:** Open
+- **Status:** Promoted
+- **Promoted to Ticket:** Ticket 25
+- **GitHub Issue:** #3
+- **Date Promoted:** 2026-09-09
 - **Origin:** Post-Ticket-23 architecture audit
 - **Problem:**
   The Terminal User Interface (TUI) was built around a single-projection mental model (`Store.Passing()`). In the current TUI, candidates that pass Stage 1 transport health but fail Stage 2 Gemini application verification (such as `ErrRegionBlocked` or `ErrTargetDenied`) appear as generic failures. There is no visible indicator or counter showing the health of the generic/network-healthy candidate pool (`Store.NetworkPassing()`).
@@ -141,6 +147,27 @@ The canonical local register for non-blocking findings, deferred hardening items
 
 ---
 
+### TD-009 — TUI narrow-terminal header layout
+
+- **ID:** `TD-009`
+- **Title:** TUI narrow-terminal header layout
+- **Priority:** P2
+- **Area:** TUI / Presentation
+- **Status:** Open
+- **Origin:** Ticket 25 independent review
+- **Problem:**
+  The Ticket 25 dual-servability header line can exceed 80 columns when cycle metrics and probe progress are displayed together, causing line wrapping on the minimum 80-column terminal.
+- **Impact:**
+  Minor presentation degradation and one-line header displacement on narrow terminals.
+- **Proposed Future Remediation:**
+  Introduce width-aware header formatting, abbreviated labels, or conditional omission/truncation of lower-priority progress information when terminal width is constrained.
+  - Do **NOT** change Ticket 25 implementation now merely to address this debt item.
+- **Dependencies:** `internal/tui/model.go`
+- **Promotion Criteria:**
+  Promote during a dedicated TUI responsive layout or cosmetic polish pass.
+
+---
+
 ## 5. Code Quality & Test Cleanup (P2)
 
 ### TD-006 — Publisher/test code cleanup
@@ -187,6 +214,56 @@ The canonical local register for non-blocking findings, deferred hardening items
 
 ---
 
+### TD-010 — TUI presentation ranking divergence documentation
+
+- **ID:** `TD-010`
+- **Title:** TUI presentation ranking divergence documentation
+- **Priority:** P2
+- **Area:** TUI / Architecture Documentation
+- **Status:** Open / Documentation
+- **Origin:** Ticket 25 independent review
+- **Problem:**
+  The TUI CandidateRows ordering intentionally differs from `Store.NetworkPassingRanked()` for Tier 2 candidates. Store delivery ordering prioritizes network latency, while the TUI presentation ordering also considers `HasPassed` and reliability score for operator readability.
+- **Impact:**
+  No runtime or delivery correctness impact, but the distinction must remain explicit to prevent future accidental coupling or assumptions that both orderings are identical.
+- **Proposed Future Remediation:**
+  Document this as an intentional boundary:
+  - Store ranking is canonical for delivery projections.
+  - TUI ordering is presentation-specific.
+  - Do not unify the ranking implementations unless a future architecture decision explicitly requires a shared ordering contract.
+- **Dependencies:** `internal/tui/adapter/adapter.go`, `docs/agents/domain.md`
+- **Promotion Criteria:**
+  Promote when updating repository architecture documentation or during a general domain context refresh.
+
+---
+
+### TD-011 — TUI legacy/unknown transport detail test coverage
+
+- **ID:** `TD-011`
+- **Title:** TUI legacy/unknown transport detail test coverage
+- **Priority:** P2
+- **Area:** TUI / Tests
+- **Status:** Open
+- **Origin:** Ticket 25 independent review
+- **Problem:**
+  The `CandidateDetail` transport fallback for `TransportEvidenceKnown=false` is implemented defensively, but the current unit-test suite does not directly assert the legacy/unknown rendering branch.
+- **Impact:**
+  Test coverage gap for legacy/unproven candidate detail display. No runtime defect.
+- **Proposed Future Remediation:**
+  Add a deterministic unit test covering:
+  - `TransportEvidenceKnown=false`
+  - `NetworkHealthy=false`
+  - rendered transport state = `UNKNOWN`
+  - `Evidence=legacy`
+  - no panic
+  - Also test the legacy `NetworkHealthy=true` case if useful.
+  - Do not modify Ticket 25 tests now.
+- **Dependencies:** `internal/tui/model_test.go`
+- **Promotion Criteria:**
+  Promote during a dedicated TUI test suite maintenance pass.
+
+---
+
 ## 6. External & Upstream Tracking
 
 ### TD-008 — Upstream sing-box race tracking
@@ -211,7 +288,11 @@ The canonical local register for non-blocking findings, deferred hardening items
 
 ## 7. Promoted & Closed Items
 
-*No debt items have been promoted or closed yet.*
+### TD-003 — TUI dual-projection observability
+- **Status:** Promoted
+- **Promoted to Ticket:** Ticket 25
+- **GitHub Issue:** #3
+- **Date Promoted:** 2026-09-09
 
 ### Record Template for Promoted Items
 

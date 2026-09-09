@@ -291,3 +291,186 @@ func TestModel_CountryFlagRendering(t *testing.T) {
 		t.Errorf("expected detail to contain 'Remark:    🇩🇪 Germany', got:\n%s", detailUnicode)
 	}
 }
+
+func TestModel_HeaderRendersDualServabilityCounts(t *testing.T) {
+	m, st, _, _ := setupTestModel(t)
+
+	now := time.Now()
+	// c1: Gemini-servable (2 passed)
+	c1 := "vless://c1@1.1.1.1:443#GeminiNode"
+	st.PutWithTransition(store.Result{Link: c1, Status: store.StatusPassed, TestedAt: now.Add(-time.Minute)})
+	st.PutWithTransition(store.Result{Link: c1, Status: store.StatusPassed, TestedAt: now})
+
+	// c2: Generic-servable only (RegionBlocked)
+	c2 := "vless://c2@2.2.2.2:443#GenericNode"
+	st.PutWithTransition(store.Result{
+		Link:                   c2,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TransportLatency:       50 * time.Millisecond,
+		TestedAt:               now.Add(-time.Minute),
+	})
+	st.PutWithTransition(store.Result{
+		Link:                   c2,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TransportLatency:       45 * time.Millisecond,
+		TestedAt:               now,
+	})
+
+	// c3: Dead node
+	c3 := "vless://c3@3.3.3.3:443#DeadNode"
+	st.PutWithTransition(store.Result{Link: c3, Status: store.StatusFailed, Category: store.ErrProxyError, TestedAt: now})
+
+	// Trigger snapshot refresh
+	updated, _ := m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+
+	view := m.View()
+	// Line 2 should display: Servable: Gemini: 1  Generic: 2 / 3
+	if !strings.Contains(view, "Gemini: 1") || !strings.Contains(view, "Generic: 2 / 3") {
+		t.Errorf("expected view to contain dual servability counts 'Gemini: 1' and 'Generic: 2 / 3', got:\n%s", view)
+	}
+}
+
+func TestModel_TableRendersDualBadgesAndBlockedStatus(t *testing.T) {
+	m, st, _, _ := setupTestModel(t)
+
+	now := time.Now()
+	c1 := "vless://c1@1.1.1.1:443#PassNode"
+	st.PutWithTransition(store.Result{
+		Link:                   c1,
+		Status:                 store.StatusPassed,
+		Latency:                100 * time.Millisecond,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TransportLatency:       100 * time.Millisecond,
+		TestedAt:               now,
+	})
+
+	c2 := "vless://c2@2.2.2.2:443#BlockedNode"
+	st.PutWithTransition(store.Result{
+		Link:                   c2,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TransportLatency:       50 * time.Millisecond,
+		TestedAt:               now,
+	})
+
+	c3 := "vless://c3@3.3.3.3:443#DeadNode"
+	st.PutWithTransition(store.Result{
+		Link:                   c3,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrProxyError,
+		TransportEvidenceKnown: true,
+		TransportOK:            false,
+		TestedAt:               now,
+	})
+
+	updated, _ := m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+
+	view := m.View()
+
+	// Dual servability markers
+	// c1 (Gemini servable): [✓✓]
+	if !strings.Contains(view, "[✓✓]") {
+		t.Errorf("expected view to contain [✓✓] for Gemini servable node, got:\n%s", view)
+	}
+	// c2 (Generic-only servable): [G ]
+	if !strings.Contains(view, "[G ]") {
+		t.Errorf("expected view to contain [G ] for generic-only servable node, got:\n%s", view)
+	}
+	// c3 (Dead node): [  ]
+	if !strings.Contains(view, "[  ]") {
+		t.Errorf("expected view to contain [  ] for dead node, got:\n%s", view)
+	}
+
+	// Status distinction
+	// c2 (RegionBlocked) must display BLOCKED, NOT red FAIL
+	if !strings.Contains(view, "BLOCKED") {
+		t.Errorf("expected view to contain 'BLOCKED' for RegionBlocked node, got:\n%s", view)
+	}
+	// c3 (Dead) must display FAIL
+	if !strings.Contains(view, "FAIL") {
+		t.Errorf("expected view to contain 'FAIL' for dead node, got:\n%s", view)
+	}
+}
+
+func TestModel_DetailRendersDualServabilityAndTransport(t *testing.T) {
+	m, st, _, _ := setupTestModel(t)
+
+	now := time.Now()
+	link := "vless://c1@1.1.1.1:443#BlockedDetail"
+	st.PutWithTransition(store.Result{
+		Link:                   link,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		Reason:                 "location not supported",
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		TransportLatency:       88 * time.Millisecond,
+		TestedAt:               now,
+	})
+
+	// Refresh and open detail (press Enter)
+	updated, _ := m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	view := m.View()
+	if !strings.Contains(view, "CANDIDATE INSPECTION") {
+		t.Fatalf("expected CANDIDATE INSPECTION view, got:\n%s", view)
+	}
+
+	// Servable line: Gemini: NO ... Generic: YES
+	if !strings.Contains(view, "Gemini: NO") || !strings.Contains(view, "Generic: YES") {
+		t.Errorf("expected detail to render dual servability 'Gemini: NO' and 'Generic: YES', got:\n%s", view)
+	}
+
+	// Transport line: Status=OK  Latency=88ms  Evidence=explicit
+	if !strings.Contains(view, "Transport: Status=OK") || !strings.Contains(view, "Latency=88ms") || !strings.Contains(view, "Evidence=explicit") {
+		t.Errorf("expected detail to render Stage 1 transport inspection line, got:\n%s", view)
+	}
+}
+
+func TestModel_FilterModeCycling(t *testing.T) {
+	m, _, _, _ := setupTestModel(t)
+
+	// Initial view: [All]
+	view0 := m.View()
+	if !strings.Contains(view0, "[s] Filter [All]") {
+		t.Errorf("expected initial filter hint '[s] Filter [All]', got:\n%s", view0)
+	}
+
+	// 1st press 's' -> Filter: Gemini servable
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(*tui.Model)
+	view1 := m.View()
+	if !strings.Contains(view1, "[Filter: Gemini servable]") || !strings.Contains(view1, "[s] Filter [Gemini]") {
+		t.Errorf("expected Gemini servable filter state, got:\n%s", view1)
+	}
+
+	// 2nd press 's' -> Filter: Generic servable
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(*tui.Model)
+	view2 := m.View()
+	if !strings.Contains(view2, "[Filter: Generic servable]") || !strings.Contains(view2, "[s] Filter [Generic]") {
+		t.Errorf("expected Generic servable filter state, got:\n%s", view2)
+	}
+
+	// 3rd press 's' -> Filter: All candidates
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(*tui.Model)
+	view3 := m.View()
+	if !strings.Contains(view3, "[Filter: All candidates]") || !strings.Contains(view3, "[s] Filter [All]") {
+		t.Errorf("expected All candidates filter state, got:\n%s", view3)
+	}
+}

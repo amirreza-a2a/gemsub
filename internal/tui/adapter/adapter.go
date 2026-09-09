@@ -268,6 +268,7 @@ func (a *Adapter) Header() viewmodel.HeaderViewModel {
 		FailedCount:       cycleFailed,
 		InconclusiveCount: cycleIncon,
 		ServableCount:     stats.Servable,
+		GenericServableCount: stats.GenericServable,
 	}
 }
 
@@ -281,7 +282,7 @@ func (a *Adapter) StoreStats() store.Stats {
 
 // CandidateRows queries the authoritative Store, applies the canonical candidate ranking
 // policy, assigns opaque presentation IDs, and returns a pre-sorted slice of CandidateRowViewModel.
-func (a *Adapter) CandidateRows(servableOnly bool) []viewmodel.CandidateRowViewModel {
+func (a *Adapter) CandidateRows(filter viewmodel.FilterMode) []viewmodel.CandidateRowViewModel {
 	if a.st == nil {
 		return nil
 	}
@@ -289,14 +290,28 @@ func (a *Adapter) CandidateRows(servableOnly bool) []viewmodel.CandidateRowViewM
 	snaps := a.st.Snapshots()
 
 	// Deterministic Candidate Ordering Policy:
-	// 1. Servable candidates before unservable candidates.
-	// 2. Within each group, proven candidates (HasPassed == true) before unproven candidates.
-	// 3. Reliability Score descending.
-	// 4. Last passed latency ascending.
-	// 5. Stable internal identity ascending as deterministic tie-breaker.
+	// 1. Tier 1: Gemini-servable candidates (Servable == true).
+	// 2. Tier 2: Generic-servable candidates (NetworkHealthy == true && Servable == false).
+	// 3. Tier 3: Unservable candidates.
+	// 4. Within each tier, proven candidates (HasPassed == true) before unproven candidates.
+	// 5. Reliability Score descending.
+	// 6. Effective latency ascending (LastPassedLatency, then TransportLatency).
+	// 7. Stable internal identity ascending as deterministic tie-breaker.
+	tier := func(snap store.CandidateSnapshot) int {
+		if snap.Servable {
+			return 1
+		}
+		if snap.NetworkHealthy {
+			return 2
+		}
+		return 3
+	}
+
 	sort.Slice(snaps, func(i, j int) bool {
-		if snaps[i].Servable != snaps[j].Servable {
-			return snaps[i].Servable
+		tI := tier(snaps[i])
+		tJ := tier(snaps[j])
+		if tI != tJ {
+			return tI < tJ
 		}
 		if snaps[i].Record.HasPassed != snaps[j].Record.HasPassed {
 			return snaps[i].Record.HasPassed
@@ -304,8 +319,22 @@ func (a *Adapter) CandidateRows(servableOnly bool) []viewmodel.CandidateRowViewM
 		if snaps[i].Record.Score != snaps[j].Record.Score {
 			return snaps[i].Record.Score > snaps[j].Record.Score
 		}
-		if snaps[i].Record.LastPassedLatency != snaps[j].Record.LastPassedLatency {
-			return snaps[i].Record.LastPassedLatency < snaps[j].Record.LastPassedLatency
+		latI := snaps[i].Record.LastPassedLatency
+		if latI == 0 && snaps[i].TransportLatency > 0 {
+			latI = snaps[i].TransportLatency
+		}
+		latJ := snaps[j].Record.LastPassedLatency
+		if latJ == 0 && snaps[j].TransportLatency > 0 {
+			latJ = snaps[j].TransportLatency
+		}
+		if latI != latJ {
+			if latI == 0 {
+				return false
+			}
+			if latJ == 0 {
+				return true
+			}
+			return latI < latJ
 		}
 		return snaps[i].Record.CanonicalLink < snaps[j].Record.CanonicalLink
 	})
@@ -331,8 +360,17 @@ func (a *Adapter) CandidateRows(servableOnly bool) []viewmodel.CandidateRowViewM
 
 	out := make([]viewmodel.CandidateRowViewModel, 0, len(snaps))
 	for _, snap := range snaps {
-		if servableOnly && !snap.Servable {
-			continue
+		switch filter {
+		case viewmodel.FilterGemini:
+			if !snap.Servable {
+				continue
+			}
+		case viewmodel.FilterGeneric:
+			if !snap.NetworkHealthy {
+				continue
+			}
+		case viewmodel.FilterAll:
+			// include all
 		}
 
 		canonical := snap.Record.CanonicalLink
@@ -353,7 +391,18 @@ func (a *Adapter) CandidateRows(servableOnly bool) []viewmodel.CandidateRowViewM
 			case store.StatusPassed:
 				status = "PASS"
 			case store.StatusFailed:
-				status = "FAIL"
+				if snap.TransportOK || (snap.NetworkHealthy && snap.Record.Latest.Category.IsTargetSpecific()) {
+					switch snap.Record.Latest.Category {
+					case store.ErrRegionBlocked:
+						status = "BLOCKED"
+					case store.ErrTargetDenied:
+						status = "DENIED"
+					default:
+						status = "FAIL"
+					}
+				} else {
+					status = "FAIL"
+				}
 			case store.StatusInconclusive:
 				status = "INCON"
 			}
@@ -374,16 +423,20 @@ func (a *Adapter) CandidateRows(servableOnly bool) []viewmodel.CandidateRowViewM
 		glyphs := FormatHistoryGlyphs(snap.Record.History.ChronologicalSamples(), snap.Record.History.Capacity)
 
 		out = append(out, viewmodel.CandidateRowViewModel{
-			ID:               opaqueID,
-			Protocol:         proto,
-			Endpoint:         endpoint,
-			Remark:           remark,
-			Status:           status,
-			ScoreFormatted:   scoreStr,
-			LatencyFormatted: latStr,
-			HistoryGlyphs:    glyphs,
-			Servable:         snap.Servable,
-			HasPassed:        snap.Record.HasPassed,
+			ID:                     opaqueID,
+			Protocol:               proto,
+			Endpoint:               endpoint,
+			Remark:                 remark,
+			Status:                 status,
+			ScoreFormatted:         scoreStr,
+			LatencyFormatted:       latStr,
+			HistoryGlyphs:          glyphs,
+			Servable:               snap.Servable,
+			NetworkHealthy:         snap.NetworkHealthy,
+			TransportOK:            snap.TransportOK,
+			TransportEvidenceKnown: snap.TransportEvidenceKnown,
+			TransportLatency:       snap.TransportLatency,
+			HasPassed:              snap.Record.HasPassed,
 		})
 	}
 
@@ -408,6 +461,7 @@ func (a *Adapter) CandidateDetail(opaqueID string) (viewmodel.CandidateDetailVie
 	}
 
 	servable, gateReason := a.st.ServabilityGate(rec)
+	networkHealthy := a.st.IsNetworkHealthyRecord(rec)
 
 	activeLink := rec.ActiveLink
 	if activeLink == "" {
@@ -486,6 +540,10 @@ func (a *Adapter) CandidateDetail(opaqueID string) (viewmodel.CandidateDetailVie
 		ScoreFormatted:         scoreStr,
 		Servable:               servable,
 		ServabilityGate:        gateReason,
+		NetworkHealthy:         networkHealthy,
+		TransportEvidenceKnown: rec.Latest.TransportEvidenceKnown,
+		TransportOK:            rec.Latest.TransportOK,
+		TransportLatency:       rec.Latest.TransportLatency,
 		HasPassed:              rec.HasPassed,
 		ProvenLatencyFormatted: provenLatStr,
 		AbsentCycles:           rec.AbsentCycles,
@@ -591,21 +649,21 @@ func (a *Adapter) CycleMinLogLevel() slog.Level {
 }
 
 // Snapshot returns a SnapshotViewModel assembled from authoritative reads (Header, CandidateRows, and Logs).
-func (a *Adapter) Snapshot(servableOnly bool) viewmodel.SnapshotViewModel {
+func (a *Adapter) Snapshot(filter viewmodel.FilterMode) viewmodel.SnapshotViewModel {
 	return viewmodel.SnapshotViewModel{
 		Header: a.Header(),
-		Rows:   a.CandidateRows(servableOnly),
+		Rows:   a.CandidateRows(filter),
 		Logs:   a.Logs(),
 	}
 }
 
 // PollSnapshot returns updated presentation viewmodels if state has been invalidated.
 // If not invalidated, it returns updated=false without building ViewModels.
-func (a *Adapter) PollSnapshot(servableOnly bool) (viewmodel.SnapshotViewModel, bool) {
+func (a *Adapter) PollSnapshot(filter viewmodel.FilterMode) (viewmodel.SnapshotViewModel, bool) {
 	if !a.CheckAndResetDirty() {
 		return viewmodel.SnapshotViewModel{}, false
 	}
-	return a.Snapshot(servableOnly), true
+	return a.Snapshot(filter), true
 }
 
 // CycleLogLevel cycles the minimum log level and returns the updated LogViewModel and level name.
