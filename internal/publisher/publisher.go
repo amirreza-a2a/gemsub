@@ -20,25 +20,78 @@ import (
 	"gemsub/internal/store"
 )
 
-// Publication file names.
+// Publication directory and file names.
 const (
+	DirGeneric = "generic"
+	DirGemini  = "gemini"
+
 	FileAll    = "all.txt"
 	FileVLESS  = "vless.txt"
 	FileVMess  = "vmess.txt"
 	FileTrojan = "trojan.txt"
 	FileMeta   = "meta.json"
+
+	FileGenericAll    = "generic/all.txt"
+	FileGenericVLESS  = "generic/vless.txt"
+	FileGenericVMess  = "generic/vmess.txt"
+	FileGenericTrojan = "generic/trojan.txt"
+
+	FileGeminiAll    = "gemini/all.txt"
+	FileGeminiVLESS  = "gemini/vless.txt"
+	FileGeminiVMess  = "gemini/vmess.txt"
+	FileGeminiTrojan = "gemini/trojan.txt"
 )
 
-var targetFiles = []string{FileAll, FileVLESS, FileVMess, FileTrojan, FileMeta}
+var targetFiles = []string{
+	FileGenericAll,
+	FileGenericVLESS,
+	FileGenericVMess,
+	FileGenericTrojan,
+	FileGeminiAll,
+	FileGeminiVLESS,
+	FileGeminiVMess,
+	FileGeminiTrojan,
+	FileMeta,
+}
+
+var subscriptionFiles = []string{
+	FileGenericAll,
+	FileGenericVLESS,
+	FileGenericVMess,
+	FileGenericTrojan,
+	FileGeminiAll,
+	FileGeminiVLESS,
+	FileGeminiVMess,
+	FileGeminiTrojan,
+}
+
+var legacyRootFiles = []string{
+	FileAll,
+	FileVLESS,
+	FileVMess,
+	FileTrojan,
+}
 
 // Metadata contains non-secret summary information about the published cycle.
 type Metadata struct {
-	GeneratedAt   string `json:"generated_at"`
-	CycleNumber   int    `json:"cycle_number"`
-	TotalServable int    `json:"total_servable"`
-	VLESSCount    int    `json:"vless_count"`
-	VMessCount    int    `json:"vmess_count"`
-	TrojanCount   int    `json:"trojan_count"`
+	GeneratedAt string `json:"generated_at"`
+	CycleNumber int    `json:"cycle_number"`
+
+	GenericTotal  int `json:"generic_total"`
+	GenericVLESS  int `json:"generic_vless"`
+	GenericVMess  int `json:"generic_vmess"`
+	GenericTrojan int `json:"generic_trojan"`
+
+	GeminiTotal  int `json:"gemini_total"`
+	GeminiVLESS  int `json:"gemini_vless"`
+	GeminiVMess  int `json:"gemini_vmess"`
+	GeminiTrojan int `json:"gemini_trojan"`
+
+	// Legacy fields mapped to Gemini projection for backward compatibility.
+	TotalServable int `json:"total_servable"`
+	VLESSCount    int `json:"vless_count"`
+	VMessCount    int `json:"vmess_count"`
+	TrojanCount   int `json:"trojan_count"`
 }
 
 // GitRunner abstracts command execution for Git operations so tests can mock Git.
@@ -93,11 +146,17 @@ func NewWithGit(cfg *config.PublishingConfig, st *store.Store, git GitRunner) *P
 	}
 }
 
-// RenderSubscriptionFiles returns rendered contents of all.txt, vless.txt, vmess.txt, trojan.txt
-// and metadata counts based on current servable candidates.
-func (p *Publisher) RenderSubscriptionFiles() (map[string][]byte, Metadata) {
-	// Deduplicate servable links
-	rawLinks := p.st.Passing()
+// partitionLinks deduplicates, sorts, and partitions raw candidate links by protocol scheme.
+//
+// Ordering policy rationale:
+// Both Store.NetworkPassing() and Store.Passing() provide candidate links in stable sorted
+// alphabetical order. We preserve deterministic alphabetical ordering within each publication
+// file (generic/* and gemini/*).
+// Using latency or reliability-ranked ordering (e.g. NetworkPassingRanked or PassingRanked)
+// would introduce line-ordering churn on every cycle due to slight network jitter even when
+// the set of passing candidates has not changed. Alphabetical sorting guarantees byte-for-byte
+// identical outputs across cycles with unchanged candidate sets, preventing spurious Git commits.
+func partitionLinks(rawLinks []string, projectionName string) (all, vless, vmess, trojan []string) {
 	seen := make(map[string]struct{}, len(rawLinks))
 	var unique []string
 	for _, link := range rawLinks {
@@ -127,8 +186,23 @@ func (p *Publisher) RenderSubscriptionFiles() (map[string][]byte, Metadata) {
 	}
 
 	if len(otherLinks) > 0 {
-		slog.Warn("publisher: notice: servable candidate(s) with other protocols excluded from protocol-specific files", "count", len(otherLinks))
+		slog.Warn("publisher: notice: candidate(s) with other protocols excluded from protocol-specific files",
+			"projection", projectionName,
+			"count", len(otherLinks),
+		)
 	}
+
+	return unique, vlessLinks, vmessLinks, trojanLinks
+}
+
+// RenderSubscriptionFiles returns rendered contents of generic/* and gemini/* subscription files
+// and metadata counts based on current Store projections.
+func (p *Publisher) RenderSubscriptionFiles() (map[string][]byte, Metadata) {
+	// 1. Generic projection: sourced directly from Store.NetworkPassing()
+	genAll, genVLESS, genVMess, genTrojan := partitionLinks(p.st.NetworkPassing(), DirGeneric)
+
+	// 2. Gemini projection: sourced directly from Store.Passing()
+	gemAll, gemVLESS, gemVMess, gemTrojan := partitionLinks(p.st.Passing(), DirGemini)
 
 	stats := p.st.Stats()
 	genAt := stats.LastCycle
@@ -139,17 +213,32 @@ func (p *Publisher) RenderSubscriptionFiles() (map[string][]byte, Metadata) {
 	meta := Metadata{
 		GeneratedAt:   genAt.UTC().Format(time.RFC3339),
 		CycleNumber:   stats.CycleCount,
-		TotalServable: len(unique),
-		VLESSCount:    len(vlessLinks),
-		VMessCount:    len(vmessLinks),
-		TrojanCount:   len(trojanLinks),
+		GenericTotal:  len(genAll),
+		GenericVLESS:  len(genVLESS),
+		GenericVMess:  len(genVMess),
+		GenericTrojan: len(genTrojan),
+		GeminiTotal:   len(gemAll),
+		GeminiVLESS:   len(gemVLESS),
+		GeminiVMess:   len(gemVMess),
+		GeminiTrojan:  len(gemTrojan),
+
+		// Legacy fields mapped to Gemini projection for backward compatibility
+		TotalServable: len(gemAll),
+		VLESSCount:    len(gemVLESS),
+		VMessCount:    len(gemVMess),
+		TrojanCount:   len(gemTrojan),
 	}
 
 	files := map[string][]byte{
-		FileAll:    renderList(unique),
-		FileVLESS:  renderList(vlessLinks),
-		FileVMess:  renderList(vmessLinks),
-		FileTrojan: renderList(trojanLinks),
+		FileGenericAll:    renderList(genAll),
+		FileGenericVLESS:  renderList(genVLESS),
+		FileGenericVMess:  renderList(genVMess),
+		FileGenericTrojan: renderList(genTrojan),
+
+		FileGeminiAll:    renderList(gemAll),
+		FileGeminiVLESS:  renderList(gemVLESS),
+		FileGeminiVMess:  renderList(gemVMess),
+		FileGeminiTrojan: renderList(gemTrojan),
 	}
 
 	return files, meta
@@ -178,7 +267,16 @@ func renderList(links []string) []byte {
 // files have pre-existing uncommitted (staged, unstaged, or untracked) modifications.
 // This protects manual edits and prevents publishing unintended state.
 func (p *Publisher) checkWorkingTreeSafety(ctx context.Context, repoDir string) error {
-	statusArgs := append([]string{"status", "--porcelain", "--"}, targetFiles...)
+	safetyFiles := append([]string{}, targetFiles...)
+	for _, legacy := range legacyRootFiles {
+		legacyPath := filepath.Join(repoDir, legacy)
+		if _, err := os.Lstat(legacyPath); err == nil {
+			safetyFiles = append(safetyFiles, legacy)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("publisher: lstat safety check %s: %w", legacy, err)
+		}
+	}
+	statusArgs := append([]string{"status", "--porcelain", "--"}, safetyFiles...)
 	statusOut, err := p.git.Run(ctx, repoDir, statusArgs...)
 	if err != nil {
 		return fmt.Errorf("publisher: git status check failed: %w", err)
@@ -274,15 +372,27 @@ func (p *Publisher) Publish(ctx context.Context) error {
 	slog.Info("publisher: generating subscription files")
 	files, meta := p.RenderSubscriptionFiles()
 
-	// Check if all subscription files on disk already match the newly rendered ones.
+	// Check if all subscription files on disk already match the newly rendered ones,
+	// and ensure no deprecated legacy root-level subscription files exist.
 	// If the subscription content has not changed and existing meta.json is valid with matching counts,
 	// preserve the existing meta.json byte content so that timestamp differences do not trigger a commit.
 	subscriptionUnchanged := true
-	for _, name := range []string{FileAll, FileVLESS, FileVMess, FileTrojan} {
+	for _, name := range subscriptionFiles {
 		existing, err := os.ReadFile(filepath.Join(repoDir, name))
 		if err != nil || string(existing) != string(files[name]) {
 			subscriptionUnchanged = false
 			break
+		}
+	}
+	if subscriptionUnchanged {
+		for _, legacy := range legacyRootFiles {
+			legacyPath := filepath.Join(repoDir, legacy)
+			if _, err := os.Lstat(legacyPath); err == nil {
+				subscriptionUnchanged = false
+				break
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("publisher: check legacy file %s: %w", legacy, err)
+			}
 		}
 	}
 
@@ -292,10 +402,18 @@ func (p *Publisher) Publish(ctx context.Context) error {
 		if err == nil {
 			var existingParsed Metadata
 			if json.Unmarshal(existingMeta, &existingParsed) == nil &&
-				existingParsed.TotalServable == meta.TotalServable &&
-				existingParsed.VLESSCount == meta.VLESSCount &&
-				existingParsed.VMessCount == meta.VMessCount &&
-				existingParsed.TrojanCount == meta.TrojanCount {
+				existingParsed.GenericTotal == meta.GenericTotal &&
+				existingParsed.GenericVLESS == meta.GenericVLESS &&
+				existingParsed.GenericVMess == meta.GenericVMess &&
+				existingParsed.GenericTrojan == meta.GenericTrojan &&
+				existingParsed.GeminiTotal == meta.GeminiTotal &&
+				existingParsed.GeminiVLESS == meta.GeminiVLESS &&
+				existingParsed.GeminiVMess == meta.GeminiVMess &&
+				existingParsed.GeminiTrojan == meta.GeminiTrojan &&
+				existingParsed.TotalServable == meta.GeminiTotal &&
+				existingParsed.VLESSCount == meta.GeminiVLESS &&
+				existingParsed.VMessCount == meta.GeminiVMess &&
+				existingParsed.TrojanCount == meta.GeminiTrojan {
 				// Preserve existing meta.json
 				metaJSON = existingMeta
 			}
@@ -312,22 +430,44 @@ func (p *Publisher) Publish(ctx context.Context) error {
 	}
 	files[FileMeta] = metaJSON
 
+	// Remove any legacy root-level subscription files so they do not linger and get mistaken for current output
+	var removedLegacyFiles []string
+	for _, legacy := range legacyRootFiles {
+		legacyPath := filepath.Join(repoDir, legacy)
+		_, err := os.Lstat(legacyPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("publisher: lstat legacy file %s: %w", legacy, err)
+		}
+		if err := os.Remove(legacyPath); err != nil {
+			return fmt.Errorf("publisher: remove legacy file %s: %w", legacy, err)
+		}
+		removedLegacyFiles = append(removedLegacyFiles, legacy)
+	}
+
 	// Write generated files to repository directory
 	for name, content := range files {
 		filePath := filepath.Join(repoDir, name)
+		if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+			return fmt.Errorf("publisher: mkdir %s: %w", filepath.Dir(filePath), err)
+		}
 		if err := os.WriteFile(filePath, content, 0o644); err != nil {
 			return fmt.Errorf("publisher: write %s: %w", name, err)
 		}
 	}
 
-	// Stage only the five generated files
-	addArgs := append([]string{"add"}, targetFiles...)
+	// Stage all generated dual-projection files and meta.json, plus any removed legacy root files
+	stageFiles := append([]string{}, targetFiles...)
+	stageFiles = append(stageFiles, removedLegacyFiles...)
+	addArgs := append([]string{"add", "--"}, stageFiles...)
 	if _, err := p.git.Run(ctx, repoDir, addArgs...); err != nil {
 		return fmt.Errorf("publisher: git add failed: %w", err)
 	}
 
 	// Check if there are any staged changes
-	diffArgs := append([]string{"diff", "--cached", "--name-only", "--"}, targetFiles...)
+	diffArgs := append([]string{"diff", "--cached", "--name-only", "--"}, stageFiles...)
 	diffOut, err := p.git.Run(ctx, repoDir, diffArgs...)
 	if err != nil {
 		return fmt.Errorf("publisher: git diff check failed: %w", err)

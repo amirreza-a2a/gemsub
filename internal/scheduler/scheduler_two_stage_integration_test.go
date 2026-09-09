@@ -260,22 +260,39 @@ func TestScheduler_TwoStageMixedPoolIntegration(t *testing.T) {
 		t.Errorf("Store.NetworkPassingRanked()[0] = %s; want Tier 1 Gemini-servable candPass=%s", netRanked[0], candPass)
 	}
 
-	// 5. Verify Publisher output in git repository
+	// 5. Verify Publisher output in git repository for dual projections
 	if atomic.LoadInt32(&publishCount) == 0 {
 		t.Fatalf("expected publisher git add to be called")
 	}
-	pubFile := filepath.Join(pubRepoDir, "all.txt")
-	pubContentBytes, err := os.ReadFile(pubFile)
+	// 5a. Gemini projection: contains candPass only
+	gemPubFile := filepath.Join(pubRepoDir, "gemini", "all.txt")
+	gemContentBytes, err := os.ReadFile(gemPubFile)
 	if err != nil {
-		t.Fatalf("read published all.txt: %v", err)
+		t.Fatalf("read published gemini/all.txt: %v", err)
 	}
-	pubContent := string(pubContentBytes)
-	if !strings.Contains(pubContent, candPass) {
-		t.Errorf("expected published all.txt to contain %s, got:\n%s", candPass, pubContent)
+	gemContent := string(gemContentBytes)
+	if !strings.Contains(gemContent, candPass) {
+		t.Errorf("expected published gemini/all.txt to contain %s, got:\n%s", candPass, gemContent)
 	}
-	if strings.Contains(pubContent, candBlocked) || strings.Contains(pubContent, candDenied) ||
-		strings.Contains(pubContent, candError) || strings.Contains(pubContent, candFailed) {
-		t.Errorf("published all.txt must NOT contain non-servable candidates. Got:\n%s", pubContent)
+	if strings.Contains(gemContent, candBlocked) || strings.Contains(gemContent, candDenied) ||
+		strings.Contains(gemContent, candError) || strings.Contains(gemContent, candFailed) {
+		t.Errorf("published gemini/all.txt must NOT contain non-servable candidates. Got:\n%s", gemContent)
+	}
+
+	// 5b. Generic projection: contains all Stage 1 passing candidates (candPass, candBlocked, candDenied, candError)
+	// and excludes Stage 1 transport failure (candFailed)
+	genPubFile := filepath.Join(pubRepoDir, "generic", "all.txt")
+	genContentBytes, err := os.ReadFile(genPubFile)
+	if err != nil {
+		t.Fatalf("read published generic/all.txt: %v", err)
+	}
+	genContent := string(genContentBytes)
+	if !strings.Contains(genContent, candPass) || !strings.Contains(genContent, candBlocked) ||
+		!strings.Contains(genContent, candDenied) || !strings.Contains(genContent, candError) {
+		t.Errorf("published generic/all.txt missing network-healthy candidates: %s", genContent)
+	}
+	if strings.Contains(genContent, candFailed) {
+		t.Errorf("published generic/all.txt must NOT contain transport failure candidate %s. Got:\n%s", candFailed, genContent)
 	}
 
 	// 6. Verify Subserver (/sub, /healthz) with deterministic polling
