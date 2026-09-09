@@ -8,8 +8,8 @@ The canonical local register for non-blocking findings, deferred hardening items
 
 | Classification | Count | Description |
 |:---|:---:|:---|
-| **Active Technical Debt (P1)** | 3 | Material architectural, product, or reliability issues requiring planned engineering tickets. |
-| **Future Hardening & Observability (P2)** | 2 | Non-blocking enhancements to metrics, operational logging, or optional configuration. |
+| **Active Technical Debt (P1)** | 2 | Material architectural, product, or reliability issues requiring planned engineering tickets. |
+| **Future Hardening & Observability (P2)** | 3 | Non-blocking enhancements to metrics, operational logging, scheduling fairness, or optional configuration. |
 | **Code Quality & Test Cleanup (P2)** | 2 | Maintainability, naming clarity, deduplication, and test fixture consolidation. |
 | **External & Upstream Tracking** | 1 | Issues rooted in external dependencies tracked across upstream releases. |
 | **Promoted / Resolved** | 0 | Items promoted to active GitHub issues or resolved in implementation commits. |
@@ -22,7 +22,7 @@ The canonical local register for non-blocking findings, deferred hardening items
 | ID | Title | Priority | Area | Origin | Status |
 |:---|:---|:---:|:---|:---|:---:|
 | [TD-001](#td-001--publisher-atomic-publication) | Publisher atomic publication | P1 | Publisher | Ticket 23 Review / Post-Ticket-23 Audit | Open |
-| [TD-002](#td-002--scheduler-probelimit-presence-semantics) | Scheduler ProbeLimit presence semantics | P1 | Scheduler / Store | Post-Ticket-23 Audit | Open |
+| [TD-002](#td-002--scheduler-candidate-rotation-under-probelimit) | Scheduler candidate rotation under ProbeLimit | P2 | Scheduler / Scheduling Fairness | Post-Ticket-23 Audit / TD-002 Audit | Open / Deferred |
 | [TD-003](#td-003--tui-dual-projection-observability) | TUI dual-projection observability | P1 | TUI | Post-Ticket-23 Audit | Open |
 | [TD-004](#td-004--scheduler-generic-servability-metrics) | Scheduler generic servability metrics | P2 | Scheduler / Observability | Post-Ticket-23 Audit | Open |
 | [TD-005](#td-005--serveconfig-projection-alignment) | ServeConfig projection alignment | P2 | Configuration / Subserver | Post-Ticket-23 Audit | Open / Deferred |
@@ -54,26 +54,6 @@ The canonical local register for non-blocking findings, deferred hardening items
 
 ---
 
-### TD-002 — Scheduler ProbeLimit presence semantics
-
-- **ID:** `TD-002`
-- **Title:** Scheduler ProbeLimit presence and absence cycle semantics
-- **Priority:** P1
-- **Area:** Scheduler / Store
-- **Status:** Open
-- **Origin:** Post-Ticket-23 architecture audit
-- **Problem:**
-  When `SchedulerConfig.ProbeLimit` restricts the number of candidates probed in a given cycle (e.g., evaluating only the first $N$ candidates), `runCycle` currently passes the entire set of upstream fetched links to `Store.StartCycle` and `Store.FinishCycle`. Consequently, candidates beyond the `ProbeLimit` boundary that were never scheduled or probed have their absence counters reset (`AbsentCycles = 0`) as if they were present and healthy.
-- **Impact:**
-  Unprobed candidates avoid absence decay and eviction, skewing candidate retention and violating fair evaluation across large candidate pools.
-- **Proposed Future Remediation:**
-  Ensure only candidates that are actually scheduled and probed within the cycle are treated as present in cycle lifecycle transactions, or implement explicit fair candidate scheduling (e.g. round-robin or priority queue across cycles) so all discovered links are periodically verified.
-- **Dependencies:** `internal/scheduler`, `internal/store`
-- **Promotion Criteria:**
-  Promote when `ProbeLimit` is activated in production deployments or when input candidate sets substantially exceed per-cycle concurrency limits.
-
----
-
 ### TD-003 — TUI dual-projection observability
 
 - **ID:** `TD-003`
@@ -95,6 +75,31 @@ The canonical local register for non-blocking findings, deferred hardening items
 ---
 
 ## 4. Future Hardening & Observability (P2)
+
+### TD-002 — Scheduler candidate rotation under ProbeLimit
+
+- **ID:** `TD-002`
+- **Title:** Scheduler candidate rotation under ProbeLimit
+- **Priority:** P2
+- **Area:** Scheduler / Scheduling Fairness
+- **Status:** Open / Deferred
+- **Origin:** Post-Ticket-23 Architecture Audit / TD-002 implementation audit
+- **Audit Disposition:**
+  Original P1 correctness hypothesis refuted by source inspection and existing `TestScoring_CycleAbortAndSkippedProbes`. Reclassified to P2 scheduling fairness enhancement.
+- **Problem:**
+  `SchedulerConfig.ProbeLimit` intentionally limits how many candidates are probed within a cycle. `Store.StartCycle` receives the complete upstream source link set and correctly treats unprobed-but-present candidates as present (`skipped != failed, skipped != absent`). Therefore, Store absence accounting must remain unchanged. The remaining limitation is that `internal/scheduler/scheduler.go` currently executes static slice head truncation (`candidates[:s.cfg.ProbeLimit]`), meaning candidates beyond `ProbeLimit` can remain unprobed indefinitely when the same ordered source pool is repeatedly fetched.
+- **Impact:**
+  Candidate starvation / incomplete verification coverage when `ProbeLimit > 0` and the candidate pool exceeds `ProbeLimit`.
+- **Proposed Future Remediation:**
+  Add scheduler-side candidate rotation (e.g. stateful round-robin offset or prioritizing least-recently-tested nodes) or another explicit fair selection strategy so candidates beyond the current `ProbeLimit` boundary eventually receive probe opportunities across cycles.
+  - Do **NOT** change `Store.StartCycle` or `Store.FinishCycle` for this concern.
+  - Do **NOT** use absence semantics as a proxy for probe scheduling.
+  - Candidate rotation is a fairness/product enhancement, not a Store correctness fix.
+- **Dependencies:** `internal/scheduler`
+- **Promotion Criteria:**
+  Promote to a dedicated implementation ticket only when bounded probing is an intentional operational mode and fair verification of candidate pools larger than `ProbeLimit` becomes a product requirement.
+
+---
 
 ### TD-004 — Scheduler generic servability metrics
 
