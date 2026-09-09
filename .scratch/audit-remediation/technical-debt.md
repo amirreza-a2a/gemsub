@@ -22,7 +22,7 @@ The canonical local register for non-blocking findings, deferred hardening items
 | ID | Title | Priority | Area | Origin | Status |
 |:---|:---|:---:|:---|:---|:---:|
 | [TD-001](#td-001--publisher-atomic-publication) | Publisher atomic publication | P1 | Publisher | Ticket 23 Review / Post-Ticket-23 Audit | Resolved (Ticket 26, e02c9c0) |
-| [TD-002](#td-002--scheduler-candidate-rotation-under-probelimit) | Scheduler candidate rotation under ProbeLimit | P1 | Scheduler / Scheduling Fairness | Post-Ticket-23 Audit / Post-Ticket-26 Audit | Promoted (Ticket 29, #7) |
+| [TD-002](#td-002--scheduler-candidate-rotation-under-probelimit) | Scheduler candidate rotation under ProbeLimit | P1 | Scheduler / Scheduling Fairness | Post-Ticket-23 Audit / Post-Ticket-26 Audit | Resolved (Ticket 29, 1a67870) |
 | [TD-003](#td-003--tui-dual-projection-observability) | TUI dual-projection observability | P1 | TUI | Post-Ticket-23 Audit | Resolved (Ticket 25, 33329c0) |
 | [TD-004](#td-004--scheduler-generic-servability-metrics) | Scheduler generic servability metrics | P2 | Scheduler / Observability | Post-Ticket-23 Audit | Open |
 | [TD-005](#td-005--serveconfig-projection-alignment) | ServeConfig projection alignment | P2 | Configuration / Subserver | Post-Ticket-23 Audit | Open / Deferred |
@@ -143,10 +143,11 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **Title:** Scheduler candidate rotation under ProbeLimit
 - **Priority:** P1
 - **Area:** Scheduler / Scheduling Fairness
-- **Status:** Promoted
-- **Promoted to Ticket:** Ticket 29
+- **Status:** Resolved
+- **Resolution Ticket:** Ticket 29
 - **GitHub Issue:** #7
-- **Date Promoted:** 2026-09-09
+- **Commit:** `1a678700dffc55a8ed4fb5377e1efebe0ad71756`
+- **Date Resolved:** 2026-09-09
 - **Origin:** Post-Ticket-23 Architecture Audit / Post-Ticket-26 Performance Investigation
 - **Audit Disposition:**
   Re-promoted from P2 to P1 based on real-world 56,799-candidate deployment evidence where unrotated bounded probing starves 98% of the candidate population and full un-bounded probing takes 4+ hours per cycle.
@@ -441,10 +442,11 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **Date Resolved:** 2026-09-09
 
 ### TD-002 — Scheduler candidate rotation under ProbeLimit
-- **Status:** Promoted
-- **Promoted to Ticket:** Ticket 29
+- **Status:** Resolved
+- **Resolution Ticket:** Ticket 29
 - **GitHub Issue:** #7
-- **Date Promoted:** 2026-09-09
+- **Commit:** `1a678700dffc55a8ed4fb5377e1efebe0ad71756`
+- **Date Resolved:** 2026-09-09
 
 ### Record Template for Promoted Items
 
