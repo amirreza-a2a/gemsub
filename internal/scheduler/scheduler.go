@@ -88,6 +88,10 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 func (s *Scheduler) runCycle(ctx context.Context) {
+	s.runCycleWithRunner(ctx, tester.Probe)
+}
+
+func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeRunner) {
 	slog.Info("scheduler: cycle starting")
 	cycleStart := time.Now()
 	s.bus.Publish(events.CycleStarted{
@@ -145,7 +149,7 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 	var passed, failed, inconclusive int64
 	var regionBlocked, timeout int64
 
-	completed := tester.RunPool(ctx, candidates, &s.cfg.Test, s.bus, func(r store.Result) {
+	completed := tester.RunPoolWithRunner(ctx, candidates, &s.cfg.Test, runner, s.bus, func(r store.Result) {
 		s.st.PutWithTransition(r)
 		switch r.Status {
 		case store.StatusPassed:
