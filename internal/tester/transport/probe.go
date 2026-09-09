@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"gemsub/internal/store"
+	"gemsub/internal/tester/textutil"
 )
 
 // DefaultHealthURL is the canonical connectivity-check endpoint.
@@ -43,6 +44,7 @@ type Result struct {
 	StatusCode int
 	Category   store.ErrorCategory
 	Error      error
+	RetryAfter *time.Duration
 }
 
 // Probe executes an isolated, target-agnostic HTTPS/HTTP transport health check
@@ -136,12 +138,17 @@ func Probe(ctx context.Context, dialFn DialFunc, cfg Config) Result {
 
 	// HTTP 429 indicates rate limiting.
 	if statusCode == http.StatusTooManyRequests {
+		var retryAfter *time.Duration
+		if resp.Header != nil {
+			retryAfter = textutil.ParseRetryAfter(resp.Header.Get("Retry-After"))
+		}
 		return Result{
 			OK:         false,
 			Latency:    latency,
 			StatusCode: statusCode,
 			Category:   store.ErrProxyRateLimited,
 			Error:      fmt.Errorf("transport probe received HTTP 429 (rate limited)"),
+			RetryAfter: retryAfter,
 		}
 	}
 
@@ -156,12 +163,17 @@ func Probe(ctx context.Context, dialFn DialFunc, cfg Config) Result {
 	}
 
 	// Any non-2xx status (or non-204 for generate_204 endpoints) is a transport failure.
+	var retryAfter *time.Duration
+	if resp.Header != nil && statusCode == http.StatusServiceUnavailable {
+		retryAfter = textutil.ParseRetryAfter(resp.Header.Get("Retry-After"))
+	}
 	return Result{
 		OK:         false,
 		Latency:    latency,
 		StatusCode: statusCode,
 		Category:   store.ErrProxyError,
 		Error:      fmt.Errorf("transport probe received unexpected HTTP status %d", statusCode),
+		RetryAfter: retryAfter,
 	}
 }
 

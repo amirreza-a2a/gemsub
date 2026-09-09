@@ -14,7 +14,6 @@ import (
 	"io"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -147,25 +146,9 @@ func Probe(ctx context.Context, dialFn transport.DialFunc, cfg Config) Result {
 }
 
 // ParseRetryAfter parses an HTTP Retry-After header value into a time.Duration.
-// It supports both delta-seconds (e.g. "120") and HTTP-date formats (RFC 1123, RFC 850, ANSI C).
-// Returns nil if the header is empty or cannot be parsed.
+// It delegates to textutil.ParseRetryAfter for backward compatibility.
 func ParseRetryAfter(header string) *time.Duration {
-	header = strings.TrimSpace(header)
-	if header == "" {
-		return nil
-	}
-	if sec, err := strconv.Atoi(header); err == nil && sec >= 0 {
-		d := time.Duration(sec) * time.Second
-		return &d
-	}
-	if t, err := http.ParseTime(header); err == nil {
-		d := time.Until(t)
-		if d < 0 {
-			d = 0
-		}
-		return &d
-	}
-	return nil
+	return textutil.ParseRetryAfter(header)
 }
 
 // ClassifyResponse evaluates an HTTP response and response body for Gemini availability.

@@ -188,6 +188,69 @@ func TestProbe_HTTP429(t *testing.T) {
 	if res.Category != store.ErrProxyRateLimited {
 		t.Errorf("expected ErrProxyRateLimited on 429, got %v", res.Category)
 	}
+	if res.RetryAfter != nil {
+		t.Errorf("expected nil RetryAfter without header, got %v", res.RetryAfter)
+	}
+}
+
+// 6b. HTTP 429 Rate Limited with Retry-After header
+func TestProbe_HTTP429_RetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	res := transport.Probe(context.Background(), directDialer(t), transport.Config{
+		HealthURL:     srv.URL + "/generate_204",
+		HealthTimeout: 2 * time.Second,
+	})
+
+	if res.OK {
+		t.Fatal("expected OK=false on 429, got true")
+	}
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected status 429, got %d", res.StatusCode)
+	}
+	if res.Category != store.ErrProxyRateLimited {
+		t.Errorf("expected ErrProxyRateLimited on 429, got %v", res.Category)
+	}
+	if res.RetryAfter == nil {
+		t.Fatal("expected non-nil RetryAfter for 429 with header")
+	}
+	if *res.RetryAfter != 30*time.Second {
+		t.Errorf("expected RetryAfter 30s, got %v", *res.RetryAfter)
+	}
+}
+
+// 6c. HTTP 503 Service Unavailable with Retry-After header
+func TestProbe_HTTP503_RetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "15")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	res := transport.Probe(context.Background(), directDialer(t), transport.Config{
+		HealthURL:     srv.URL + "/generate_204",
+		HealthTimeout: 2 * time.Second,
+	})
+
+	if res.OK {
+		t.Fatal("expected OK=false on 503, got true")
+	}
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", res.StatusCode)
+	}
+	if res.Category != store.ErrProxyError {
+		t.Errorf("expected ErrProxyError on 503, got %v", res.Category)
+	}
+	if res.RetryAfter == nil {
+		t.Fatal("expected non-nil RetryAfter for 503 with header")
+	}
+	if *res.RetryAfter != 15*time.Second {
+		t.Errorf("expected RetryAfter 15s, got %v", *res.RetryAfter)
+	}
 }
 
 // 7. Dial Failure (Connection Refused)

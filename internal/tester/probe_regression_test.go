@@ -33,6 +33,11 @@ func getClosedPort(t *testing.T) int {
 // TestExecuteAttempt_RetryAfterPreserved_Seconds verifies that Retry-After in
 // integer seconds from an HTTP 429 response is parsed and returned by executeAttempt.
 func TestExecuteAttempt_RetryAfterPreserved_Seconds(t *testing.T) {
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer healthSrv.Close()
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "7")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -48,6 +53,7 @@ func TestExecuteAttempt_RetryAfterPreserved_Seconds(t *testing.T) {
 	}
 
 	cfg := &config.TestConfig{
+		HealthURL:   healthSrv.URL + "/generate_204",
 		TargetURL:   srv.URL,
 		Timeout:     2 * time.Second,
 		DialTimeout: 1 * time.Second,
@@ -75,6 +81,11 @@ func TestExecuteAttempt_RetryAfterPreserved_Seconds(t *testing.T) {
 // TestExecuteAttempt_RetryAfterPreserved_HttpDate verifies that Retry-After in
 // HTTP-date format (RFC 1123) is parsed and returned by executeAttempt.
 func TestExecuteAttempt_RetryAfterPreserved_HttpDate(t *testing.T) {
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer healthSrv.Close()
+
 	targetTime := time.Now().Add(10 * time.Second).UTC()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", targetTime.Format(http.TimeFormat))
@@ -91,6 +102,7 @@ func TestExecuteAttempt_RetryAfterPreserved_HttpDate(t *testing.T) {
 	}
 
 	cfg := &config.TestConfig{
+		HealthURL:   healthSrv.URL + "/generate_204",
 		TargetURL:   srv.URL,
 		Timeout:     2 * time.Second,
 		DialTimeout: 1 * time.Second,
@@ -112,6 +124,11 @@ func TestExecuteAttempt_RetryAfterPreserved_HttpDate(t *testing.T) {
 // TestExecuteAttempt_RetryAfter_NilWhenMissing verifies that 429 without Retry-After
 // returns nil for retryAfter.
 func TestExecuteAttempt_RetryAfter_NilWhenMissing(t *testing.T) {
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer healthSrv.Close()
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))
@@ -126,6 +143,7 @@ func TestExecuteAttempt_RetryAfter_NilWhenMissing(t *testing.T) {
 	}
 
 	cfg := &config.TestConfig{
+		HealthURL:   healthSrv.URL + "/generate_204",
 		TargetURL:   srv.URL,
 		Timeout:     2 * time.Second,
 		DialTimeout: 1 * time.Second,
@@ -144,6 +162,11 @@ func TestExecuteAttempt_RetryAfter_NilWhenMissing(t *testing.T) {
 // TestProbeCandidate_HonorsRetryAfterBackoff verifies end-to-end that ProbeCandidate
 // with real executeAttempt actually honors the parsed Retry-After delay during retries.
 func TestProbeCandidate_HonorsRetryAfterBackoff(t *testing.T) {
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer healthSrv.Close()
+
 	var attempts int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		att := atomic.AddInt64(&attempts, 1)
@@ -169,6 +192,7 @@ func TestProbeCandidate_HonorsRetryAfterBackoff(t *testing.T) {
 	}
 
 	cfg := &config.TestConfig{
+		HealthURL:    healthSrv.URL + "/generate_204",
 		TargetURL:    srv.URL,
 		Timeout:      3 * time.Second,
 		DialTimeout:  1 * time.Second,
@@ -208,6 +232,7 @@ func TestExecuteAttempt_TransportErrorsNotCollapsed(t *testing.T) {
 			},
 		}
 		cfg := &config.TestConfig{
+			HealthURL:   fmt.Sprintf("http://127.0.0.1:%d/", closedPort),
 			TargetURL:   fmt.Sprintf("http://127.0.0.1:%d/", closedPort),
 			Timeout:     2 * time.Second,
 			DialTimeout: 1 * time.Second,
@@ -254,9 +279,11 @@ func TestExecuteAttempt_TransportErrorsNotCollapsed(t *testing.T) {
 			},
 		}
 		cfg := &config.TestConfig{
-			TargetURL:   fmt.Sprintf("http://%s/", l.Addr().String()),
-			Timeout:     100 * time.Millisecond,
-			DialTimeout: 50 * time.Millisecond,
+			HealthURL:     fmt.Sprintf("http://%s/", l.Addr().String()),
+			HealthTimeout: 50 * time.Millisecond,
+			TargetURL:     fmt.Sprintf("http://%s/", l.Addr().String()),
+			Timeout:       100 * time.Millisecond,
+			DialTimeout:   50 * time.Millisecond,
 		}
 
 		classRes, retryable, _ := executeAttempt(context.Background(), cand, cfg)
@@ -285,6 +312,7 @@ func TestExecuteAttempt_TransportErrorsNotCollapsed(t *testing.T) {
 			},
 		}
 		cfg := &config.TestConfig{
+			HealthURL:   "http://127.0.0.1:1/",
 			TargetURL:   "http://127.0.0.1:1/",
 			Timeout:     2 * time.Second,
 			DialTimeout: 1 * time.Second,
@@ -330,6 +358,7 @@ func TestExecuteAttempt_TransportErrorsNotCollapsed(t *testing.T) {
 			},
 		}
 		cfg := &config.TestConfig{
+			HealthURL:   fmt.Sprintf("http://%s/", l.Addr().String()),
 			TargetURL:   fmt.Sprintf("http://%s/", l.Addr().String()),
 			Timeout:     2 * time.Second,
 			DialTimeout: 1 * time.Second,

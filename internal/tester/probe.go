@@ -16,6 +16,7 @@ package tester
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -33,6 +34,7 @@ import (
 	"gemsub/internal/parser"
 	"gemsub/internal/store"
 	"gemsub/internal/tester/gemini"
+	"gemsub/internal/tester/transport"
 )
 
 // AttemptFunc executes a single probe attempt against a candidate.
@@ -116,41 +118,120 @@ func ProbeWithExecutor(ctx context.Context, cand parser.Candidate, cfg *config.T
 }
 
 func executeAttempt(ctx context.Context, cand parser.Candidate, cfg *config.TestConfig) (ClassificationResult, bool, *time.Duration) {
-	probeCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-	defer cancel()
+	attemptCtx, cancelAttempt := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancelAttempt()
 
-	dialFn, closeBox, err := buildDialer(probeCtx, cand, cfg.DialTimeout)
+	dialFn, closeBox, err := buildDialer(attemptCtx, cand, cfg.DialTimeout)
 	if err != nil {
 		classErr := ClassifyDialError(fmt.Errorf("build outbound: %w", err))
 		return classErr, classErr.Retryable, nil
 	}
 	defer closeBox()
 
-	// Delegate all Gemini-specific work (browser headers, body download,
-	// response classification) to the isolated gemini probe module.
-	geminiResult := gemini.Probe(probeCtx, dialFn, gemini.Config{
+	// --- Stage 1: Transport Health ---
+	healthTimeout := cfg.HealthTimeout
+	if healthTimeout <= 0 {
+		healthTimeout = 4 * time.Second
+	}
+	healthCtx, cancelHealth := context.WithTimeout(attemptCtx, healthTimeout)
+	tr := transport.Probe(healthCtx, dialFn, transport.Config{
+		HealthURL:     cfg.HealthURL,
+		HealthTimeout: healthTimeout,
+	})
+	cancelHealth()
+
+	// If the attempt context (or outer ctx) was cancelled or timed out during Stage 1
+	if attemptCtx.Err() != nil {
+		reason := "timeout"
+		if errors.Is(attemptCtx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			reason = "context canceled"
+		}
+		return ClassificationResult{
+			Status:                 store.StatusInconclusive,
+			Category:               store.ErrTimeout,
+			Reason:                 reason,
+			Retryable:              false,
+			TransportEvidenceKnown: true,
+			TransportOK:            false,
+			TransportLatency:       tr.Latency,
+		}, false, nil
+	}
+
+	if !tr.OK {
+		var classResult ClassificationResult
+		if tr.StatusCode == 429 {
+			classResult = ClassifyDialError(fmt.Errorf("unexpected HTTP response status: 429"))
+		} else if tr.StatusCode == 503 {
+			classResult = ClassifyDialError(fmt.Errorf("unexpected HTTP response status: 503"))
+		} else if tr.StatusCode == 403 {
+			classResult = ClassificationResult{
+				Status:     store.StatusFailed,
+				Category:   store.ErrProxyError,
+				StatusCode: 403,
+				Reason:     "transport health check received HTTP 403 (forbidden)",
+				Retryable:  false,
+			}
+		} else if tr.Error != nil {
+			classResult = ClassifyDialError(tr.Error)
+		} else {
+			classResult = ClassificationResult{
+				Status:   store.StatusFailed,
+				Category: tr.Category,
+				Reason:   "transport health check failed",
+			}
+		}
+
+		if tr.Category == store.ErrTimeout {
+			classResult.Status = store.StatusFailed
+			classResult.Category = store.ErrTimeout
+			classResult.Reason = "timeout"
+			classResult.Retryable = false
+		}
+
+		if tr.StatusCode != 0 {
+			classResult.StatusCode = tr.StatusCode
+		}
+		classResult.TransportEvidenceKnown = true
+		classResult.TransportOK = false
+		classResult.TransportLatency = tr.Latency
+
+		return classResult, classResult.Retryable, tr.RetryAfter
+	}
+
+	// --- Stage 2: Gemini Application ---
+	geminiResult := gemini.Probe(attemptCtx, dialFn, gemini.Config{
 		URL:          cfg.TargetURL,
 		BlockPhrases: cfg.BlockPhrases,
 		Timeout:      cfg.Timeout,
 		DialTimeout:  cfg.DialTimeout,
 	})
 
-	// If a network, dial, TLS, or read error occurred during probing,
-	// classify it using ClassifyDialError so canonical transport error
-	// categories and retryable semantics are preserved.
+	var classResult ClassificationResult
 	if geminiResult.Err != nil {
-		classErr := ClassifyDialError(geminiResult.Err)
-		return classErr, classErr.Retryable, nil
+		classResult = ClassifyDialError(geminiResult.Err)
+		if ctx.Err() != nil || errors.Is(geminiResult.Err, context.DeadlineExceeded) || errors.Is(geminiResult.Err, context.Canceled) || classResult.Category == store.ErrTimeout {
+			classResult.Status = store.StatusInconclusive
+			classResult.Category = store.ErrTimeout
+			if ctx.Err() == context.Canceled || errors.Is(geminiResult.Err, context.Canceled) {
+				classResult.Reason = "context canceled"
+			} else {
+				classResult.Reason = "timeout"
+			}
+		}
+	} else {
+		classResult = ClassificationResult{
+			Status:     geminiResult.Status,
+			Category:   geminiResult.Category,
+			StatusCode: geminiResult.StatusCode,
+			Reason:     geminiResult.Reason,
+			Retryable:  geminiResult.Retryable,
+		}
 	}
 
-	// Convert gemini.Result → ClassificationResult at the boundary.
-	classResult := ClassificationResult{
-		Status:     geminiResult.Status,
-		Category:   geminiResult.Category,
-		StatusCode: geminiResult.StatusCode,
-		Reason:     geminiResult.Reason,
-		Retryable:  geminiResult.Retryable,
-	}
+	// Stage 1 proved transport health. Preserve explicit transport evidence.
+	classResult.TransportEvidenceKnown = true
+	classResult.TransportOK = true
+	classResult.TransportLatency = tr.Latency
 
 	return classResult, classResult.Retryable, geminiResult.RetryAfter
 }
