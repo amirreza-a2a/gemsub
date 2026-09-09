@@ -36,7 +36,7 @@ The canonical local register for non-blocking findings, deferred hardening items
 | [TD-013](#td-013--publisher-filesystem-failure-injection-api-visibility) | Publisher filesystem failure-injection API visibility | P2 | Publisher / Testability | Ticket 26 independent code review | Open |
 | [TD-014](#td-014--publisher-owned-path-slice-deduplication) | Publisher owned-path slice deduplication | P2 | Publisher / Code Quality | Ticket 26 independent code review | Open |
 | [TD-015](#td-015--tui-candidate-table-rendering-and-full-store-snapshot-thrashing) | TUI candidate table rendering and full-store snapshot thrashing | P0 | TUI / Performance | Post-Ticket-26 Investigation | Promoted (Ticket 27, #5) |
-| [TD-016](#td-016--state-persistence-compaction-and-compression) | State persistence compaction and compression | P1 | Store / Persistence / Performance | Post-Ticket-26 Investigation | Promoted (Ticket 28, #6) |
+| [TD-016](#td-016--state-persistence-compaction-and-compression) | State persistence compaction and compression | P1 | Store / Persistence / Performance | Post-Ticket-26 Investigation | Resolved (Ticket 28, 91aeeaf) |
 
 ---
 
@@ -119,10 +119,11 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **Title:** State persistence compaction and compression
 - **Priority:** P1
 - **Area:** Store / Persistence / Performance
-- **Status:** Promoted
-- **Promoted to Ticket:** Ticket 28
+- **Status:** Resolved
+- **Resolution Ticket:** Ticket 28
 - **GitHub Issue:** #6
-- **Date Promoted:** 2026-09-09
+- **Commit:** `91aeeafd71d98a2e74d92e6bf4fca293d9f28418`
+- **Date Resolved:** 2026-09-09
 - **Origin:** Post-Ticket-26 architecture and performance investigation
 - **Problem:**
   `gemsub_state.json` reaches 171.11 MB in production, containing ~57.22 MB of indentation whitespace, ~45.25 MB of empty circular buffer dummy sample padding, ~15 MB duplicated URLs, and ~10 MB redundant derived state. Saving causes a 610 MB allocation spike and 1.4s write pause; loading takes 1.85s and 473 MB allocations.
@@ -433,10 +434,11 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **Date Promoted:** 2026-09-09
 
 ### TD-016 — State persistence compaction and compression
-- **Status:** Promoted
-- **Promoted to Ticket:** Ticket 28
+- **Status:** Resolved
+- **Resolution Ticket:** Ticket 28
 - **GitHub Issue:** #6
-- **Date Promoted:** 2026-09-09
+- **Commit:** `91aeeafd71d98a2e74d92e6bf4fca293d9f28418`
+- **Date Resolved:** 2026-09-09
 
 ### TD-002 — Scheduler candidate rotation under ProbeLimit
 - **Status:** Promoted
