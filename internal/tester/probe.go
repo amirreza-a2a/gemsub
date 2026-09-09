@@ -17,13 +17,9 @@ package tester
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/rand"
 	"net"
-	"net/http"
-	"strconv"
-	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -36,6 +32,7 @@ import (
 	"gemsub/internal/config"
 	"gemsub/internal/parser"
 	"gemsub/internal/store"
+	"gemsub/internal/tester/gemini"
 )
 
 // AttemptFunc executes a single probe attempt against a candidate.
@@ -126,45 +123,33 @@ func executeAttempt(ctx context.Context, cand parser.Candidate, cfg *config.Test
 	}
 	defer closeBox()
 
-	client := &http.Client{
-		Timeout: cfg.Timeout,
-		Transport: &http.Transport{
-			DialContext:         dialFn,
-			TLSHandshakeTimeout: cfg.DialTimeout,
-		},
-	}
+	// Delegate all Gemini-specific work (browser headers, body download,
+	// response classification) to the isolated gemini probe module.
+	geminiResult := gemini.Probe(probeCtx, dialFn, gemini.Config{
+		URL:          cfg.TargetURL,
+		BlockPhrases: cfg.BlockPhrases,
+		Timeout:      cfg.Timeout,
+		DialTimeout:  cfg.DialTimeout,
+	})
 
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, cfg.TargetURL, nil)
-	if err != nil {
-		classErr := ClassifyDialError(fmt.Errorf("build request: %w", err))
+	// If a network, dial, TLS, or read error occurred during probing,
+	// classify it using ClassifyDialError so canonical transport error
+	// categories and retryable semantics are preserved.
+	if geminiResult.Err != nil {
+		classErr := ClassifyDialError(geminiResult.Err)
 		return classErr, classErr.Retryable, nil
 	}
 
-	// Browser headers for realistic probing
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Sec-CH-UA", `"Chromium";v="131", "Not_A Brand";v="24"`)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		classErr := ClassifyDialError(err)
-		return classErr, classErr.Retryable, nil
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB cap
-	if err != nil {
-		classErr := ClassifyDialError(fmt.Errorf("read body: %w", err))
-		return classErr, classErr.Retryable, nil
+	// Convert gemini.Result → ClassificationResult at the boundary.
+	classResult := ClassificationResult{
+		Status:     geminiResult.Status,
+		Category:   geminiResult.Category,
+		StatusCode: geminiResult.StatusCode,
+		Reason:     geminiResult.Reason,
+		Retryable:  geminiResult.Retryable,
 	}
 
-	classResp := ClassifyResponse(resp, body, cfg.BlockPhrases)
-	var retryAfter *time.Duration
-	if classResp.Retryable {
-		retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
-	}
-	return classResp, classResp.Retryable, retryAfter
+	return classResult, classResult.Retryable, geminiResult.RetryAfter
 }
 
 // buildDialer spins up a minimal Box containing just this one
@@ -264,23 +249,4 @@ func computeBackoff(base time.Duration, attempt int, retryAfter *time.Duration) 
 		delay = maxBackoffCap
 	}
 	return delay
-}
-
-func parseRetryAfter(header string) *time.Duration {
-	header = strings.TrimSpace(header)
-	if header == "" {
-		return nil
-	}
-	if sec, err := strconv.Atoi(header); err == nil && sec >= 0 {
-		d := time.Duration(sec) * time.Second
-		return &d
-	}
-	if t, err := http.ParseTime(header); err == nil {
-		d := time.Until(t)
-		if d < 0 {
-			d = 0
-		}
-		return &d
-	}
-	return nil
 }
