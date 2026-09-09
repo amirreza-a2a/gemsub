@@ -393,3 +393,58 @@ func TestStore_Revision(t *testing.T) {
 		t.Errorf("expected revision to increment after Load, rev4=%d rev5=%d", rev4, rev5)
 	}
 }
+
+func TestStore_Stats_GenericServableMatchesNetworkPassing(t *testing.T) {
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+
+	// 1. Initially empty
+	stats := st.Stats()
+	if stats.GenericServable != 0 || stats.Servable != 0 || len(st.NetworkPassing()) != 0 {
+		t.Fatalf("expected 0 generic/servable on empty store, got %+v", stats)
+	}
+
+	// 2. Candidate 1: Transport OK + Gemini PASS -> both Generic and Gemini servable
+	st.PutWithTransition(store.Result{
+		Link:                   "vless://pass@1.1.1.1:443",
+		Status:                 store.StatusPassed,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+	})
+
+	// 3. Candidate 2: Transport OK + Gemini RegionBlocked -> Generic servable, NOT Gemini servable
+	st.PutWithTransition(store.Result{
+		Link:                   "vmess://blocked@2.2.2.2:443",
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+	})
+
+	// 4. Candidate 3: Transport Failure -> NEITHER Generic nor Gemini servable
+	st.PutWithTransition(store.Result{
+		Link:                   "trojan://dead@3.3.3.3:443",
+		Status:                 store.StatusFailed,
+		Category:               store.ErrTimeout,
+		TransportEvidenceKnown: true,
+		TransportOK:            false,
+	})
+
+	st.FinishCycle()
+
+	stats = st.Stats()
+	netPassing := st.NetworkPassing()
+	gemPassing := st.Passing()
+
+	if stats.GenericServable != len(netPassing) {
+		t.Errorf("GenericServable (%d) != len(NetworkPassing()) (%d)", stats.GenericServable, len(netPassing))
+	}
+	if stats.GenericServable != 2 {
+		t.Errorf("expected GenericServable == 2, got %d", stats.GenericServable)
+	}
+	if stats.Servable != len(gemPassing) {
+		t.Errorf("Servable (%d) != len(Passing()) (%d)", stats.Servable, len(gemPassing))
+	}
+	if stats.Servable != 1 {
+		t.Errorf("expected Servable == 1, got %d", stats.Servable)
+	}
+}

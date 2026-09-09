@@ -868,13 +868,14 @@ func (s *Store) NetworkPassingRanked() []string {
 
 // Stats is a snapshot of counts based on canonical Status and servability.
 type Stats struct {
-	Total        int       `json:"total"`
-	Passed       int       `json:"passed"`
-	Failed       int       `json:"failed"`
-	Inconclusive int       `json:"inconclusive"`
-	Servable     int       `json:"servable"`
-	LastCycle    time.Time `json:"last_cycle"`
-	CycleCount   int       `json:"cycle_count"`
+	Total           int       `json:"total"`
+	Passed          int       `json:"passed"`
+	Failed          int       `json:"failed"`
+	Inconclusive    int       `json:"inconclusive"`
+	Servable        int       `json:"servable"`
+	GenericServable int       `json:"generic_servable"`
+	LastCycle       time.Time `json:"last_cycle"`
+	CycleCount      int       `json:"cycle_count"`
 }
 
 func (s *Store) Stats() Stats {
@@ -897,6 +898,9 @@ func (s *Store) Stats() Stats {
 		}
 		if s.isServableRecordLocked(rec) {
 			st.Servable++
+		}
+		if s.isNetworkHealthyRecordLocked(rec) {
+			st.GenericServable++
 		}
 	}
 	return st

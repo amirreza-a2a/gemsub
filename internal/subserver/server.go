@@ -30,8 +30,20 @@ func New(cfg *config.ServeConfig, st *store.Store) *Server {
 // Run starts the HTTP server and blocks until ctx is cancelled or an error occurs.
 // When ctx is cancelled, it gracefully shuts down the server with a 5-second timeout.
 func (s *Server) Run(ctx context.Context) error {
+	basePath := s.cfg.Path
+	if basePath == "" {
+		basePath = "/sub"
+	}
+	base := strings.TrimRight(basePath, "/")
+	if base == "" {
+		base = "/"
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc(s.cfg.Path, s.handleSub)
+	mux.HandleFunc(base, s.handleSub)
+	if base != "/" {
+		mux.HandleFunc(base+"/", s.handleSub)
+	}
 	mux.HandleFunc("/healthz", s.handleHealth)
 
 	httpSrv := &http.Server{
@@ -53,7 +65,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}()
 
-	slog.Info("subserver: listening", "addr", s.cfg.Listen, "path", s.cfg.Path)
+	slog.Info("subserver: listening", "addr", s.cfg.Listen, "path", basePath)
 	err := httpSrv.ListenAndServe()
 	close(serverStopped)
 
@@ -65,15 +77,126 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) handleSub(w http.ResponseWriter, r *http.Request) {
-	links := s.st.Passing()
-	body := strings.Join(links, "\n")
+	basePath := s.cfg.Path
+	if basePath == "" {
+		basePath = "/sub"
+	}
+	base := strings.TrimRight(basePath, "/")
+	if base == "" {
+		base = "/"
+	}
 
-	if s.cfg.Format == "base64" {
-		body = base64.StdEncoding.EncodeToString([]byte(body))
+	path := strings.TrimRight(r.URL.Path, "/")
+	if path == "" {
+		path = "/"
+	}
+
+	var isGenericRoute, isGeminiRoute, isBaseRoute bool
+	if base == "/" {
+		isBaseRoute = (path == "/")
+		isGenericRoute = (path == "/generic")
+		isGeminiRoute = (path == "/gemini")
+	} else {
+		isBaseRoute = (path == base)
+		isGenericRoute = (path == base+"/generic")
+		isGeminiRoute = (path == base+"/gemini")
+	}
+
+	if !isBaseRoute && !isGenericRoute && !isGeminiRoute {
+		http.NotFound(w, r)
+		return
+	}
+
+	q := r.URL.Query()
+
+	// Validate projection query parameter if present
+	projParam := strings.TrimSpace(strings.ToLower(q.Get("projection")))
+	if projParam != "" && projParam != "generic" && projParam != "gemini" {
+		http.Error(w, "invalid projection: "+projParam, http.StatusBadRequest)
+		return
+	}
+
+	// Projection routing precedence:
+	// 1. Dedicated route has precedence over query projection.
+	// 2. Query projection is used only for the base subscription endpoint.
+	// 3. Otherwise default projection is Gemini.
+	var projection string
+	if isGenericRoute {
+		projection = "generic"
+	} else if isGeminiRoute {
+		projection = "gemini"
+	} else if isBaseRoute {
+		if projParam == "generic" {
+			projection = "generic"
+		} else {
+			projection = "gemini"
+		}
+	}
+
+	// Protocol aliases: support ?protocol=... and ?proto=...
+	p1 := strings.TrimSpace(strings.ToLower(q.Get("protocol")))
+	p2 := strings.TrimSpace(strings.ToLower(q.Get("proto")))
+	if p1 != "" && p2 != "" && p1 != p2 {
+		http.Error(w, "conflicting protocol and proto parameters", http.StatusBadRequest)
+		return
+	}
+	targetProto := p1
+	if targetProto == "" {
+		targetProto = p2
+	}
+	if targetProto != "" {
+		if targetProto != "vless" && targetProto != "vmess" && targetProto != "trojan" {
+			http.Error(w, "invalid protocol: "+targetProto, http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Format override: support ?format=raw and ?format=base64 (request-local only)
+	formatParam := strings.TrimSpace(strings.ToLower(q.Get("format")))
+	format := s.cfg.Format
+	if format == "" {
+		format = "base64"
+	}
+	if formatParam != "" {
+		if formatParam != "raw" && formatParam != "base64" {
+			http.Error(w, "invalid format: "+formatParam, http.StatusBadRequest)
+			return
+		}
+		format = formatParam
+	}
+
+	// Sourced directly from authoritative Store projections
+	var links []string
+	if projection == "generic" {
+		links = s.st.NetworkPassing()
+	} else {
+		links = s.st.Passing()
+	}
+
+	// Protocol filtering (if requested)
+	if targetProto != "" {
+		prefix := targetProto + "://"
+		var filtered []string
+		for _, link := range links {
+			if strings.HasPrefix(link, prefix) {
+				filtered = append(filtered, link)
+			}
+		}
+		links = filtered
+	}
+
+	body := strings.Join(links, "\n")
+	if format == "base64" {
+		if body != "" {
+			body = base64.StdEncoding.EncodeToString([]byte(body))
+		} else {
+			body = ""
+		}
 	}
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(body))
 }
 
@@ -86,6 +209,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"failed: " + strconv.Itoa(stats.Failed) + "\n" +
 			"inconclusive: " + strconv.Itoa(stats.Inconclusive) + "\n" +
 			"servable: " + strconv.Itoa(stats.Servable) + "\n" +
+			"generic_servable: " + strconv.Itoa(stats.GenericServable) + "\n" +
 			"cycles: " + strconv.Itoa(stats.CycleCount) + "\n",
 	))
 }
