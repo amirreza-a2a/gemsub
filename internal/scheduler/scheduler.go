@@ -7,6 +7,7 @@ package scheduler
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,10 +21,12 @@ import (
 )
 
 type Scheduler struct {
-	cfg *config.Config
-	st  *store.Store
-	pub *publisher.Publisher
-	bus *events.EventBus
+	cfg         *config.Config
+	st          *store.Store
+	pub         *publisher.Publisher
+	bus         *events.EventBus
+	rotatorOnce sync.Once
+	rotator     *candidateRotator
 
 	// Trigger lets anything (TUI, signal handler, ...) request an
 	// immediate cycle instead of waiting for the interval. Buffered
@@ -47,8 +50,18 @@ func New(cfg *config.Config, st *store.Store, bus ...*events.EventBus) *Schedule
 		st:      st,
 		pub:     pub,
 		bus:     b,
+		rotator: newCandidateRotator(),
 		Trigger: make(chan struct{}, 1),
 	}
+}
+
+func (s *Scheduler) getRotator() *candidateRotator {
+	s.rotatorOnce.Do(func() {
+		if s.rotator == nil {
+			s.rotator = newCandidateRotator()
+		}
+	})
+	return s.rotator
 }
 
 // EventBus returns the scheduler's event bus.
@@ -132,25 +145,31 @@ func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeR
 		candidates = append(candidates, cand)
 	}
 	totalParsed := len(candidates)
-	if s.cfg.ProbeLimit > 0 && len(candidates) > s.cfg.ProbeLimit {
-		candidates = candidates[:s.cfg.ProbeLimit]
-	}
-	slog.Info("scheduler: selected candidates for probing", "selected", len(candidates), "total", totalParsed)
-	s.bus.Publish(events.CandidatesLoaded{
-		Total:      len(candidates),
-		Candidates: candidates,
-	})
 
 	// Drop stale results for links no longer present in this cycle's
 	// source, so a config removed upstream also disappears from what
 	// we serve to Throne.
 	s.st.StartCycle(linkSet)
 
+	// Maintain rotation state only for candidates currently present.
+	rot := s.getRotator()
+	rot.PruneStale(linkSet)
+
+	// Apply fair Least-Recently-Tested (LRT) candidate rotation under ProbeLimit.
+	candidates = rot.SelectCandidates(candidates, s.cfg.ProbeLimit)
+
+	slog.Info("scheduler: selected candidates for probing", "selected", len(candidates), "total", totalParsed)
+	s.bus.Publish(events.CandidatesLoaded{
+		Total:      len(candidates),
+		Candidates: candidates,
+	})
+
 	var passed, failed, inconclusive int64
 	var regionBlocked, timeout int64
 
 	completed := tester.RunPoolWithRunner(ctx, candidates, &s.cfg.Test, runner, s.bus, func(r store.Result) {
 		s.st.PutWithTransition(r)
+		rot.RecordTested(r.Link, r.TestedAt)
 		switch r.Status {
 		case store.StatusPassed:
 			atomic.AddInt64(&passed, 1)
