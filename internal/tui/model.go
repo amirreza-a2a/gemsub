@@ -21,6 +21,7 @@ type Controller interface {
 	CandidateDetail(opaqueID string) (viewmodel.CandidateDetailViewModel, bool)
 	CycleLogLevel() (viewmodel.LogViewModel, string)
 	CopyCandidateLink(opaqueID string) error
+	CandidateRowsWindow(filter viewmodel.FilterMode, offset, limit int) []viewmodel.CandidateRowViewModel
 }
 
 // ActiveView represents the primary content pane currently displayed.
@@ -51,6 +52,11 @@ type Model struct {
 	rows   []viewmodel.CandidateRowViewModel
 	detail viewmodel.CandidateDetailViewModel
 	logs   viewmodel.LogViewModel
+
+	// Virtualized table state
+	totalRows         int
+	windowOffset      int
+	detailCandidateID string
 
 	// View state
 	activeView       ActiveView
@@ -100,6 +106,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.terminalTooSmall = (m.width < 80 || m.height < 24)
+		m.adjustScroll()
+		m.refreshVisibleRows()
 		return m, nil
 
 	case TickMsg:
@@ -181,6 +189,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleCandidateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	prevOffset := m.tableOffset
 	switch msg.String() {
 	case "up", "k":
 		if m.cursorIndex > 0 {
@@ -188,7 +197,7 @@ func (m *Model) handleCandidateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.adjustScroll()
 		}
 	case "down", "j":
-		if m.cursorIndex < len(m.rows)-1 {
+		if m.cursorIndex < m.totalRows-1 {
 			m.cursorIndex++
 			m.adjustScroll()
 		}
@@ -202,8 +211,8 @@ func (m *Model) handleCandidateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "pgdown", "ctrl+f":
 		page := m.visibleTableRows()
 		m.cursorIndex += page
-		if m.cursorIndex >= len(m.rows) {
-			m.cursorIndex = len(m.rows) - 1
+		if m.cursorIndex >= m.totalRows {
+			m.cursorIndex = m.totalRows - 1
 		}
 		if m.cursorIndex < 0 {
 			m.cursorIndex = 0
@@ -213,31 +222,31 @@ func (m *Model) handleCandidateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursorIndex = 0
 		m.adjustScroll()
 	case "G":
-		if len(m.rows) > 0 {
-			m.cursorIndex = len(m.rows) - 1
+		if m.totalRows > 0 {
+			m.cursorIndex = m.totalRows - 1
 			m.adjustScroll()
 		}
 	case "enter", " ":
-		if len(m.rows) > 0 && m.cursorIndex >= 0 && m.cursorIndex < len(m.rows) {
-			selectedID := m.rows[m.cursorIndex].ID
-			if m.ctrl != nil {
-				if detail, ok := m.ctrl.CandidateDetail(selectedID); ok {
-					m.detail = detail
-					m.showDetail = true
-				}
+		selectedID := m.selectedCandidateID()
+		if selectedID != "" && m.ctrl != nil {
+			if detail, ok := m.ctrl.CandidateDetail(selectedID); ok {
+				m.detail = detail
+				m.showDetail = true
+				m.detailCandidateID = selectedID
 			}
 		}
 	case "y":
-		if len(m.rows) > 0 && m.cursorIndex >= 0 && m.cursorIndex < len(m.rows) {
-			selectedID := m.rows[m.cursorIndex].ID
-			if m.ctrl != nil {
-				if err := m.ctrl.CopyCandidateLink(selectedID); err == nil {
-					m.setStatus("Copied active link to clipboard")
-				} else {
-					m.setStatus("Clipboard unavailable: could not copy")
-				}
+		selectedID := m.selectedCandidateID()
+		if selectedID != "" && m.ctrl != nil {
+			if err := m.ctrl.CopyCandidateLink(selectedID); err == nil {
+				m.setStatus("Copied active link to clipboard")
+			} else {
+				m.setStatus("Clipboard unavailable: could not copy")
 			}
 		}
+	}
+	if m.tableOffset != prevOffset {
+		m.refreshVisibleRows()
 	}
 	return m, nil
 }
@@ -246,6 +255,7 @@ func (m *Model) handleDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "enter", " ":
 		m.showDetail = false
+		m.detailCandidateID = ""
 	case "y":
 		if m.ctrl != nil {
 			if err := m.ctrl.CopyCandidateLink(m.detail.ID); err == nil {
@@ -311,27 +321,31 @@ func (m *Model) handleLogKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) applySnapshot(snap viewmodel.SnapshotViewModel, resetCursor bool) {
 	m.header = snap.Header
-	m.rows = snap.Rows
 	m.logs = snap.Logs
+
+	total := snap.TotalRows
+	if total == 0 && len(snap.Rows) > 0 {
+		total = len(snap.Rows)
+	}
+	m.totalRows = total
 
 	if resetCursor {
 		m.cursorIndex = 0
 		m.tableOffset = 0
-	} else if len(m.rows) > 0 {
-		if m.cursorIndex >= len(m.rows) {
-			m.cursorIndex = len(m.rows) - 1
+	} else if m.totalRows > 0 {
+		if m.cursorIndex >= m.totalRows {
+			m.cursorIndex = m.totalRows - 1
 		}
 	} else {
 		m.cursorIndex = 0
 	}
 	m.adjustScroll()
 
-	if m.showDetail && m.cursorIndex < len(m.rows) {
-		selectedID := m.rows[m.cursorIndex].ID
-		if m.ctrl != nil {
-			if detail, ok := m.ctrl.CandidateDetail(selectedID); ok {
-				m.detail = detail
-			}
+	m.syncVisibleRows(snap.Rows)
+
+	if m.showDetail && m.detailCandidateID != "" && m.ctrl != nil {
+		if detail, ok := m.ctrl.CandidateDetail(m.detailCandidateID); ok {
+			m.detail = detail
 		}
 	}
 
@@ -343,6 +357,45 @@ func (m *Model) applySnapshot(snap viewmodel.SnapshotViewModel, resetCursor bool
 		}
 		m.logScrollOffset = maxOffset
 	}
+}
+
+func (m *Model) syncVisibleRows(snapRows []viewmodel.CandidateRowViewModel) {
+	vis := m.visibleTableRows()
+	if m.tableOffset == 0 && len(snapRows) >= vis {
+		m.rows = snapRows[:vis]
+		m.windowOffset = 0
+		return
+	}
+	if m.tableOffset == 0 && len(snapRows) == m.totalRows {
+		m.rows = snapRows
+		m.windowOffset = 0
+		return
+	}
+	m.refreshVisibleRows()
+}
+
+func (m *Model) refreshVisibleRows() {
+	vis := m.visibleTableRows()
+	if m.ctrl != nil {
+		m.rows = m.ctrl.CandidateRowsWindow(m.filterMode, m.tableOffset, vis)
+		m.windowOffset = m.tableOffset
+	}
+}
+
+func (m *Model) selectedCandidateID() string {
+	if m.cursorIndex < 0 || m.cursorIndex >= m.totalRows {
+		return ""
+	}
+	idx := m.cursorIndex - m.windowOffset
+	if idx < 0 || idx >= len(m.rows) {
+		m.adjustScroll()
+		m.refreshVisibleRows()
+		idx = m.cursorIndex - m.windowOffset
+	}
+	if idx >= 0 && idx < len(m.rows) {
+		return m.rows[idx].ID
+	}
+	return ""
 }
 
 func (m *Model) adjustScroll() {
@@ -357,6 +410,9 @@ func (m *Model) adjustScroll() {
 	}
 	if m.tableOffset < 0 {
 		m.tableOffset = 0
+	}
+	if m.totalRows > 0 && m.tableOffset >= m.totalRows {
+		m.tableOffset = m.totalRows - 1
 	}
 }
 
@@ -484,7 +540,7 @@ func (m *Model) renderCandidateTable() string {
 	sb.WriteString(bold.Render(headerStr))
 	sb.WriteString("\n")
 
-	if len(m.rows) == 0 {
+	if m.totalRows == 0 {
 		sb.WriteString(dim.Render("  No candidates in current view."))
 		sb.WriteString("\n")
 		return sb.String()
@@ -492,8 +548,8 @@ func (m *Model) renderCandidateTable() string {
 
 	vis := m.visibleTableRows()
 	end := m.tableOffset + vis
-	if end > len(m.rows) {
-		end = len(m.rows)
+	if end > m.totalRows {
+		end = m.totalRows
 	}
 
 	endpointWidth := m.width - 49
@@ -502,7 +558,11 @@ func (m *Model) renderCandidateTable() string {
 	}
 
 	for i := m.tableOffset; i < end; i++ {
-		row := m.rows[i]
+		idx := i - m.windowOffset
+		if idx < 0 || idx >= len(m.rows) {
+			continue
+		}
+		row := m.rows[idx]
 
 		servChar := "[  ]"
 		if row.Servable {

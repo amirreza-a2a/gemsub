@@ -110,7 +110,8 @@ type LogViewModel struct {
 
 // SnapshotViewModel bundles presentation viewmodels assembled from authoritative reads.
 type SnapshotViewModel struct {
-	Header HeaderViewModel
-	Rows   []CandidateRowViewModel
-	Logs   LogViewModel
+	Header    HeaderViewModel
+	Rows      []CandidateRowViewModel
+	TotalRows int
+	Logs      LogViewModel
 }

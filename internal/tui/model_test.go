@@ -474,3 +474,115 @@ func TestModel_FilterModeCycling(t *testing.T) {
 		t.Errorf("expected All candidates filter state, got:\n%s", view3)
 	}
 }
+
+func TestModel_VirtualizationScrollAndInspection(t *testing.T) {
+	m, st, _, _ := setupTestModel(t)
+
+	// Populate 100 candidates
+	for i := 0; i < 100; i++ {
+		link := "vless://cand" + string(rune('A'+i%26)) + "@1.1.1.1:443#Node-" + strings.Repeat("x", i%5)
+		st.PutWithTransition(store.Result{
+			Link:     link,
+			Status:   store.StatusPassed,
+			Latency:  time.Duration(100+i) * time.Millisecond,
+			TestedAt: time.Now(),
+		})
+	}
+
+	// Trigger initial snapshot via tick
+	updated, _ := m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+
+	// 1. Move cursor to bottom using 'G'
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	m = updated.(*tui.Model)
+
+	// 2. Open detail on the selected row
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+	viewDetail := m.View()
+	if !strings.Contains(viewDetail, "CANDIDATE INSPECTION") {
+		t.Fatalf("expected detail view after pressing Enter on virtualized row, got:\n%s", viewDetail)
+	}
+
+	// 3. Close detail
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	m = updated.(*tui.Model)
+
+	// 4. Jump back to top using 'g'
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = updated.(*tui.Model)
+
+	// 5. Move down with 'j' and pgdown
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m = updated.(*tui.Model)
+
+	// 6. View should render candidate table normally without line wrapping
+	viewNormal := m.View()
+	if !strings.Contains(viewNormal, "SERV") || !strings.Contains(viewNormal, "ENDPOINT") {
+		t.Errorf("expected table view, got:\n%s", viewNormal)
+	}
+}
+
+func TestModel_DynamicMembershipClamping(t *testing.T) {
+	m, st, _, _ := setupTestModel(t)
+
+	// Populate 10 candidates
+	for i := 0; i < 10; i++ {
+		link := "vless://cand" + string(rune('a'+i)) + "@1.1.1.1:443#Cand-" + string(rune('a'+i))
+		st.PutWithTransition(store.Result{
+			Link:     link,
+			Status:   store.StatusPassed,
+			Latency:  100 * time.Millisecond,
+			TestedAt: time.Now(),
+		})
+	}
+
+	updated, _ := m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+
+	// Jump to bottom (cursor at 9)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	m = updated.(*tui.Model)
+
+	// Remove all candidates by starting a new cycle with only 1 link
+	st.StartCycle(map[string]struct{}{
+		store.CanonicalizeLink("vless://canda@1.1.1.1:443#Cand-a"): {},
+	})
+	st.FinishCycle()
+	st.FinishCycle()
+	st.FinishCycle() // Evicts past MaxAbsentCycles=2
+
+	// Poll via tick
+	updated, _ = m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+
+	// Cursor must be clamped safely to 0 (only 1 candidate left) without panicking
+	view := m.View()
+	if !strings.Contains(view, "SERV") {
+		t.Errorf("expected table after eviction, got:\n%s", view)
+	}
+}
+
+func TestModel_EmptyCandidatesView(t *testing.T) {
+	m, _, _, _ := setupTestModel(t)
+
+	view := m.View()
+	if !strings.Contains(view, "No candidates in current view.") {
+		t.Errorf("expected 'No candidates in current view.', got:\n%s", view)
+	}
+
+	// Pressing keys on empty table must not panic
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = updated.(*tui.Model)
+}

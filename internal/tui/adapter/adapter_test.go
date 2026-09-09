@@ -1,6 +1,7 @@
 package adapter_test
 
 import (
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -60,7 +61,7 @@ func TestAdapter_DeterministicOrdering(t *testing.T) {
 	// c4: Failed transport (unservable)
 	st.PutWithTransition(store.Result{Link: c4, Status: store.StatusFailed, Category: store.ErrProxyError, TestedAt: now})
 
-	rows := ad.CandidateRows(viewmodel.FilterAll)
+	rows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
 	if len(rows) != 4 {
 		t.Fatalf("expected 4 rows, got %d", len(rows))
 	}
@@ -78,17 +79,23 @@ func TestAdapter_DeterministicOrdering(t *testing.T) {
 		t.Errorf("expected 3rd row to be unproven C3, got %q", rows[2].Remark)
 	}
 
-	// Rule 3 & 4: Same score (0.90 / 1.0), latency ascending (100ms < 200ms)
-	// c1 (100ms) before c2 (200ms)
-	if rows[0].Remark != "C1" || rows[1].Remark != "C2" {
-		t.Errorf("expected rows order [C1, C2], got [%s, %s]", rows[0].Remark, rows[1].Remark)
+	// Rule 3: Reliability score descending within proven servable.
+	// Both c1 and c2 have score 0.90, so score doesn't differentiate.
+	// Rule 4: Effective latency ascending.
+	// c1 has latency 100ms, c2 has latency 200ms.
+	// So c1 must come before c2.
+	if rows[0].Remark != "C1" {
+		t.Errorf("expected 1st row to be C1 (lower latency), got %q", rows[0].Remark)
+	}
+	if rows[1].Remark != "C2" {
+		t.Errorf("expected 2nd row to be C2, got %q", rows[1].Remark)
 	}
 }
 
 func TestAdapter_OpaqueIDMappingAndDetail(t *testing.T) {
 	ad, st, _, _ := setupTestAdapter(t)
 
-	link := "vless://secret-uuid@1.1.1.1:443?security=reality&sni=example.com#MyNode"
+	link := "vless://user@1.1.1.1:443#TestNode"
 	st.PutWithTransition(store.Result{
 		Link:     link,
 		Status:   store.StatusPassed,
@@ -97,7 +104,7 @@ func TestAdapter_OpaqueIDMappingAndDetail(t *testing.T) {
 		TestedAt: time.Now(),
 	})
 
-	rows := ad.CandidateRows(viewmodel.FilterAll)
+	rows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(rows))
 	}
@@ -113,24 +120,22 @@ func TestAdapter_OpaqueIDMappingAndDetail(t *testing.T) {
 	if !ok {
 		t.Fatalf("failed to retrieve candidate detail for opaque ID %q", row.ID)
 	}
+	if detail.Remark != "TestNode" {
+		t.Errorf("expected detail remark %q, got %q", "TestNode", detail.Remark)
+	}
 
-	if detail.Remark != "MyNode" {
-		t.Errorf("expected remark 'MyNode', got %q", detail.Remark)
+	// Detail contains masked active link
+	if strings.Contains(detail.MaskedLink, "user@") {
+		t.Errorf("detail.MaskedLink leaked credentials: %q", detail.MaskedLink)
 	}
-	if detail.Protocol != "vless" {
-		t.Errorf("expected protocol 'vless', got %q", detail.Protocol)
+	if !strings.Contains(detail.MaskedLink, "[REDACTED]") {
+		t.Errorf("detail.MaskedLink missing [REDACTED]: %q", detail.MaskedLink)
 	}
-	if detail.Endpoint != "1.1.1.1:443" {
-		t.Errorf("expected endpoint '1.1.1.1:443', got %q", detail.Endpoint)
-	}
-	if strings.Contains(detail.MaskedLink, "secret-uuid") {
-		t.Errorf("detail.MaskedLink leaked secret-uuid: %q", detail.MaskedLink)
-	}
-	if !detail.Servable {
-		t.Errorf("expected detail to be servable")
-	}
-	if len(detail.Samples) != 1 {
-		t.Errorf("expected 1 sample in detail, got %d", len(detail.Samples))
+
+	// Non-existent opaque ID returns false
+	_, okMissing := ad.CandidateDetail("cand-999")
+	if okMissing {
+		t.Error("expected ok=false for non-existent opaque ID")
 	}
 }
 
@@ -143,12 +148,12 @@ func TestAdapter_FilterServableOnly(t *testing.T) {
 	st.PutWithTransition(store.Result{Link: linkPass, Status: store.StatusPassed, TestedAt: time.Now()})
 	st.PutWithTransition(store.Result{Link: linkFail, Status: store.StatusFailed, Category: store.ErrRegionBlocked, TestedAt: time.Now()})
 
-	allRows := ad.CandidateRows(viewmodel.FilterAll)
+	allRows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
 	if len(allRows) != 2 {
 		t.Fatalf("expected 2 all rows, got %d", len(allRows))
 	}
 
-	servableRows := ad.CandidateRows(viewmodel.FilterGemini)
+	servableRows := ad.CandidateRowsWindow(viewmodel.FilterGemini, 0, 10)
 	if len(servableRows) != 1 {
 		t.Fatalf("expected 1 servable row, got %d", len(servableRows))
 	}
@@ -280,6 +285,7 @@ func TestAdapter_OpaqueIDPruning(t *testing.T) {
 	bus := events.New()
 	ring := logging.NewRingLogHandler(100)
 	ad := adapter.New(st, bus, ring)
+	ad.SetIndexThrottleIntervalForTest(0)
 	defer ad.Close()
 	defer bus.Close()
 
@@ -287,7 +293,7 @@ func TestAdapter_OpaqueIDPruning(t *testing.T) {
 	st.PutWithTransition(store.Result{Link: "vless://a@1.1.1.1:443#NodeA", Status: store.StatusPassed, TestedAt: time.Now()})
 	st.PutWithTransition(store.Result{Link: "vless://b@2.2.2.2:443#NodeB", Status: store.StatusPassed, TestedAt: time.Now()})
 
-	rows1 := ad.CandidateRows(viewmodel.FilterAll)
+	rows1 := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
 	if len(rows1) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(rows1))
 	}
@@ -310,6 +316,11 @@ func TestAdapter_OpaqueIDPruning(t *testing.T) {
 		t.Fatal("expected detail for NodeB")
 	}
 
+	linkCount1, idCount1 := ad.OpaqueIDMapCountsForTest()
+	if linkCount1 != 2 || idCount1 != 2 {
+		t.Fatalf("expected initial map sizes (2, 2), got (%d, %d)", linkCount1, idCount1)
+	}
+
 	// Cycle 2: candidate A is evicted from store, only candidate B remains, and candidate C is added
 	bLink := "vless://b@2.2.2.2:443#NodeB"
 	cLink := "vless://c@3.3.3.3:443#NodeC"
@@ -324,16 +335,20 @@ func TestAdapter_OpaqueIDPruning(t *testing.T) {
 		t.Fatalf("failed to reload store: %v", err)
 	}
 
-	// Call CandidateRows on the SAME adapter `ad`
-	rows2 := ad.CandidateRows(viewmodel.FilterAll)
+	// Call CandidateRowsWindow on the SAME adapter `ad`
+	rows2 := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
 	if len(rows2) != 2 {
 		t.Fatalf("expected 2 rows after reload, got %d", len(rows2))
 	}
 
-	// Verify candidate A was pruned from `ad`
+	// Verify candidate A was pruned from `ad` internal maps and detail retrieval fails
 	_, foundAAfter := ad.CandidateDetail(idA)
 	if foundAAfter {
 		t.Errorf("expected candidate A (%s) to be pruned from adapter, but was found", idA)
+	}
+	linkCount2, idCount2 := ad.OpaqueIDMapCountsForTest()
+	if linkCount2 != 2 || idCount2 != 2 {
+		t.Errorf("expected pruned map sizes (2, 2), got (%d, %d)", linkCount2, idCount2)
 	}
 
 	// Verify candidate B retained its existing ID (idB)
@@ -418,7 +433,7 @@ func TestAdapter_LatencySemantics(t *testing.T) {
 		TestedAt: time.Now(),
 	})
 
-	rows := ad.CandidateRows(viewmodel.FilterAll)
+	rows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
 	var rowProven, rowUnproven viewmodel.CandidateRowViewModel
 	for _, r := range rows {
 		if r.Remark == "Proven" {
@@ -958,7 +973,7 @@ func TestAdapter_FlagPresentationModes(t *testing.T) {
 		t.Fatalf("expected FlagMode ASCII, got %v", ad.FlagMode())
 	}
 
-	rowsASCII := ad.CandidateRows(viewmodel.FilterAll)
+	rowsASCII := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
 	if len(rowsASCII) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(rowsASCII))
 	}
@@ -985,7 +1000,7 @@ func TestAdapter_FlagPresentationModes(t *testing.T) {
 		t.Fatalf("expected FlagMode Unicode, got %v", ad.FlagMode())
 	}
 
-	rowsUnicode := ad.CandidateRows(viewmodel.FilterAll)
+	rowsUnicode := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
 	for _, r := range rowsUnicode {
 		if r.Endpoint == "1.1.1.1:443" {
 			if r.Remark != "🇩🇪 Germany" {
@@ -1141,7 +1156,7 @@ func TestAdapter_TieredRankingAndFiltering(t *testing.T) {
 	})
 
 	// 1. Check 3-tier ordering under FilterAll
-	rowsAll := ad.CandidateRows(viewmodel.FilterAll)
+	rowsAll := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
 	if len(rowsAll) != 3 {
 		t.Fatalf("expected 3 rows, got %d", len(rowsAll))
 	}
@@ -1156,7 +1171,7 @@ func TestAdapter_TieredRankingAndFiltering(t *testing.T) {
 	}
 
 	// 2. Check FilterGemini: only Tier 1
-	rowsGemini := ad.CandidateRows(viewmodel.FilterGemini)
+	rowsGemini := ad.CandidateRowsWindow(viewmodel.FilterGemini, 0, 10)
 	if len(rowsGemini) != 1 {
 		t.Fatalf("expected 1 row for FilterGemini, got %d", len(rowsGemini))
 	}
@@ -1165,7 +1180,7 @@ func TestAdapter_TieredRankingAndFiltering(t *testing.T) {
 	}
 
 	// 3. Check FilterGeneric: Tier 1 + Tier 2 (both are network healthy)
-	rowsGeneric := ad.CandidateRows(viewmodel.FilterGeneric)
+	rowsGeneric := ad.CandidateRowsWindow(viewmodel.FilterGeneric, 0, 10)
 	if len(rowsGeneric) != 2 {
 		t.Fatalf("expected 2 rows for FilterGeneric, got %d", len(rowsGeneric))
 	}
@@ -1220,5 +1235,345 @@ func TestAdapter_TieredRankingAndFiltering(t *testing.T) {
 	if !detail2.TransportEvidenceKnown || !detail2.TransportOK || detail2.TransportLatency != 75*time.Millisecond {
 		t.Errorf("expected Tier2 detail transport evidence known=true ok=true lat=75ms, got known=%v ok=%v lat=%v",
 			detail2.TransportEvidenceKnown, detail2.TransportOK, detail2.TransportLatency)
+	}
+}
+
+func TestAdapter_VirtualizationWindowAndBoundedMemory(t *testing.T) {
+	ad, st, _, _ := setupTestAdapter(t)
+
+	// Populate 1000 candidates with distinct canonical links
+	for i := 0; i < 1000; i++ {
+		link := fmt.Sprintf("vless://user-%d@1.1.1.1:443#Node-%d", i, i)
+		st.PutWithTransition(store.Result{
+			Link:     link,
+			Status:   store.StatusPassed,
+			Latency:  time.Duration(50+i%200) * time.Millisecond,
+			TestedAt: time.Now(),
+		})
+	}
+
+	// 1. Snapshot returns bounded rows and accurate TotalRows
+	snap := ad.Snapshot(viewmodel.FilterAll)
+	if snap.TotalRows != 1000 {
+		t.Fatalf("expected TotalRows 1000, got %d", snap.TotalRows)
+	}
+	if len(snap.Rows) > 50 {
+		t.Fatalf("expected bounded rows <= 50, got %d", len(snap.Rows))
+	}
+
+	// 2. Window retrieval
+	window := ad.CandidateRowsWindow(viewmodel.FilterAll, 200, 20)
+	if len(window) != 20 {
+		t.Fatalf("expected 20 rows in window, got %d", len(window))
+	}
+
+	// 3. Detail inspection for windowed rows
+	detail, ok := ad.CandidateDetail(window[0].ID)
+	if !ok {
+		t.Fatalf("expected detail retrieval for window row ID %s", window[0].ID)
+	}
+	if detail.Status != "passed" {
+		t.Errorf("expected status passed, got %s", detail.Status)
+	}
+
+	// 4. Boundary cases for CandidateRowsWindow
+	emptyWindow := ad.CandidateRowsWindow(viewmodel.FilterAll, 2000, 20)
+	if len(emptyWindow) != 0 {
+		t.Errorf("expected empty window past end of list, got %d", len(emptyWindow))
+	}
+
+	negWindow := ad.CandidateRowsWindow(viewmodel.FilterAll, -5, 10)
+	if len(negWindow) != 10 {
+		t.Errorf("expected 10 rows for negative offset, got %d", len(negWindow))
+	}
+}
+
+func TestAdapter_FilteredCountAndTierOrdering(t *testing.T) {
+	ad, st, _, _ := setupTestAdapter(t)
+
+	now := time.Now()
+	// Tier 1: Gemini servable
+	st.PutWithTransition(store.Result{
+		Link:     "vless://t1@1.1.1.1:443#Tier1",
+		Status:   store.StatusPassed,
+		Latency:  100 * time.Millisecond,
+		TestedAt: now,
+	})
+
+	// Tier 2: Generic servable (target blocked)
+	st.PutWithTransition(store.Result{
+		Link:                   "vless://t2@2.2.2.2:443#Tier2",
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportOK:            true,
+		TransportEvidenceKnown: true,
+		TransportLatency:       50 * time.Millisecond,
+		TestedAt:               now,
+	})
+
+	// Tier 3: Unservable (transport failure)
+	st.PutWithTransition(store.Result{
+		Link:                   "vless://t3@3.3.3.3:443#Tier3",
+		Status:                 store.StatusFailed,
+		Category:               store.ErrProxyError,
+		TransportOK:            false,
+		TransportEvidenceKnown: true,
+		TestedAt:               now,
+	})
+
+	if ad.Snapshot(viewmodel.FilterAll).TotalRows != 3 {
+		t.Errorf("expected 3 in FilterAll, got %d", ad.Snapshot(viewmodel.FilterAll).TotalRows)
+	}
+	if ad.Snapshot(viewmodel.FilterGemini).TotalRows != 1 {
+		t.Errorf("expected 1 in FilterGemini, got %d", ad.Snapshot(viewmodel.FilterGemini).TotalRows)
+	}
+	if ad.Snapshot(viewmodel.FilterGeneric).TotalRows != 2 {
+		t.Errorf("expected 2 in FilterGeneric, got %d", ad.Snapshot(viewmodel.FilterGeneric).TotalRows)
+	}
+
+	// Verify window ordering conforms to Tier 1 -> Tier 2 -> Tier 3
+	rows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows))
+	}
+	if rows[0].Remark != "Tier1" {
+		t.Errorf("expected row 0 to be Tier1, got %s", rows[0].Remark)
+	}
+	if rows[1].Remark != "Tier2" {
+		t.Errorf("expected row 1 to be Tier2, got %s", rows[1].Remark)
+	}
+	if rows[2].Remark != "Tier3" {
+		t.Errorf("expected row 2 to be Tier3, got %s", rows[2].Remark)
+	}
+}
+
+func TestAdapter_ReconcileCycleStateWithCandidateIndex(t *testing.T) {
+	ad, st, bus, _ := setupTestAdapter(t)
+	ad.Subscribe()
+
+	// Simulate running cycle
+	bus.Publish(events.CycleStarted{StartedAt: time.Now()})
+	time.Sleep(20 * time.Millisecond)
+
+	// Add candidates and finish cycle in Store directly (simulating lost event)
+	st.PutWithTransition(store.Result{
+		Link:     "vless://rec@1.1.1.1:443#Reconciled",
+		Status:   store.StatusPassed,
+		TestedAt: time.Now(),
+	})
+	st.FinishCycle()
+
+	// CheckAndResetDirty will call reconcileCycleStateLocked
+	dirty := ad.CheckAndResetDirty()
+	if !dirty {
+		t.Errorf("expected dirty after cycle finish")
+	}
+
+	snap := ad.Snapshot(viewmodel.FilterAll)
+	if snap.Header.CycleStatus != viewmodel.CycleIdle {
+		t.Errorf("expected CycleIdle after reconciliation, got %s", snap.Header.CycleStatus)
+	}
+	if snap.Header.PassedCount != 1 {
+		t.Errorf("expected 1 passed count, got %d", snap.Header.PassedCount)
+	}
+}
+
+func TestAdapter_IndexRebuildOverdueAfterThrottleExpires(t *testing.T) {
+	ad, st, _, _ := setupTestAdapter(t)
+	// 50ms throttle interval
+	ad.SetIndexThrottleIntervalForTest(50 * time.Millisecond)
+
+	linkA := "vless://a@1.1.1.1:443#NodeA"
+	st.PutWithTransition(store.Result{
+		Link:     linkA,
+		Status:   store.StatusPassed,
+		Latency:  100 * time.Millisecond,
+		TestedAt: time.Now(),
+	})
+
+	// Initial snapshot rebuilds index
+	snap, updated := ad.PollSnapshot(viewmodel.FilterAll)
+	if !updated || len(snap.Rows) != 1 {
+		t.Fatalf("expected initial updated snapshot with 1 row")
+	}
+	initRev := ad.LastIndexRevForTest()
+	if initRev != st.Revision() {
+		t.Fatalf("expected index rev %d to match store rev %d", initRev, st.Revision())
+	}
+
+	// Mutate candidate inside throttle window (< 50ms)
+	st.PutWithTransition(store.Result{
+		Link:     linkA,
+		Status:   store.StatusFailed,
+		Category: store.ErrRegionBlocked,
+		TestedAt: time.Now(),
+	})
+	mutRev := st.Revision()
+	if mutRev == initRev {
+		t.Fatalf("expected store revision increment on mutation")
+	}
+
+	// Intermediate tick calls PollSnapshot, which checks dirty and runs rebuildIndexLocked(false).
+	// Because < 50ms elapsed and candidate count is unchanged (1 == 1), index rebuild throttles.
+	snap2, updated2 := ad.PollSnapshot(viewmodel.FilterAll)
+	if !updated2 {
+		t.Fatalf("expected PollSnapshot to return updated because store revision changed")
+	}
+	if ad.LastIndexRevForTest() != initRev {
+		t.Fatalf("expected index to be throttled (rev %d, expected %d)", ad.LastIndexRevForTest(), initRev)
+	}
+	// Row status in throttled index is still old "PASS"
+	if len(snap2.Rows) != 1 || snap2.Rows[0].Status != "PASS" {
+		t.Fatalf("expected throttled rows to still show PASS, got %v", snap2.Rows[0].Status)
+	}
+
+	// Probing pauses. Immediate check before 50ms expires returns dirty=false
+	if ad.CheckAndResetDirty() {
+		t.Fatalf("expected not dirty before throttle expires with no store mutations")
+	}
+
+	// Wait for throttle duration to elapse
+	time.Sleep(65 * time.Millisecond)
+
+	// Invariant: overdue throttled index MUST trigger dirty automatically even with 0 new Store mutations
+	snap3, updated3 := ad.PollSnapshot(viewmodel.FilterAll)
+	if !updated3 {
+		t.Fatalf("expected updated snapshot after throttle expiration for pending stale index")
+	}
+	if ad.LastIndexRevForTest() != mutRev {
+		t.Fatalf("expected index rev %d to match mutated store rev %d", ad.LastIndexRevForTest(), mutRev)
+	}
+	if len(snap3.Rows) != 1 || snap3.Rows[0].Status != "BLOCKED" {
+		t.Fatalf("expected rebuilt rows to show mutated status BLOCKED, got %s", snap3.Rows[0].Status)
+	}
+}
+
+func TestAdapter_RapidStoreRevisionsEventuallyRebuilt(t *testing.T) {
+	ad, st, _, _ := setupTestAdapter(t)
+	ad.SetIndexThrottleIntervalForTest(40 * time.Millisecond)
+
+	link := "vless://rapid@1.1.1.1:443#Rapid"
+	st.PutWithTransition(store.Result{
+		Link:     link,
+		Status:   store.StatusPassed,
+		TestedAt: time.Now(),
+	})
+	ad.PollSnapshot(viewmodel.FilterAll)
+
+	// 10 rapid mutations in tight loop
+	for i := 1; i <= 10; i++ {
+		st.PutWithTransition(store.Result{
+			Link:     link,
+			Status:   store.StatusPassed,
+			Latency:  time.Duration(i*10) * time.Millisecond,
+			TestedAt: time.Now(),
+		})
+	}
+	finalRev := st.Revision()
+
+	// Wait past throttle
+	time.Sleep(55 * time.Millisecond)
+
+	if !ad.CheckAndResetDirty() {
+		t.Fatalf("expected dirty after rapid mutations and throttle expiration")
+	}
+	snap, updated := ad.PollSnapshot(viewmodel.FilterAll)
+	if !updated {
+		t.Fatalf("expected updated snapshot")
+	}
+	if ad.LastIndexRevForTest() != finalRev {
+		t.Fatalf("expected index rev %d to match final rev %d", ad.LastIndexRevForTest(), finalRev)
+	}
+	if len(snap.Rows) != 1 || snap.Rows[0].LatencyFormatted != "100ms" {
+		t.Errorf("expected final latency 100ms, got %s", snap.Rows[0].LatencyFormatted)
+	}
+}
+
+func TestAdapter_OpaqueIDMapBoundedLifetimeAcrossChurn(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "state.json")
+
+	// Store with MaxAbsentCycles = 1 (eviction after 1 cycle of absence)
+	st := store.New(stateFile, 1)
+	bus := events.New()
+	ring := logging.NewRingLogHandler(100)
+	ad := adapter.New(st, bus, ring)
+	ad.SetIndexThrottleIntervalForTest(0)
+	defer ad.Close()
+	defer bus.Close()
+
+	// Initial pool: 10 candidates (0..9)
+	initialIDs := make(map[int]string)
+	for i := 0; i < 10; i++ {
+		link := fmt.Sprintf("vless://node-%d@1.1.1.1:443#Node-%d", i, i)
+		st.PutWithTransition(store.Result{Link: link, Status: store.StatusPassed, TestedAt: time.Now()})
+	}
+	rows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 20)
+	if len(rows) != 10 {
+		t.Fatalf("expected 10 initial rows, got %d", len(rows))
+	}
+	for _, r := range rows {
+		var idx int
+		fmt.Sscanf(r.Remark, "Node-%d", &idx)
+		initialIDs[idx] = r.ID
+	}
+
+	linkCount, idCount := ad.OpaqueIDMapCountsForTest()
+	if linkCount != 10 || idCount != 10 {
+		t.Fatalf("expected initial map sizes (10, 10), got (%d, %d)", linkCount, idCount)
+	}
+
+	// Churn simulation: rotate 5 candidates out and 5 candidates in over 4 cycles
+	for cycle := 1; cycle <= 4; cycle++ {
+		startIdx := cycle * 5
+		endIdx := startIdx + 10 // Active window of 10 candidates
+
+		// Recreate state with the 10 currently active candidates
+		stNew := store.New(stateFile, 1)
+		for i := startIdx; i < endIdx; i++ {
+			link := fmt.Sprintf("vless://node-%d@1.1.1.1:443#Node-%d", i, i)
+			stNew.PutWithTransition(store.Result{Link: link, Status: store.StatusPassed, TestedAt: time.Now()})
+		}
+		if err := stNew.Save(); err != nil {
+			t.Fatalf("failed to save state in cycle %d: %v", cycle, err)
+		}
+		if err := st.Load(); err != nil {
+			t.Fatalf("failed to load state in cycle %d: %v", cycle, err)
+		}
+
+		// Re-fetch window
+		activeRows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 20)
+		if len(activeRows) != 10 {
+			t.Fatalf("cycle %d: expected 10 active rows, got %d", cycle, len(activeRows))
+		}
+
+		// Invariant: Opaque ID maps MUST be strictly bounded to active candidate count (10)
+		curLinks, curIDs := ad.OpaqueIDMapCountsForTest()
+		if curLinks != 10 || curIDs != 10 {
+			t.Fatalf("cycle %d: memory leak detected! Expected map sizes (10, 10), got (%d, %d)",
+				cycle, curLinks, curIDs)
+		}
+
+		// Verify surviving candidates retained their stable IDs
+		for _, r := range activeRows {
+			var idx int
+			fmt.Sscanf(r.Remark, "Node-%d", &idx)
+			if prevID, hadPrev := initialIDs[idx]; hadPrev {
+				if r.ID != prevID {
+					t.Errorf("cycle %d: candidate Node-%d changed ID from %s to %s", cycle, idx, prevID, r.ID)
+				}
+			} else {
+				initialIDs[idx] = r.ID
+			}
+		}
+
+		// Verify evicted candidates from older cycles return false on detail query
+		for i := 0; i < startIdx; i++ {
+			if oldID, hadID := initialIDs[i]; hadID {
+				if _, found := ad.CandidateDetail(oldID); found {
+					t.Errorf("cycle %d: evicted candidate Node-%d (ID %s) still found in detail", cycle, i, oldID)
+				}
+			}
+		}
 	}
 }

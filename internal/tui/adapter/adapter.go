@@ -55,6 +55,16 @@ type Adapter struct {
 
 	// Presentation mode for country flags
 	flagMode country.Mode
+
+	// Cached sorted index and throttling
+	indexMu               sync.Mutex
+	lastIndexTime         time.Time
+	lastIndexRev          uint64
+	indexThrottleInterval time.Duration
+	cachedEntries         []store.CandidateIndexEntry
+	cachedFilterAll       []int
+	cachedFilterGem       []int
+	cachedFilterGen       []int
 }
 
 // New creates an unstarted Adapter.
@@ -78,6 +88,7 @@ func New(st *store.Store, bus *events.EventBus, ring *logging.RingLogHandler) *A
 		lastRevision:            initRev,
 		lastCompletedCycleCount: initCycleCount,
 		flagMode:                country.ModeAuto,
+		indexThrottleInterval:   time.Second,
 	}
 }
 
@@ -184,9 +195,9 @@ func (a *Adapter) reconcileCycleStateLocked() bool {
 		if stats.CycleCount > 0 {
 			completedCycleID := uint64(stats.CycleCount - 1)
 			var passed, failed, inconclusive int
-			for _, snap := range a.st.Snapshots() {
-				if lastSample, ok := snap.Record.History.Last(); ok && lastSample.CycleID == completedCycleID {
-					switch lastSample.Status {
+			for _, entry := range a.st.CandidateIndex() {
+				if entry.LastCycleID == completedCycleID {
+					switch entry.LatestStatus {
 					case store.StatusPassed:
 						passed++
 					case store.StatusFailed:
@@ -213,8 +224,11 @@ func (a *Adapter) reconcileCycleStateLocked() bool {
 }
 
 // CheckAndResetDirty returns true if state has been invalidated since last check,
-// checking both EventBus notifications and the authoritative Store revision.
+// checking EventBus notifications, Store revision increments, and overdue throttled index refreshes.
 func (a *Adapter) CheckAndResetDirty() bool {
+	a.indexMu.Lock()
+	defer a.indexMu.Unlock()
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -227,6 +241,20 @@ func (a *Adapter) CheckAndResetDirty() bool {
 		}
 		if a.reconcileCycleStateLocked() {
 			dirty = true
+		}
+
+		// Invariant: If candidate index is stale and the throttle has expired,
+		// the pending index rebuild is overdue and must trigger a refresh even
+		// if no new Store mutation occurred since the last tick.
+		throttle := a.indexThrottleInterval
+		if throttle < 0 {
+			throttle = 0
+		}
+		if a.cachedEntries != nil {
+			isStale := (a.lastIndexRev != currentRev || len(a.cachedEntries) != a.st.Stats().Total)
+			if isStale && (throttle == 0 || time.Since(a.lastIndexTime) >= throttle) {
+				dirty = true
+			}
 		}
 	}
 	return dirty
@@ -258,16 +286,16 @@ func (a *Adapter) Header() viewmodel.HeaderViewModel {
 	}
 
 	return viewmodel.HeaderViewModel{
-		CycleCount:        stats.CycleCount,
-		LastCycle:         stats.LastCycle,
-		CycleStatus:       cycleStatus,
-		ProgressCurrent:   progCurrent,
-		ProgressTotal:     progTotal,
-		TotalCandidates:   stats.Total,
-		PassedCount:       cyclePassed,
-		FailedCount:       cycleFailed,
-		InconclusiveCount: cycleIncon,
-		ServableCount:     stats.Servable,
+		CycleCount:           stats.CycleCount,
+		LastCycle:            stats.LastCycle,
+		CycleStatus:          cycleStatus,
+		ProgressCurrent:      progCurrent,
+		ProgressTotal:        progTotal,
+		TotalCandidates:      stats.Total,
+		PassedCount:          cyclePassed,
+		FailedCount:          cycleFailed,
+		InconclusiveCount:    cycleIncon,
+		ServableCount:        stats.Servable,
 		GenericServableCount: stats.GenericServable,
 	}
 }
@@ -280,16 +308,52 @@ func (a *Adapter) StoreStats() store.Stats {
 	return store.Stats{}
 }
 
-// CandidateRows queries the authoritative Store, applies the canonical candidate ranking
-// policy, assigns opaque presentation IDs, and returns a pre-sorted slice of CandidateRowViewModel.
-func (a *Adapter) CandidateRows(filter viewmodel.FilterMode) []viewmodel.CandidateRowViewModel {
+// rebuildIndexLocked refreshes the cached candidate index and partitions if necessary.
+// Must be called with a.indexMu locked.
+func (a *Adapter) rebuildIndexLocked(force bool) {
 	if a.st == nil {
-		return nil
+		a.cachedEntries = nil
+		a.cachedFilterAll = nil
+		a.cachedFilterGem = nil
+		a.cachedFilterGen = nil
+		a.mu.Lock()
+		a.idToLink = make(map[string]string)
+		a.linkToID = make(map[string]string)
+		a.mu.Unlock()
+		return
 	}
 
-	snaps := a.st.Snapshots()
+	currentRev := a.st.Revision()
+	stats := a.st.Stats()
+	now := time.Now()
+	throttle := a.indexThrottleInterval
+	if throttle < 0 {
+		throttle = 0
+	}
+	if !force && a.cachedEntries != nil && len(a.cachedEntries) == stats.Total {
+		if currentRev == a.lastIndexRev || (throttle > 0 && now.Sub(a.lastIndexTime) < throttle) {
+			return
+		}
+	}
 
-	// Deterministic Candidate Ordering Policy:
+	entries := a.st.CandidateIndex()
+
+	// Prune orphaned presentation IDs for candidates evicted from Store (P1 fix).
+	// Surviving candidates retain their stable opaque IDs; evicted candidates are removed.
+	activeLinks := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		activeLinks[e.CanonicalLink] = struct{}{}
+	}
+	a.mu.Lock()
+	for link, id := range a.linkToID {
+		if _, ok := activeLinks[link]; !ok {
+			delete(a.linkToID, link)
+			delete(a.idToLink, id)
+		}
+	}
+	a.mu.Unlock()
+
+	// Deterministic Candidate Ordering Policy (Ticket 25):
 	// 1. Tier 1: Gemini-servable candidates (Servable == true).
 	// 2. Tier 2: Generic-servable candidates (NetworkHealthy == true && Servable == false).
 	// 3. Tier 3: Unservable candidates.
@@ -297,35 +361,35 @@ func (a *Adapter) CandidateRows(filter viewmodel.FilterMode) []viewmodel.Candida
 	// 5. Reliability Score descending.
 	// 6. Effective latency ascending (LastPassedLatency, then TransportLatency).
 	// 7. Stable internal identity ascending as deterministic tie-breaker.
-	tier := func(snap store.CandidateSnapshot) int {
-		if snap.Servable {
+	tier := func(e store.CandidateIndexEntry) int {
+		if e.Servable {
 			return 1
 		}
-		if snap.NetworkHealthy {
+		if e.NetworkHealthy {
 			return 2
 		}
 		return 3
 	}
 
-	sort.Slice(snaps, func(i, j int) bool {
-		tI := tier(snaps[i])
-		tJ := tier(snaps[j])
+	sort.Slice(entries, func(i, j int) bool {
+		tI := tier(entries[i])
+		tJ := tier(entries[j])
 		if tI != tJ {
 			return tI < tJ
 		}
-		if snaps[i].Record.HasPassed != snaps[j].Record.HasPassed {
-			return snaps[i].Record.HasPassed
+		if entries[i].HasPassed != entries[j].HasPassed {
+			return entries[i].HasPassed
 		}
-		if snaps[i].Record.Score != snaps[j].Record.Score {
-			return snaps[i].Record.Score > snaps[j].Record.Score
+		if entries[i].Score != entries[j].Score {
+			return entries[i].Score > entries[j].Score
 		}
-		latI := snaps[i].Record.LastPassedLatency
-		if latI == 0 && snaps[i].TransportLatency > 0 {
-			latI = snaps[i].TransportLatency
+		latI := entries[i].LastPassedLatency
+		if latI == 0 && entries[i].TransportLatency > 0 {
+			latI = entries[i].TransportLatency
 		}
-		latJ := snaps[j].Record.LastPassedLatency
-		if latJ == 0 && snaps[j].TransportLatency > 0 {
-			latJ = snaps[j].TransportLatency
+		latJ := entries[j].LastPassedLatency
+		if latJ == 0 && entries[j].TransportLatency > 0 {
+			latJ = entries[j].TransportLatency
 		}
 		if latI != latJ {
 			if latI == 0 {
@@ -336,110 +400,152 @@ func (a *Adapter) CandidateRows(filter viewmodel.FilterMode) []viewmodel.Candida
 			}
 			return latI < latJ
 		}
-		return snaps[i].Record.CanonicalLink < snaps[j].Record.CanonicalLink
+		return entries[i].CanonicalLink < entries[j].CanonicalLink
 	})
+
+	allIndices := make([]int, len(entries))
+	gemIndices := make([]int, 0, len(entries))
+	genIndices := make([]int, 0, len(entries))
+
+	for i, e := range entries {
+		allIndices[i] = i
+		if e.Servable {
+			gemIndices = append(gemIndices, i)
+		}
+		if e.NetworkHealthy {
+			genIndices = append(genIndices, i)
+		}
+	}
+
+	a.cachedEntries = entries
+	a.cachedFilterAll = allIndices
+	a.cachedFilterGem = gemIndices
+	a.cachedFilterGen = genIndices
+	a.lastIndexTime = now
+	a.lastIndexRev = currentRev
+}
+
+func (a *Adapter) filteredIndicesLocked(filter viewmodel.FilterMode) []int {
+	switch filter {
+	case viewmodel.FilterGemini:
+		return a.cachedFilterGem
+	case viewmodel.FilterGeneric:
+		return a.cachedFilterGen
+	default:
+		return a.cachedFilterAll
+	}
+}
+
+func (a *Adapter) materializeRowViewModelLocked(entry store.CandidateIndexEntry) viewmodel.CandidateRowViewModel {
+	canonical := entry.CanonicalLink
+	opaqueID, exists := a.linkToID[canonical]
+	if !exists {
+		a.idCounter++
+		opaqueID = fmt.Sprintf("cand-%d", a.idCounter)
+		a.linkToID[canonical] = opaqueID
+		a.idToLink[opaqueID] = canonical
+	}
+
+	activeLink := entry.ActiveLink
+	if activeLink == "" {
+		activeLink = canonical
+	}
+
+	proto := ExtractProtocol(activeLink)
+	endpoint := ExtractEndpoint(activeLink)
+	remark := country.FormatRemark(ExtractRemark(activeLink), a.flagMode)
+
+	status := "PEND"
+	if entry.LatestStatus != "" {
+		switch entry.LatestStatus {
+		case store.StatusPassed:
+			status = "PASS"
+		case store.StatusFailed:
+			if entry.TransportOK || (entry.NetworkHealthy && entry.LatestCategory.IsTargetSpecific()) {
+				switch entry.LatestCategory {
+				case store.ErrRegionBlocked:
+					status = "BLOCKED"
+				case store.ErrTargetDenied:
+					status = "DENIED"
+				default:
+					status = "FAIL"
+				}
+			} else {
+				status = "FAIL"
+			}
+		case store.StatusInconclusive:
+			status = "INCON"
+		}
+	}
+
+	scoreStr := "---"
+	if entry.HistoryCount > 0 {
+		scoreStr = fmt.Sprintf("%.2f", entry.Score)
+	}
+
+	latStr := "---"
+	if entry.HasPassed && entry.LastPassedLatency > 0 {
+		latStr = entry.LastPassedLatency.Round(time.Millisecond).String()
+	}
+
+	glyphs := ""
+	if a.st != nil {
+		if rec, ok := a.st.GetRecord(canonical); ok && rec != nil {
+			glyphs = FormatHistoryGlyphs(rec.History.ChronologicalSamples(), rec.History.Capacity)
+		}
+	}
+
+	return viewmodel.CandidateRowViewModel{
+		ID:                     opaqueID,
+		Protocol:               proto,
+		Endpoint:               endpoint,
+		Remark:                 remark,
+		Status:                 status,
+		ScoreFormatted:         scoreStr,
+		LatencyFormatted:       latStr,
+		HistoryGlyphs:          glyphs,
+		Servable:               entry.Servable,
+		NetworkHealthy:         entry.NetworkHealthy,
+		TransportOK:            entry.TransportOK,
+		TransportEvidenceKnown: entry.TransportEvidenceKnown,
+		TransportLatency:       entry.TransportLatency,
+		HasPassed:              entry.HasPassed,
+	}
+}
+
+// CandidateRowsWindow materializes CandidateRowViewModels ONLY for the specified slice window.
+func (a *Adapter) CandidateRowsWindow(filter viewmodel.FilterMode, offset, limit int) []viewmodel.CandidateRowViewModel {
+	a.indexMu.Lock()
+	defer a.indexMu.Unlock()
+
+	a.rebuildIndexLocked(false)
+	indices := a.filteredIndicesLocked(filter)
+	total := len(indices)
+
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	if offset >= end {
+		return nil
+	}
+
+	window := indices[offset:end]
+	out := make([]viewmodel.CandidateRowViewModel, 0, len(window))
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Prune unreferenced candidate mappings to bound memory strictly to current snapshot
-	newLinkToID := make(map[string]string, len(snaps))
-	newIDToLink := make(map[string]string, len(snaps))
-	for _, snap := range snaps {
-		canonical := snap.Record.CanonicalLink
-		opaqueID, exists := a.linkToID[canonical]
-		if !exists {
-			a.idCounter++
-			opaqueID = fmt.Sprintf("cand-%d", a.idCounter)
-		}
-		newLinkToID[canonical] = opaqueID
-		newIDToLink[opaqueID] = canonical
+	for _, idx := range window {
+		entry := a.cachedEntries[idx]
+		out = append(out, a.materializeRowViewModelLocked(entry))
 	}
-	a.linkToID = newLinkToID
-	a.idToLink = newIDToLink
-
-	out := make([]viewmodel.CandidateRowViewModel, 0, len(snaps))
-	for _, snap := range snaps {
-		switch filter {
-		case viewmodel.FilterGemini:
-			if !snap.Servable {
-				continue
-			}
-		case viewmodel.FilterGeneric:
-			if !snap.NetworkHealthy {
-				continue
-			}
-		case viewmodel.FilterAll:
-			// include all
-		}
-
-		canonical := snap.Record.CanonicalLink
-		opaqueID := a.linkToID[canonical]
-
-		activeLink := snap.Record.ActiveLink
-		if activeLink == "" {
-			activeLink = canonical
-		}
-
-		proto := ExtractProtocol(activeLink)
-		endpoint := ExtractEndpoint(activeLink)
-		remark := country.FormatRemark(ExtractRemark(activeLink), a.flagMode)
-
-		status := "PEND"
-		if snap.Record.Latest.Status != "" {
-			switch snap.Record.Latest.Status {
-			case store.StatusPassed:
-				status = "PASS"
-			case store.StatusFailed:
-				if snap.TransportOK || (snap.NetworkHealthy && snap.Record.Latest.Category.IsTargetSpecific()) {
-					switch snap.Record.Latest.Category {
-					case store.ErrRegionBlocked:
-						status = "BLOCKED"
-					case store.ErrTargetDenied:
-						status = "DENIED"
-					default:
-						status = "FAIL"
-					}
-				} else {
-					status = "FAIL"
-				}
-			case store.StatusInconclusive:
-				status = "INCON"
-			}
-		}
-
-		scoreStr := "---"
-		if snap.Record.History.Count > 0 {
-			scoreStr = fmt.Sprintf("%.2f", snap.Record.Score)
-		}
-
-		// Aligned with Store reliability contract:
-		// Only display LastPassedLatency for proven candidates (HasPassed == true).
-		latStr := "---"
-		if snap.Record.HasPassed && snap.Record.LastPassedLatency > 0 {
-			latStr = snap.Record.LastPassedLatency.Round(time.Millisecond).String()
-		}
-
-		glyphs := FormatHistoryGlyphs(snap.Record.History.ChronologicalSamples(), snap.Record.History.Capacity)
-
-		out = append(out, viewmodel.CandidateRowViewModel{
-			ID:                     opaqueID,
-			Protocol:               proto,
-			Endpoint:               endpoint,
-			Remark:                 remark,
-			Status:                 status,
-			ScoreFormatted:         scoreStr,
-			LatencyFormatted:       latStr,
-			HistoryGlyphs:          glyphs,
-			Servable:               snap.Servable,
-			NetworkHealthy:         snap.NetworkHealthy,
-			TransportOK:            snap.TransportOK,
-			TransportEvidenceKnown: snap.TransportEvidenceKnown,
-			TransportLatency:       snap.TransportLatency,
-			HasPassed:              snap.Record.HasPassed,
-		})
-	}
-
 	return out
 }
 
@@ -648,13 +754,25 @@ func (a *Adapter) CycleMinLogLevel() slog.Level {
 	return a.logLevel
 }
 
-// Snapshot returns a SnapshotViewModel assembled from authoritative reads (Header, CandidateRows, and Logs).
-func (a *Adapter) Snapshot(filter viewmodel.FilterMode) viewmodel.SnapshotViewModel {
+func (a *Adapter) buildSnapshot(filter viewmodel.FilterMode, forceIndex bool) viewmodel.SnapshotViewModel {
+	a.indexMu.Lock()
+	a.rebuildIndexLocked(forceIndex)
+	total := len(a.filteredIndicesLocked(filter))
+	a.indexMu.Unlock()
+
+	rows := a.CandidateRowsWindow(filter, 0, 50)
+
 	return viewmodel.SnapshotViewModel{
-		Header: a.Header(),
-		Rows:   a.CandidateRows(filter),
-		Logs:   a.Logs(),
+		Header:    a.Header(),
+		Rows:      rows,
+		TotalRows: total,
+		Logs:      a.Logs(),
 	}
+}
+
+// Snapshot returns a SnapshotViewModel assembled from authoritative reads (Header, windowed Rows, and Logs).
+func (a *Adapter) Snapshot(filter viewmodel.FilterMode) viewmodel.SnapshotViewModel {
+	return a.buildSnapshot(filter, true)
 }
 
 // PollSnapshot returns updated presentation viewmodels if state has been invalidated.
@@ -663,7 +781,7 @@ func (a *Adapter) PollSnapshot(filter viewmodel.FilterMode) (viewmodel.SnapshotV
 	if !a.CheckAndResetDirty() {
 		return viewmodel.SnapshotViewModel{}, false
 	}
-	return a.Snapshot(filter), true
+	return a.buildSnapshot(filter, false), true
 }
 
 // CycleLogLevel cycles the minimum log level and returns the updated LogViewModel and level name.

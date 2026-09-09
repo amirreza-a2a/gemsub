@@ -979,6 +979,69 @@ func (s *Store) Snapshots() []CandidateSnapshot {
 	return out
 }
 
+// CandidateIndexEntry represents lightweight, sortable presentation information for a single candidate.
+// It exposes only the fields required for presentation ranking, filtering, and cycle reconciliation,
+// without deep-copying CandidateRecord or BoundedHistory.
+type CandidateIndexEntry struct {
+	CanonicalLink          string
+	ActiveLink             string
+	Servable               bool
+	NetworkHealthy         bool
+	HasPassed              bool
+	Score                  float64
+	LastPassedLatency      time.Duration
+	TransportLatency       time.Duration
+	TransportEvidenceKnown bool
+	TransportOK            bool
+	LatestStatus           Status
+	LatestCategory         ErrorCategory
+	HistoryCount           int
+	LastCycleID            uint64
+}
+
+// CandidateIndex returns a lightweight slice of presentation index entries for all candidates.
+// It avoids deep-copying CandidateRecord or BoundedHistory.
+func (s *Store) CandidateIndex() []CandidateIndexEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]CandidateIndexEntry, 0, len(s.records))
+	for _, rec := range s.records {
+		servable, _ := s.servabilityGateLocked(rec)
+		var lastCycleID uint64
+		var lastStatus Status
+		if lastSample, ok := rec.History.Last(); ok {
+			lastCycleID = lastSample.CycleID
+			lastStatus = lastSample.Status
+		} else if rec.Latest.Status != "" {
+			lastStatus = rec.Latest.Status
+		}
+
+		activeLink := rec.ActiveLink
+		if activeLink == "" {
+			activeLink = rec.CanonicalLink
+		}
+
+		out = append(out, CandidateIndexEntry{
+			CanonicalLink:          rec.CanonicalLink,
+			ActiveLink:             activeLink,
+			Servable:               servable,
+			NetworkHealthy:         s.isNetworkHealthyRecordLocked(rec),
+			HasPassed:              rec.HasPassed,
+			Score:                  rec.Score,
+			LastPassedLatency:      rec.LastPassedLatency,
+			TransportLatency:       rec.Latest.TransportLatency,
+			TransportEvidenceKnown: rec.Latest.TransportEvidenceKnown,
+			TransportOK:            rec.Latest.TransportOK,
+			LatestStatus:           lastStatus,
+			LatestCategory:         rec.Latest.Category,
+			HistoryCount:           rec.History.Count,
+			LastCycleID:            lastCycleID,
+		})
+	}
+	return out
+}
+
 // Revision returns the monotonic generation counter of the store,
 // incremented on every candidate state transition or cycle boundary.
 func (s *Store) Revision() uint64 {

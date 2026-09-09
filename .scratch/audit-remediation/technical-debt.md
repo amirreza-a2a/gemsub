@@ -9,11 +9,11 @@ The canonical local register for non-blocking findings, deferred hardening items
 | Classification | Count | Description |
 |:---|:---:|:---|
 | **Active Technical Debt (P1)** | 0 | Material architectural, product, or reliability issues requiring planned engineering tickets. |
-| **Future Hardening & Observability (P2)** | 4 | Non-blocking enhancements to metrics, operational logging, scheduling fairness, or optional configuration. |
+| **Future Hardening & Observability (P2)** | 3 | Non-blocking enhancements to metrics, operational logging, scheduling fairness, or optional configuration. |
 | **Code Quality & Test Cleanup (P2)** | 7 | Maintainability, naming clarity, deduplication, and test fixture consolidation. |
 | **External & Upstream Tracking** | 1 | Issues rooted in external dependencies tracked across upstream releases. |
-| **Promoted / Resolved** | 3 | Items promoted to active GitHub issues or resolved in implementation commits. |
-| **Total Registered Items** | **14** | |
+| **Promoted / Resolved** | 5 | Items promoted to active GitHub issues or resolved in implementation commits. |
+| **Total Registered Items** | **16** | |
 
 ---
 
@@ -22,7 +22,7 @@ The canonical local register for non-blocking findings, deferred hardening items
 | ID | Title | Priority | Area | Origin | Status |
 |:---|:---|:---:|:---|:---|:---:|
 | [TD-001](#td-001--publisher-atomic-publication) | Publisher atomic publication | P1 | Publisher | Ticket 23 Review / Post-Ticket-23 Audit | Resolved (Ticket 26, e02c9c0) |
-| [TD-002](#td-002--scheduler-candidate-rotation-under-probelimit) | Scheduler candidate rotation under ProbeLimit | P2 | Scheduler / Scheduling Fairness | Post-Ticket-23 Audit / TD-002 Audit | Open / Deferred |
+| [TD-002](#td-002--scheduler-candidate-rotation-under-probelimit) | Scheduler candidate rotation under ProbeLimit | P1 | Scheduler / Scheduling Fairness | Post-Ticket-23 Audit / Post-Ticket-26 Audit | Promoted (Ticket 29, #7) |
 | [TD-003](#td-003--tui-dual-projection-observability) | TUI dual-projection observability | P1 | TUI | Post-Ticket-23 Audit | Resolved (Ticket 25, 33329c0) |
 | [TD-004](#td-004--scheduler-generic-servability-metrics) | Scheduler generic servability metrics | P2 | Scheduler / Observability | Post-Ticket-23 Audit | Open |
 | [TD-005](#td-005--serveconfig-projection-alignment) | ServeConfig projection alignment | P2 | Configuration / Subserver | Post-Ticket-23 Audit | Open / Deferred |
@@ -35,6 +35,8 @@ The canonical local register for non-blocking findings, deferred hardening items
 | [TD-012](#td-012--publisher-atomicwritefile-api-visibility) | Publisher AtomicWriteFile API visibility | P2 | Publisher / Code Quality | Ticket 26 independent code review | Open |
 | [TD-013](#td-013--publisher-filesystem-failure-injection-api-visibility) | Publisher filesystem failure-injection API visibility | P2 | Publisher / Testability | Ticket 26 independent code review | Open |
 | [TD-014](#td-014--publisher-owned-path-slice-deduplication) | Publisher owned-path slice deduplication | P2 | Publisher / Code Quality | Ticket 26 independent code review | Open |
+| [TD-015](#td-015--tui-candidate-table-rendering-and-full-store-snapshot-thrashing) | TUI candidate table rendering and full-store snapshot thrashing | P0 | TUI / Performance | Post-Ticket-26 Investigation | Promoted (Ticket 27, #5) |
+| [TD-016](#td-016--state-persistence-compaction-and-compression) | State persistence compaction and compression | P1 | Store / Persistence / Performance | Post-Ticket-26 Investigation | Promoted (Ticket 28, #6) |
 
 ---
 
@@ -88,18 +90,65 @@ The canonical local register for non-blocking findings, deferred hardening items
 
 ---
 
-## 4. Future Hardening & Observability (P2)
+### TD-015 — TUI candidate table rendering and full-store snapshot thrashing
+
+- **ID:** `TD-015`
+- **Title:** TUI candidate table rendering and full-store snapshot thrashing
+- **Priority:** P0
+- **Area:** TUI / Performance
+- **Status:** Promoted
+- **Promoted to Ticket:** Ticket 27
+- **GitHub Issue:** #5
+- **Date Promoted:** 2026-09-09
+- **Origin:** Post-Ticket-26 architecture and performance investigation
+- **Problem:**
+  The TUI requests full `Store` snapshots at approximately 10 Hz via `PollSnapshot` in `internal/tui/model.go`. `Store.Snapshots()` clones and sorts the entire candidate population (~56,799 candidates) on every tick, causing ~48.4 ms CPU consumption, ~80.17 MB heap allocations per tick, and ~800 MB/s garbage generation.
+- **Impact:**
+  Severe GC pressure, frame drops, high CPU load (50% of a core), and unresponsive UI.
+- **Proposed Future Remediation:**
+  Virtualize candidate table rendering so ViewModels are materialized only for the visible viewport rows (~20 rows), decouple header progress updates from candidate table sorting, and throttle full sorting to 1 Hz.
+- **Dependencies:** `internal/tui`, `internal/store` (read-only presentation index)
+- **Promotion Criteria:**
+  Promoted immediately to Ticket 27 (P0).
+
+---
+
+### TD-016 — State persistence compaction and compression
+
+- **ID:** `TD-016`
+- **Title:** State persistence compaction and compression
+- **Priority:** P1
+- **Area:** Store / Persistence / Performance
+- **Status:** Promoted
+- **Promoted to Ticket:** Ticket 28
+- **GitHub Issue:** #6
+- **Date Promoted:** 2026-09-09
+- **Origin:** Post-Ticket-26 architecture and performance investigation
+- **Problem:**
+  `gemsub_state.json` reaches 171.11 MB in production, containing ~57.22 MB of indentation whitespace, ~45.25 MB of empty circular buffer dummy sample padding, ~15 MB duplicated URLs, and ~10 MB redundant derived state. Saving causes a 610 MB allocation spike and 1.4s write pause; loading takes 1.85s and 473 MB allocations.
+- **Impact:**
+  Slow daemon startup, memory allocation spikes, disk write amplification, and potential I/O stalls during cycle completion or shutdown.
+- **Proposed Future Remediation:**
+  Omit uninitialized dummy samples from serialization, omit duplicate link strings, replace `MarshalIndent` with compact JSON, and apply transparent gzip compression via `compress/gzip`.
+- **Dependencies:** `internal/store`
+- **Promotion Criteria:**
+  Promoted immediately to Ticket 28 (P1).
+
+---
 
 ### TD-002 — Scheduler candidate rotation under ProbeLimit
 
 - **ID:** `TD-002`
 - **Title:** Scheduler candidate rotation under ProbeLimit
-- **Priority:** P2
+- **Priority:** P1
 - **Area:** Scheduler / Scheduling Fairness
-- **Status:** Open / Deferred
-- **Origin:** Post-Ticket-23 Architecture Audit / TD-002 implementation audit
+- **Status:** Promoted
+- **Promoted to Ticket:** Ticket 29
+- **GitHub Issue:** #7
+- **Date Promoted:** 2026-09-09
+- **Origin:** Post-Ticket-23 Architecture Audit / Post-Ticket-26 Performance Investigation
 - **Audit Disposition:**
-  Original P1 correctness hypothesis refuted by source inspection and existing `TestScoring_CycleAbortAndSkippedProbes`. Reclassified to P2 scheduling fairness enhancement.
+  Re-promoted from P2 to P1 based on real-world 56,799-candidate deployment evidence where unrotated bounded probing starves 98% of the candidate population and full un-bounded probing takes 4+ hours per cycle.
 - **Problem:**
   `SchedulerConfig.ProbeLimit` intentionally limits how many candidates are probed within a cycle. `Store.StartCycle` receives the complete upstream source link set and correctly treats unprobed-but-present candidates as present (`skipped != failed, skipped != absent`). Therefore, Store absence accounting must remain unchanged. The remaining limitation is that `internal/scheduler/scheduler.go` currently executes static slice head truncation (`candidates[:s.cfg.ProbeLimit]`), meaning candidates beyond `ProbeLimit` can remain unprobed indefinitely when the same ordered source pool is repeatedly fetched.
 - **Impact:**
@@ -111,7 +160,11 @@ The canonical local register for non-blocking findings, deferred hardening items
   - Candidate rotation is a fairness/product enhancement, not a Store correctness fix.
 - **Dependencies:** `internal/scheduler`
 - **Promotion Criteria:**
-  Promote to a dedicated implementation ticket only when bounded probing is an intentional operational mode and fair verification of candidate pools larger than `ProbeLimit` becomes a product requirement.
+  Promoted to Ticket 29 (P1) for real-world candidate scale.
+
+---
+
+## 4. Future Hardening & Observability (P2)
 
 ---
 
@@ -372,6 +425,24 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **GitHub Issue:** #3
 - **Commit:** `33329c08334a2bbf6c1212b11eeac4ef8bd02006`
 - **Date Resolved:** 2026-09-09
+
+### TD-015 — TUI candidate table rendering and full-store snapshot thrashing
+- **Status:** Promoted
+- **Promoted to Ticket:** Ticket 27
+- **GitHub Issue:** #5
+- **Date Promoted:** 2026-09-09
+
+### TD-016 — State persistence compaction and compression
+- **Status:** Promoted
+- **Promoted to Ticket:** Ticket 28
+- **GitHub Issue:** #6
+- **Date Promoted:** 2026-09-09
+
+### TD-002 — Scheduler candidate rotation under ProbeLimit
+- **Status:** Promoted
+- **Promoted to Ticket:** Ticket 29
+- **GitHub Issue:** #7
+- **Date Promoted:** 2026-09-09
 
 ### Record Template for Promoted Items
 
