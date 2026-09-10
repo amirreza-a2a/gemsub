@@ -1568,3 +1568,80 @@ func TestStore_Count(t *testing.T) {
 		t.Fatalf("Count() (%d) != Stats().Total (%d) after eviction", got, total)
 	}
 }
+
+func TestStore_CycleCount(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "cycle_count_state.json")
+	st := store.New(stateFile, 2)
+
+	// 1. Initial state
+	if got := st.CycleCount(); got != 0 {
+		t.Fatalf("expected initial CycleCount 0, got %d", got)
+	}
+	if got, want := st.CycleCount(), st.Stats().CycleCount; got != want {
+		t.Fatalf("CycleCount() (%d) != Stats().CycleCount (%d)", got, want)
+	}
+
+	// 2. Increment on FinishCycle
+	st.StartCycle(map[string]struct{}{})
+	st.FinishCycle()
+
+	if got := st.CycleCount(); got != 1 {
+		t.Fatalf("expected CycleCount 1 after FinishCycle, got %d", got)
+	}
+	if got, want := st.CycleCount(), st.Stats().CycleCount; got != want {
+		t.Fatalf("CycleCount() (%d) != Stats().CycleCount (%d)", got, want)
+	}
+
+	// 3. Increment again
+	st.StartCycle(map[string]struct{}{})
+	st.FinishCycle()
+
+	if got := st.CycleCount(); got != 2 {
+		t.Fatalf("expected CycleCount 2 after second FinishCycle, got %d", got)
+	}
+
+	// 4. Persistence round-trip retains CycleCount
+	if err := st.Save(); err != nil {
+		t.Fatalf("failed to save store: %v", err)
+	}
+
+	stLoaded := store.New(stateFile, 2)
+	if err := stLoaded.Load(); err != nil {
+		t.Fatalf("failed to load store: %v", err)
+	}
+	if got := stLoaded.CycleCount(); got != 2 {
+		t.Fatalf("expected loaded CycleCount 2, got %d", got)
+	}
+}
+
+func TestStore_LastCycle(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "last_cycle_state.json")
+	st := store.New(stateFile, 2)
+
+	// 1. Initial state: zero time
+	if got := st.LastCycle(); !got.IsZero() {
+		t.Fatalf("expected initial LastCycle to be zero time, got %v", got)
+	}
+	if got, want := st.LastCycle(), st.Stats().LastCycle; !got.Equal(want) {
+		t.Fatalf("LastCycle() (%v) != Stats().LastCycle (%v)", got, want)
+	}
+
+	// 2. Updated on FinishCycle
+	before := time.Now().Add(-time.Second)
+	st.StartCycle(map[string]struct{}{})
+	st.FinishCycle()
+	after := time.Now().Add(time.Second)
+
+	got := st.LastCycle()
+	if got.IsZero() {
+		t.Fatal("expected LastCycle to be set after FinishCycle")
+	}
+	if got.Before(before) || got.After(after) {
+		t.Fatalf("LastCycle (%v) outside expected range [%v, %v]", got, before, after)
+	}
+	if !got.Equal(st.Stats().LastCycle) {
+		t.Fatalf("LastCycle() (%v) != Stats().LastCycle (%v)", got, st.Stats().LastCycle)
+	}
+}

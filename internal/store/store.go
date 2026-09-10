@@ -2238,3 +2238,17 @@ func (s *Store) Count() int {
 	defer s.mu.RUnlock()
 	return len(s.records)
 }
+
+// CycleCount returns the completed cycle count in O(1) time under RLock.
+func (s *Store) CycleCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cycleCount
+}
+
+// LastCycle returns the timestamp of the last completed cycle in O(1) time under RLock.
+func (s *Store) LastCycle() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastCycle
+}

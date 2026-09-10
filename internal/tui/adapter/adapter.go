@@ -73,7 +73,7 @@ func New(st *store.Store, bus *events.EventBus, ring *logging.RingLogHandler) *A
 	var initCycleCount int
 	if st != nil {
 		initRev = st.Revision()
-		initCycleCount = st.Stats().CycleCount
+		initCycleCount = st.CycleCount()
 	}
 	return &Adapter{
 		st:                      st,
@@ -174,7 +174,7 @@ func (a *Adapter) handleEvent(evt any) {
 		a.cycleFailed = e.Failed
 		a.cycleInconclusive = e.Inconclusive
 		if a.st != nil {
-			a.lastCompletedCycleCount = a.st.Stats().CycleCount
+			a.lastCompletedCycleCount = a.st.CycleCount()
 		}
 		atomic.StoreInt32(&a.dirty, 1)
 	}
@@ -184,43 +184,43 @@ func (a *Adapter) handleEvent(evt any) {
 // was lost, and reconciles cycle status and metrics from authoritative Store state.
 // Caller must hold a.mu Lock.
 func (a *Adapter) reconcileCycleStateLocked() bool {
-	if a.st == nil {
+	if a.st == nil || a.cycleStatus != viewmodel.CycleRunning {
 		return false
 	}
-	stats := a.st.Stats()
-	if a.cycleStatus == viewmodel.CycleRunning && stats.CycleCount > a.lastCompletedCycleCount {
-		a.cycleStatus = viewmodel.CycleIdle
-		a.lastCompletedCycleCount = stats.CycleCount
+	cycleCount := a.st.CycleCount()
+	if cycleCount <= a.lastCompletedCycleCount {
+		return false
+	}
+	a.cycleStatus = viewmodel.CycleIdle
+	a.lastCompletedCycleCount = cycleCount
 
-		if stats.CycleCount > 0 {
-			completedCycleID := uint64(stats.CycleCount - 1)
-			var passed, failed, inconclusive int
-			for _, entry := range a.st.CandidateIndex() {
-				if entry.LastCycleID == completedCycleID {
-					switch entry.LatestStatus {
-					case store.StatusPassed:
-						passed++
-					case store.StatusFailed:
-						failed++
-					case store.StatusInconclusive:
-						inconclusive++
-					}
-				}
-			}
-			totalObs := passed + failed + inconclusive
-			if totalObs > 0 {
-				a.cyclePassed = passed
-				a.cycleFailed = failed
-				a.cycleInconclusive = inconclusive
-				a.progressCurrent = totalObs
-				if a.progressTotal < totalObs {
-					a.progressTotal = totalObs
+	if cycleCount > 0 {
+		completedCycleID := uint64(cycleCount - 1)
+		var passed, failed, inconclusive int
+		for _, entry := range a.st.CandidateIndex() {
+			if entry.LastCycleID == completedCycleID {
+				switch entry.LatestStatus {
+				case store.StatusPassed:
+					passed++
+				case store.StatusFailed:
+					failed++
+				case store.StatusInconclusive:
+					inconclusive++
 				}
 			}
 		}
-		return true
+		totalObs := passed + failed + inconclusive
+		if totalObs > 0 {
+			a.cyclePassed = passed
+			a.cycleFailed = failed
+			a.cycleInconclusive = inconclusive
+			a.progressCurrent = totalObs
+			if a.progressTotal < totalObs {
+				a.progressTotal = totalObs
+			}
+		}
 	}
-	return false
+	return true
 }
 
 // CheckAndResetDirty returns true if state has been invalidated since last check,
@@ -265,13 +265,16 @@ func (a *Adapter) MarkDirty() {
 	atomic.StoreInt32(&a.dirty, 1)
 }
 
-// Header returns the current HeaderViewModel constructed from authoritative Store.Stats()
+// Header returns the current HeaderViewModel constructed from Store metadata
 // and ephemeral cycle lifecycle metrics. Pass/Fail/Incon counts represent the active cycle only.
 func (a *Adapter) Header() viewmodel.HeaderViewModel {
+	a.indexMu.Lock()
+	a.rebuildIndexLocked(false)
+	servableCount := len(a.cachedFilterGem)
+	genericServableCount := len(a.cachedFilterGen)
+	a.indexMu.Unlock()
+
 	a.mu.Lock()
-	if a.st != nil {
-		a.reconcileCycleStateLocked()
-	}
 	cycleStatus := a.cycleStatus
 	progCurrent := a.progressCurrent
 	progTotal := a.progressTotal
@@ -280,23 +283,27 @@ func (a *Adapter) Header() viewmodel.HeaderViewModel {
 	cycleIncon := a.cycleInconclusive
 	a.mu.Unlock()
 
-	var stats store.Stats
+	var totalCandidates int
+	var cycleCount int
+	var lastCycle time.Time
 	if a.st != nil {
-		stats = a.st.Stats()
+		totalCandidates = a.st.Count()
+		cycleCount = a.st.CycleCount()
+		lastCycle = a.st.LastCycle()
 	}
 
 	return viewmodel.HeaderViewModel{
-		CycleCount:           stats.CycleCount,
-		LastCycle:            stats.LastCycle,
+		CycleCount:           cycleCount,
+		LastCycle:            lastCycle,
 		CycleStatus:          cycleStatus,
 		ProgressCurrent:      progCurrent,
 		ProgressTotal:        progTotal,
-		TotalCandidates:      stats.Total,
+		TotalCandidates:      totalCandidates,
 		PassedCount:          cyclePassed,
 		FailedCount:          cycleFailed,
 		InconclusiveCount:    cycleIncon,
-		ServableCount:        stats.Servable,
-		GenericServableCount: stats.GenericServable,
+		ServableCount:        servableCount,
+		GenericServableCount: genericServableCount,
 	}
 }
 

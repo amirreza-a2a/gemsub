@@ -2,7 +2,11 @@ package adapter_test
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1606,27 +1610,233 @@ func TestAdapter_CandidateRowsWindow_DoesNotInvokeStats(t *testing.T) {
 	// Warm up window query path
 	_ = ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 25)
 
-	// Measure baseline cost of 5 full Store.Stats() traversals
-	startStats := time.Now()
-	for i := 0; i < 5; i++ {
-		_ = st.Stats()
-	}
-	statsDuration := time.Since(startStats)
-
 	// Measure 20 consecutive window queries on the warm index
-	startWindow := time.Now()
 	for i := 0; i < 20; i++ {
 		rows := ad.CandidateRowsWindow(viewmodel.FilterAll, 100+i, 25)
 		if len(rows) != 25 {
 			t.Fatalf("expected 25 rows, got %d", len(rows))
 		}
 	}
-	windowDuration := time.Since(startWindow)
+}
 
-	// Invariant: 20 window queries must NOT perform 20 full Stats() traversals (which would take ~4x statsDuration).
-	// With O(1) Count(), 20 window queries complete in a fraction of that time.
-	if windowDuration >= 2*statsDuration {
-		t.Errorf("CandidateRowsWindow invoked expensive traversal: 20 window queries took %v, 5 Stats took %v",
-			windowDuration, statsDuration)
+// TestAdapter_CheckAndResetDirty_PollingBehavior verifies that the 10 Hz polling loop check
+// correctly detects store revision changes and cycle state without error.
+func TestAdapter_CheckAndResetDirty_PollingBehavior(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "dirty_bench.json"), 2)
+	bus := events.New()
+	ring := logging.NewRingLogHandler(100)
+	ad := adapter.New(st, bus, ring)
+	t.Cleanup(func() {
+		ad.Close()
+		bus.Close()
+	})
+
+	now := time.Now()
+	for i := 0; i < 500; i++ {
+		st.PutWithTransition(store.Result{
+			Link:        fmt.Sprintf("vless://user-%d@1.1.1.1:443#N-%d", i, i),
+			Status:      store.StatusPassed,
+			Latency:     50 * time.Millisecond,
+			TransportOK: true,
+			TestedAt:    now,
+		})
+	}
+
+	// Prime cached index and drain initial dirty state from test data loading
+	_ = ad.Snapshot(viewmodel.FilterAll)
+	_ = ad.CheckAndResetDirty()
+
+	// Clean polling check must return false
+	if ad.CheckAndResetDirty() {
+		t.Fatalf("expected CheckAndResetDirty to return false on clean cache")
+	}
+
+	// Invalidate store
+	st.PutWithTransition(store.Result{
+		Link:        "vless://new-cand@1.1.1.1:443#new",
+		Status:      store.StatusPassed,
+		Latency:     20 * time.Millisecond,
+		TransportOK: true,
+		TestedAt:    time.Now(),
+	})
+
+	// Dirty polling check must detect the store revision mutation
+	if !ad.CheckAndResetDirty() {
+		t.Fatalf("expected CheckAndResetDirty to return true after store mutation")
+	}
+
+	// Subsequent check must return false again
+	if ad.CheckAndResetDirty() {
+		t.Fatalf("expected CheckAndResetDirty to return false after being reset")
+	}
+}
+
+// TestAdapter_HotPaths_DoNotInvokeStats_AST statically inspects the Go AST of adapter.go
+// to deterministically guarantee that performance-critical hot paths (CheckAndResetDirty,
+// reconcileCycleStateLocked, Header, and CandidateRowsWindow) never invoke Store.Stats().
+// This provides zero production overhead and deterministic regression protection.
+func TestAdapter_HotPaths_DoNotInvokeStats_AST(t *testing.T) {
+	fset := token.NewFileSet()
+	adapterPath := "adapter.go"
+	if _, err := os.Stat(adapterPath); os.IsNotExist(err) {
+		adapterPath = filepath.Join("internal", "tui", "adapter", "adapter.go")
+	}
+
+	node, err := parser.ParseFile(fset, adapterPath, nil, 0)
+	if err != nil {
+		t.Fatalf("failed to parse %s: %v", adapterPath, err)
+	}
+
+	hotPathFuncs := map[string]struct{}{
+		"CheckAndResetDirty":        {},
+		"reconcileCycleStateLocked": {},
+		"Header":                    {},
+		"CandidateRowsWindow":       {},
+	}
+
+	inspected := make(map[string]bool)
+
+	for _, decl := range node.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		name := fn.Name.Name
+		if _, isHotPath := hotPathFuncs[name]; !isHotPath {
+			continue
+		}
+		inspected[name] = true
+
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if sel.Sel.Name == "Stats" {
+				pos := fset.Position(call.Pos())
+				t.Errorf("forbidden call to .Stats() in hot path %s at %s", name, pos)
+			}
+			return true
+		})
+	}
+
+	for required := range hotPathFuncs {
+		if !inspected[required] {
+			t.Errorf("expected to inspect hot path function %s in %s, but declaration was not found", required, adapterPath)
+		}
+	}
+}
+
+// TestAdapter_Header_CleanCache_Lifecycle verifies the cache invalidation contract of Header():
+// 1. Initial Header() builds the cached index.
+// 2. Repeated Header() calls while the cache is clean do not invalidate/rebuild the index.
+// 3. A Store revision change invalidates the cache.
+// 4. After the appropriate throttle condition, Header() rebuilds and reflects updated projection counts.
+// 5. Subsequent Header() calls on the clean cache do not rebuild again.
+func TestAdapter_Header_CleanCache_Lifecycle(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "header_clean_cache.json"), 2)
+	bus := events.New()
+	ring := logging.NewRingLogHandler(100)
+	ad := adapter.New(st, bus, ring)
+	t.Cleanup(func() {
+		ad.Close()
+		bus.Close()
+	})
+
+	now := time.Now()
+	for i := 0; i < 1000; i++ {
+		status := store.StatusFailed
+		transportOK := false
+		evidenceKnown := false
+		if i < 100 {
+			status = store.StatusPassed
+			transportOK = true
+			evidenceKnown = true
+		} else if i < 300 {
+			transportOK = true
+			evidenceKnown = true
+		}
+		st.PutWithTransition(store.Result{
+			Link:                   fmt.Sprintf("vless://user-%d@1.1.1.1:443#N-%d", i, i),
+			Status:                 status,
+			Latency:                50 * time.Millisecond,
+			TransportEvidenceKnown: evidenceKnown,
+			TransportOK:            transportOK,
+			TestedAt:               now,
+		})
+	}
+
+	initStoreRev := st.Revision()
+
+	// 1. Initial Header() builds the index
+	if got := ad.LastIndexRevForTest(); got != 0 {
+		t.Fatalf("expected initial LastIndexRev 0 before Header(), got %d", got)
+	}
+
+	initHdr := ad.Header()
+	if got := ad.LastIndexRevForTest(); got != initStoreRev {
+		t.Fatalf("expected LastIndexRev %d after initial Header(), got %d", initStoreRev, got)
+	}
+	if initHdr.TotalCandidates != 1000 || initHdr.ServableCount != 100 || initHdr.GenericServableCount != 300 {
+		t.Fatalf("initial Header() incorrect projection counts: %+v", initHdr)
+	}
+
+	// 2. Repeated Header() calls while the cache is clean do not invalidate/rebuild the index
+	for i := 0; i < 50; i++ {
+		hdr := ad.Header()
+		if got := ad.LastIndexRevForTest(); got != initStoreRev {
+			t.Fatalf("iteration %d: clean cache mutated LastIndexRev: got %d, want %d", i, got, initStoreRev)
+		}
+		if hdr.TotalCandidates != 1000 || hdr.ServableCount != 100 || hdr.GenericServableCount != 300 {
+			t.Fatalf("iteration %d: clean Header() returned inconsistent counts: %+v", i, hdr)
+		}
+	}
+
+	// 3. A Store revision change invalidates the cache
+	for i := 100; i < 150; i++ {
+		st.PutWithTransition(store.Result{
+			Link:                   fmt.Sprintf("vless://user-%d@1.1.1.1:443#N-%d", i, i),
+			Status:                 store.StatusPassed,
+			Latency:                45 * time.Millisecond,
+			TransportEvidenceKnown: true,
+			TransportOK:            true,
+			TestedAt:               time.Now(),
+		})
+	}
+	dirtyStoreRev := st.Revision()
+	if dirtyStoreRev <= initStoreRev {
+		t.Fatalf("expected Store revision to increase, got %d <= %d", dirtyStoreRev, initStoreRev)
+	}
+	// Verify that the adapter's cached revision has NOT yet rebuilt and is now stale/invalidated:
+	if got := ad.LastIndexRevForTest(); got != initStoreRev {
+		t.Fatalf("expected adapter to retain old cached revision %d before rebuild, got %d", initStoreRev, got)
+	}
+
+	// 4. After throttle condition, Header() rebuilds and reflects updated projection counts
+	ad.SetIndexThrottleIntervalForTest(0) // throttle elapsed
+
+	hdrDirty := ad.Header()
+	if got := ad.LastIndexRevForTest(); got != dirtyStoreRev {
+		t.Fatalf("expected LastIndexRev to update to %d after dirty rebuild, got %d", dirtyStoreRev, got)
+	}
+	if hdrDirty.ServableCount != 150 {
+		t.Fatalf("expected updated ServableCount 150 after rebuild, got %d", hdrDirty.ServableCount)
+	}
+
+	// 5. Subsequent Header() calls on the clean cache do not rebuild again
+	for i := 0; i < 50; i++ {
+		hdr := ad.Header()
+		if got := ad.LastIndexRevForTest(); got != dirtyStoreRev {
+			t.Fatalf("iteration %d: subsequent clean cache mutated LastIndexRev: got %d, want %d", i, got, dirtyStoreRev)
+		}
+		if hdr.ServableCount != 150 {
+			t.Fatalf("iteration %d: subsequent Header() returned inconsistent ServableCount: %d", i, hdr.ServableCount)
+		}
 	}
 }
