@@ -479,3 +479,222 @@ func TestStore_PersistenceCompatibility_NetworkPassing(t *testing.T) {
 		t.Fatalf("reloaded NetworkPassingRanked() = %v, want [%s, %s]", netRanked, linkPass, linkBlocked)
 	}
 }
+
+func TestStore_NetworkHealthyAndServabilityEquivalence_Matrix(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.NewWithConfig(filepath.Join(tmpDir, "state.json"), store.DefaultScoringConfig())
+
+	// 1. Target blocked: transport OK, but target region blocked
+	lBlocked := "vless://blocked@1.1.1.1:443#Blocked"
+	st.PutWithTransition(store.Result{
+		Link:                   lBlocked,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportOK:            true,
+		TransportEvidenceKnown: true,
+	})
+
+	// 2. Target denied: transport OK, but target denied
+	lDenied := "vless://denied@1.1.1.2:443#Denied"
+	st.PutWithTransition(store.Result{
+		Link:                   lDenied,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrTargetDenied,
+		TransportOK:            true,
+		TransportEvidenceKnown: true,
+	})
+
+	// 3. Score below threshold: transport failed, score low
+	lLowScore := "vless://lowscore@1.1.1.3:443#LowScore"
+	st.PutWithTransition(store.Result{
+		Link:                   lLowScore,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrConnRefused,
+		TransportOK:            false,
+		TransportEvidenceKnown: true,
+	})
+
+	// 4. Score above threshold: fully passed Gemini & transport
+	lPassed := "vless://passed@1.1.1.4:443#Passed"
+	st.PutWithTransition(store.Result{
+		Link:                   lPassed,
+		Status:                 store.StatusPassed,
+		TransportOK:            true,
+		TransportEvidenceKnown: true,
+	})
+
+	// 5. Explicit transport failure with known evidence
+	lExplicitFail := "vless://explicitfail@1.1.1.6:443#ExplicitFail"
+	st.PutWithTransition(store.Result{
+		Link:                   lExplicitFail,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrTimeout,
+		TransportOK:            false,
+		TransportEvidenceKnown: true,
+	})
+
+	// 6. Legacy record with no explicit transport evidence (historical compatibility)
+	lLegacyTarget := "vless://legacytarget@1.1.1.7:443#LegacyTarget"
+	st.PutWithTransition(store.Result{
+		Link:                   lLegacyTarget,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportEvidenceKnown: false,
+	})
+
+	lLegacyNetFail := "vless://legacynetfail@1.1.1.8:443#LegacyNetFail"
+	st.PutWithTransition(store.Result{
+		Link:                   lLegacyNetFail,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrConnRefused,
+		TransportEvidenceKnown: false,
+	})
+
+	// Test all candidate states for 100% equivalence between:
+	// - ServabilityGate
+	// - IsNetworkHealthyRecord
+	// - NetworkHealthyStateForTest
+	// - CandidateIndex
+	indexEntries := st.CandidateIndex()
+	indexByLink := make(map[string]store.CandidateIndexEntry, len(indexEntries))
+	for _, entry := range indexEntries {
+		indexByLink[entry.CanonicalLink] = entry
+	}
+
+	testCases := []struct {
+		link         string
+		wantServable bool
+		wantHealthy  bool
+	}{
+		{lBlocked, false, true},
+		{lDenied, false, true},
+		{lLowScore, false, false},
+		{lPassed, true, true},
+		{lExplicitFail, false, false},
+		{lLegacyTarget, false, true},
+		{lLegacyNetFail, false, false},
+	}
+
+	for _, tc := range testCases {
+		canonical := store.CanonicalizeLink(tc.link)
+		rec, ok := st.GetRecord(tc.link)
+		if !ok {
+			t.Fatalf("record not found for %s", tc.link)
+		}
+
+		servableGate, _ := st.ServabilityGate(rec)
+		if servableGate != tc.wantServable {
+			t.Errorf("[%s] ServabilityGate = %v, want %v", tc.link, servableGate, tc.wantServable)
+		}
+
+		isServable := st.IsServableRecord(rec)
+		if isServable != tc.wantServable {
+			t.Errorf("[%s] IsServableRecord = %v, want %v", tc.link, isServable, tc.wantServable)
+		}
+
+		netHealthy := st.IsNetworkHealthyRecord(rec)
+		if netHealthy != tc.wantHealthy {
+			t.Errorf("[%s] IsNetworkHealthyRecord = %v, want %v", tc.link, netHealthy, tc.wantHealthy)
+		}
+
+		healthyState, servableState := st.NetworkHealthyStateForTest(rec)
+		if healthyState != tc.wantHealthy || servableState != tc.wantServable {
+			t.Errorf("[%s] NetworkHealthyStateForTest = (%v, %v), want (%v, %v)",
+				tc.link, healthyState, servableState, tc.wantHealthy, tc.wantServable)
+		}
+
+		idxEntry, hasIdx := indexByLink[canonical]
+		if !hasIdx {
+			t.Fatalf("[%s] not found in CandidateIndex", tc.link)
+		}
+		if idxEntry.Servable != tc.wantServable || idxEntry.NetworkHealthy != tc.wantHealthy {
+			t.Errorf("[%s] CandidateIndexEntry = (Servable:%v, NetHealthy:%v), want (%v, %v)",
+				tc.link, idxEntry.Servable, idxEntry.NetworkHealthy, tc.wantServable, tc.wantHealthy)
+		}
+	}
+
+	// Grace period inconclusive: legacy record with prior pass and 1 inconclusive observation
+	recGrace := &store.CandidateRecord{
+		CanonicalLink: "vless://grace@1.1.1.5:443#Grace",
+		Score:         0.2, // Below MinServableScore (0.75)
+		History: func() store.BoundedHistory {
+			h := store.NewBoundedHistory(10)
+			h.Push(store.ProbeSample{
+				Status:                 store.StatusInconclusive,
+				TransportOK:            true,
+				TransportEvidenceKnown: true,
+			})
+			return h
+		}(),
+		Latest: store.Result{
+			Status:                  store.StatusInconclusive,
+			PreviouslyPassed:        true,
+			ConsecutiveInconclusive: 1,
+			TransportOK:             true,
+			TransportEvidenceKnown:  true,
+		},
+	}
+	gateGrace, reasonGrace := st.ServabilityGate(recGrace)
+	if !gateGrace || reasonGrace != "Servable (grace period)" {
+		t.Errorf("expected grace period servability, got %v (%s)", gateGrace, reasonGrace)
+	}
+	hGrace, sGrace := st.NetworkHealthyStateForTest(recGrace)
+	if !hGrace || !sGrace {
+		t.Errorf("grace period candidate must have (healthy:true, servable:true), got (%v, %v)", hGrace, sGrace)
+	}
+
+	// 8. Cold-start record (rec.History.Count < MinObservationsForServing)
+	recCold := &store.CandidateRecord{
+		CanonicalLink: "vless://cold@1.1.1.9:443#Cold",
+		History:       store.NewBoundedHistory(10), // Count is 0
+	}
+	hCold, sCold := st.NetworkHealthyStateForTest(recCold)
+	if hCold || sCold {
+		t.Errorf("cold start candidate must have (healthy:false, servable:false), got (%v, %v)", hCold, sCold)
+	}
+
+	// 9. Pending absent / Absent cycles > 0 / Present candidate reappearing
+	// Start a cycle with a subset of links to populate pendingAbsent & pendingPresent
+	activeCycleLinks := map[string]struct{}{
+		lPassed:  {},
+		lBlocked: {},
+	}
+	st.StartCycle(activeCycleLinks)
+
+	// In active cycle:
+	// lPassed is present
+	// lDenied was absent in this cycle -> disqualified by Gate 1 (pendingAbsent)
+	recDenied, _ := st.GetRecord(lDenied)
+	hPending, sPending := st.NetworkHealthyStateForTest(recDenied)
+	if hPending || sPending {
+		t.Errorf("pending absent candidate must not be healthy or servable, got (%v, %v)", hPending, sPending)
+	}
+	gatePending, reasonPending := st.ServabilityGate(recDenied)
+	if gatePending || reasonPending != "Absent in active cycle" {
+		t.Errorf("expected pending absent rejection, got %v (%s)", gatePending, reasonPending)
+	}
+
+	// Finish cycle to transition absent candidate to AbsentCycles > 0
+	st.FinishCycle()
+
+	// lDenied now has AbsentCycles > 0
+	recAbsent, _ := st.GetRecord(lDenied)
+	if recAbsent.AbsentCycles == 0 {
+		t.Fatalf("expected AbsentCycles > 0 after cycle completion")
+	}
+
+	// In the next cycle, start with lDenied present again (candidate reappearing from source)
+	reappearingLinks := map[string]struct{}{
+		lDenied: {},
+		lPassed: {},
+	}
+	st.StartCycle(reappearingLinks)
+
+	// lDenied is in pendingPresent -> source absence gate must NOT disqualify it!
+	recReappearing, _ := st.GetRecord(lDenied)
+	hReappear, sReappear := st.NetworkHealthyStateForTest(recReappearing)
+	// For lDenied, target is denied so servable=false, but transport passed so network-healthy=true
+	if !hReappear || sReappear {
+		t.Errorf("reappearing candidate with transport OK should be network-healthy, got (%v, %v)", hReappear, sReappear)
+	}
+}

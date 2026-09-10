@@ -13,7 +13,7 @@ import (
 	"gemsub/internal/tui/viewmodel"
 )
 
-func setup50kAdapter(b *testing.B) (*adapter.Adapter, *store.Store) {
+func setupAdapterWithCount(b *testing.B, count int) (*adapter.Adapter, *store.Store) {
 	b.Helper()
 	tmpDir := b.TempDir()
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
@@ -22,7 +22,7 @@ func setup50kAdapter(b *testing.B) (*adapter.Adapter, *store.Store) {
 	ad := adapter.New(st, bus, ring)
 
 	now := time.Now()
-	for i := 0; i < 50000; i++ {
+	for i := 0; i < count; i++ {
 		link := fmt.Sprintf("vless://user-%d@1.1.1.1:443#Node-%d", i, i)
 		st.PutWithTransition(store.Result{
 			Link:                   link,
@@ -41,6 +41,10 @@ func setup50kAdapter(b *testing.B) (*adapter.Adapter, *store.Store) {
 	})
 
 	return ad, st
+}
+
+func setup50kAdapter(b *testing.B) (*adapter.Adapter, *store.Store) {
+	return setupAdapterWithCount(b, 50000)
 }
 
 // BenchmarkCandidateRowsWindow_50k measures the latency and allocations of materializing
@@ -159,5 +163,29 @@ func BenchmarkHeader_50k(b *testing.B) {
 		if hdr.TotalCandidates != 50000 {
 			b.Fatalf("expected 50000 candidates, got %d", hdr.TotalCandidates)
 		}
+	}
+}
+
+// BenchmarkRebuildIndex_50k measures forced candidate index rebuild across 50,000 candidates.
+func BenchmarkRebuildIndex_50k(b *testing.B) {
+	ad, _ := setupAdapterWithCount(b, 50000)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		ad.RebuildIndexForTest(true)
+	}
+}
+
+// BenchmarkRebuildIndex_62k measures forced candidate index rebuild across 62,000 candidates.
+func BenchmarkRebuildIndex_62k(b *testing.B) {
+	ad, _ := setupAdapterWithCount(b, 62000)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		ad.RebuildIndexForTest(true)
 	}
 }

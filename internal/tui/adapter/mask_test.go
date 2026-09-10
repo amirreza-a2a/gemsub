@@ -234,3 +234,24 @@ func TestFormatHistoryGlyphs(t *testing.T) {
 		t.Errorf("FormatHistoryGlyphs() length in runes = %d, want 7", len([]rune(glyphs)))
 	}
 }
+
+func TestFormatHistoryGlyphsFromStatuses_Equivalence(t *testing.T) {
+	samples := []store.ProbeSample{
+		{Status: store.StatusPassed},
+		{Status: store.StatusFailed},
+		{Status: store.StatusInconclusive},
+	}
+
+	var statuses [16]byte
+	statuses[0] = 'P'
+	statuses[1] = 'F'
+	statuses[2] = 'I'
+
+	for cap := 1; cap <= 10; cap++ {
+		legacy := adapter.FormatHistoryGlyphs(samples, cap)
+		compact := adapter.FormatHistoryGlyphsFromStatuses(statuses, len(samples), cap)
+		if legacy != compact {
+			t.Fatalf("mismatch at cap %d: legacy=%q compact=%q", cap, legacy, compact)
+		}
+	}
+}

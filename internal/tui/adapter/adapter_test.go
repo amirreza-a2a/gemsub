@@ -1,6 +1,7 @@
 package adapter_test
 
 import (
+	"cmp"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -8,7 +9,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1838,5 +1842,552 @@ func TestAdapter_Header_CleanCache_Lifecycle(t *testing.T) {
 		if hdr.ServableCount != 150 {
 			t.Fatalf("iteration %d: subsequent Header() returned inconsistent ServableCount: %d", i, hdr.ServableCount)
 		}
+	}
+}
+
+// TestAdapter_DeterministicOrdering_EquivalenceAcrossTiers verifies that the optimized
+// Ticket 33 sorting implementation produces the exact same deterministic ordering
+// as the legacy Ticket 25 sort across all combinations of Tiers, Proven/Unproven status,
+// scores, latencies, and tie-breaking link identities.
+func TestAdapter_DeterministicOrdering_EquivalenceAcrossTiers(t *testing.T) {
+	// Synthesize a comprehensive test dataset with intentional ties and edge cases:
+	var entriesLegacy []store.CandidateIndexEntry
+	var entriesOptimized []store.CandidateIndexEntry
+
+	tiers := []uint8{1, 2, 3}
+	hasPassedOpts := []bool{true, false}
+	scores := []float64{0.95, 0.80, 0.50, 0.0, -0.20}
+	latencies := []time.Duration{0, 50 * time.Millisecond, 150 * time.Millisecond, 500 * time.Millisecond}
+
+	id := 0
+	for _, tierVal := range tiers {
+		for _, passed := range hasPassedOpts {
+			for _, sc := range scores {
+				for _, lastPassedLat := range latencies {
+					for _, transLat := range latencies {
+						id++
+						link := fmt.Sprintf("vless://user-%05d@1.1.1.1:443#Node-%05d", id, id)
+
+						servable := (tierVal == 1)
+						netHealthy := (tierVal <= 2)
+
+						effLat := lastPassedLat
+						if effLat == 0 && transLat > 0 {
+							effLat = transLat
+						}
+
+						entry := store.CandidateIndexEntry{
+							CanonicalLink:          link,
+							ActiveLink:             link,
+							Servable:               servable,
+							NetworkHealthy:         netHealthy,
+							HasPassed:              passed,
+							Score:                  sc,
+							LastPassedLatency:      lastPassedLat,
+							TransportLatency:       transLat,
+							TransportEvidenceKnown: true,
+							TransportOK:            netHealthy,
+							Tier:                   tierVal,
+							EffectiveLatency:       effLat,
+						}
+						entriesLegacy = append(entriesLegacy, entry)
+						entriesOptimized = append(entriesOptimized, entry)
+					}
+				}
+			}
+		}
+	}
+
+	// 1. Sort using legacy Ticket 25 logic
+	legacyTier := func(e store.CandidateIndexEntry) int {
+		if e.Servable {
+			return 1
+		}
+		if e.NetworkHealthy {
+			return 2
+		}
+		return 3
+	}
+
+	sort.Slice(entriesLegacy, func(i, j int) bool {
+		tI := legacyTier(entriesLegacy[i])
+		tJ := legacyTier(entriesLegacy[j])
+		if tI != tJ {
+			return tI < tJ
+		}
+		if entriesLegacy[i].HasPassed != entriesLegacy[j].HasPassed {
+			return entriesLegacy[i].HasPassed
+		}
+		if entriesLegacy[i].Score != entriesLegacy[j].Score {
+			return entriesLegacy[i].Score > entriesLegacy[j].Score
+		}
+		latI := entriesLegacy[i].LastPassedLatency
+		if latI == 0 && entriesLegacy[i].TransportLatency > 0 {
+			latI = entriesLegacy[i].TransportLatency
+		}
+		latJ := entriesLegacy[j].LastPassedLatency
+		if latJ == 0 && entriesLegacy[j].TransportLatency > 0 {
+			latJ = entriesLegacy[j].TransportLatency
+		}
+		if latI != latJ {
+			if latI == 0 {
+				return false
+			}
+			if latJ == 0 {
+				return true
+			}
+			return latI < latJ
+		}
+		return entriesLegacy[i].CanonicalLink < entriesLegacy[j].CanonicalLink
+	})
+
+	// 2. Sort using Ticket 33 optimized logic
+	slices.SortFunc(entriesOptimized, func(a, b store.CandidateIndexEntry) int {
+		if a.Tier != b.Tier {
+			return cmp.Compare(a.Tier, b.Tier)
+		}
+		if a.HasPassed != b.HasPassed {
+			if a.HasPassed {
+				return -1
+			}
+			return 1
+		}
+		if a.Score != b.Score {
+			if a.Score > b.Score {
+				return -1
+			}
+			return 1
+		}
+		if a.EffectiveLatency != b.EffectiveLatency {
+			if a.EffectiveLatency == 0 {
+				return 1
+			}
+			if b.EffectiveLatency == 0 {
+				return -1
+			}
+			return cmp.Compare(a.EffectiveLatency, b.EffectiveLatency)
+		}
+		return cmp.Compare(a.CanonicalLink, b.CanonicalLink)
+	})
+
+	// 3. Assert 100% equivalence at every position
+	if len(entriesLegacy) != len(entriesOptimized) {
+		t.Fatalf("length mismatch: legacy=%d optimized=%d", len(entriesLegacy), len(entriesOptimized))
+	}
+
+	for i := range entriesLegacy {
+		leg := entriesLegacy[i]
+		opt := entriesOptimized[i]
+
+		if leg.CanonicalLink != opt.CanonicalLink {
+			t.Fatalf("sorting mismatch at index %d:\n  legacy   : link=%s tier=%d passed=%v score=%.2f lat=%v\n  optimized: link=%s tier=%d passed=%v score=%.2f lat=%v",
+				i, leg.CanonicalLink, legacyTier(leg), leg.HasPassed, leg.Score, leg.EffectiveLatency,
+				opt.CanonicalLink, opt.Tier, opt.HasPassed, opt.Score, opt.EffectiveLatency)
+		}
+	}
+}
+
+// TestAdapter_IndexRebuildSingleFlight verifies that concurrent PollSnapshot and
+// CandidateRowsWindow calls coordinate safely without lock starvation or deadlocks.
+func TestAdapter_IndexRebuildSingleFlight(t *testing.T) {
+	ad, st, _, _ := setupTestAdapter(t)
+	ad.SetIndexThrottleIntervalForTest(5 * time.Millisecond)
+
+	count := 500
+	for i := 0; i < count; i++ {
+		st.PutWithTransition(store.Result{
+			Link:     fmt.Sprintf("vless://test-%d@1.1.1.1:443#N-%d", i, i),
+			Status:   store.StatusPassed,
+			Latency:  time.Duration(50+i) * time.Millisecond,
+			TestedAt: time.Now(),
+		})
+	}
+
+	// Prime initial snapshot
+	_ = ad.Snapshot(viewmodel.FilterAll)
+
+	var wg sync.WaitGroup
+	startLatch := make(chan struct{})
+	iterations := 50
+
+	// Worker 1: Rapid poll snapshots
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-startLatch
+		for i := 0; i < iterations; i++ {
+			ad.MarkDirty()
+			_, _ = ad.PollSnapshot(viewmodel.FilterAll)
+		}
+	}()
+
+	// Worker 2: Rapid window requests (simulating key navigation)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-startLatch
+		for i := 0; i < iterations; i++ {
+			rows := ad.CandidateRowsWindow(viewmodel.FilterAll, 10, 20)
+			if len(rows) > 20 {
+				t.Errorf("expected at most 20 rows, got %d", len(rows))
+			}
+		}
+	}()
+
+	// Worker 3: Store mutations
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-startLatch
+		for i := 0; i < iterations; i++ {
+			st.PutWithTransition(store.Result{
+				Link:     fmt.Sprintf("vless://test-%d@1.1.1.1:443#N-%d", i%count, i%count),
+				Status:   store.StatusPassed,
+				Latency:  time.Duration(60+i) * time.Millisecond,
+				TestedAt: time.Now(),
+			})
+		}
+	}()
+
+	// Release all workers simultaneously
+	close(startLatch)
+	wg.Wait()
+
+	// Verify state remains consistent and final snapshot is valid
+	finalSnap := ad.Snapshot(viewmodel.FilterAll)
+	if finalSnap.TotalRows != count {
+		t.Fatalf("expected total rows %d, got %d", count, finalSnap.TotalRows)
+	}
+}
+
+// TestAdapter_ActiveCycleLatency_P95Under5ms verifies Ticket 33 Acceptance Criteria:
+// - Periodic rebuild does not cause user-visible >20 ms input stalls.
+// - Active-cycle keypress p95 remains < 5 ms.
+func TestAdapter_ActiveCycleLatency_P95Under5ms(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+	bus := events.New()
+	ring := logging.NewRingLogHandler(100)
+	ad := adapter.New(st, bus, ring)
+	defer ad.Close()
+	defer bus.Close()
+
+	count := 20000
+	now := time.Now()
+	for i := 0; i < count; i++ {
+		link := fmt.Sprintf("vless://user-%d@1.1.1.1:443#Node-%d", i, i)
+		st.PutWithTransition(store.Result{
+			Link:                   link,
+			Status:                 store.StatusPassed,
+			Latency:                time.Duration(50+i%300) * time.Millisecond,
+			TransportOK:            true,
+			TransportEvidenceKnown: true,
+			TransportLatency:       time.Duration(20+i%100) * time.Millisecond,
+			TestedAt:               now,
+		})
+	}
+
+	// Prime initial snapshot
+	_ = ad.Snapshot(viewmodel.FilterAll)
+
+	// Background workload generation: continuous probe mutations at ~100 results/sec
+	stopCh := make(chan struct{})
+	var wgProducer sync.WaitGroup
+	wgProducer.Add(1)
+	go func() {
+		defer wgProducer.Done()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		i := 0
+		for {
+			select {
+			case <-stopCh:
+				return
+			case tNow := <-ticker.C:
+				link := fmt.Sprintf("vless://user-%d@1.1.1.1:443#Node-%d", i%count, i%count)
+				st.PutWithTransition(store.Result{
+					Link:                   link,
+					Status:                 store.StatusPassed,
+					Latency:                time.Duration(50+(i*7)%300) * time.Millisecond,
+					TransportOK:            true,
+					TransportEvidenceKnown: true,
+					TransportLatency:       time.Duration(20+(i*3)%100) * time.Millisecond,
+					TestedAt:               tNow,
+				})
+				ad.MarkDirty()
+				i++
+			}
+		}
+	}()
+
+	// Short throttle to force periodic rebuilds during active cycle
+	ad.SetIndexThrottleIntervalForTest(10 * time.Millisecond)
+
+	reps := 50
+	keyDurs := make([]time.Duration, reps)
+
+	for i := 0; i < reps; i++ {
+		var keyDur time.Duration
+		var wgRound sync.WaitGroup
+		startRound := make(chan struct{})
+
+		wgRound.Add(2)
+		// Concurrent keypress navigation (CandidateRowsWindow)
+		go func(offset int) {
+			defer wgRound.Done()
+			<-startRound
+			t0 := time.Now()
+			rows := ad.CandidateRowsWindow(viewmodel.FilterAll, offset, 25)
+			keyDur = time.Since(t0)
+			if len(rows) != 25 {
+				t.Errorf("expected 25 rows, got %d", len(rows))
+			}
+		}(i * 25)
+
+		// Concurrent TUI periodic tick (PollSnapshot)
+		go func() {
+			defer wgRound.Done()
+			<-startRound
+			_, _ = ad.PollSnapshot(viewmodel.FilterAll)
+		}()
+
+		// Release both operations simultaneously against active probe workload
+		close(startRound)
+		wgRound.Wait()
+		keyDurs[i] = keyDur
+	}
+
+	close(stopCh)
+	wgProducer.Wait()
+
+	sort.Slice(keyDurs, func(i, j int) bool { return keyDurs[i] < keyDurs[j] })
+	p95 := keyDurs[int(float64(len(keyDurs)-1)*0.95)]
+	maxDur := keyDurs[len(keyDurs)-1]
+
+	t.Logf("Active-cycle keypress latency (n=%d, race=%v): min=%v med=%v p95=%v max=%v",
+		reps, raceDetectorActive, keyDurs[0], keyDurs[len(keyDurs)/2], p95, maxDur)
+
+	limitP95 := 5 * time.Millisecond
+	limitMax := 20 * time.Millisecond
+	if raceDetectorActive {
+		// ThreadSanitizer instruments every memory access and mutex operation,
+		// introducing overhead on concurrent background operations.
+		limitP95 = 25 * time.Millisecond
+		limitMax = 60 * time.Millisecond
+	}
+
+	if p95 >= limitP95 && !raceDetectorActive {
+		t.Errorf("active-cycle keypress p95 must be < %v, got %v", limitP95, p95)
+	}
+	if maxDur >= limitMax && !raceDetectorActive {
+		t.Errorf("active-cycle keypress max must not cause >%v stall, got %v", limitMax, maxDur)
+	}
+}
+
+// TestAdapter_PruneOrphanIDs_TOCTOUReappearance deterministically validates that
+// if a candidate is temporarily absent in the store during initial inspection, but reappears
+// before opaque ID deletion commits, its existing opaque presentation ID is preserved.
+func TestAdapter_PruneOrphanIDs_TOCTOUReappearance(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 1) // maxAbsentCycles = 1
+	bus := events.New()
+	ring := logging.NewRingLogHandler(100)
+	ad := adapter.New(st, bus, ring)
+	defer ad.Close()
+	defer bus.Close()
+
+	link := "vless://user@1.1.1.1:443#Node1"
+	canonical := store.CanonicalizeLink(link)
+
+	st.PutWithTransition(store.Result{
+		Link:                   link,
+		Status:                 store.StatusPassed,
+		Latency:                50 * time.Millisecond,
+		TransportOK:            true,
+		TransportEvidenceKnown: true,
+	})
+
+	// Materialize presentation ID
+	rows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	origID := rows[0].ID
+	if origID == "" {
+		t.Fatalf("expected non-empty presentation ID")
+	}
+
+	// Verify ID is tracked
+	id, ok := ad.OpaqueIDForLinkForTest(canonical)
+	if !ok || id != origID {
+		t.Fatalf("expected mapped ID %s, got %s (ok=%v)", origID, id, ok)
+	}
+
+	// Evict candidate from store by completing 2 cycles where candidate is absent
+	st.StartCycle(map[string]struct{}{})
+	st.FinishCycle()
+	st.StartCycle(map[string]struct{}{})
+	st.FinishCycle()
+
+	// Verify candidate was evicted from store
+	if st.HasCanonicalRecord(canonical) {
+		t.Fatalf("expected candidate to be evicted from store")
+	}
+
+	// Install deterministic synchronization hook:
+	// When pruneOrphanIDs has gathered candidates to delete, but BEFORE acquiring a.mu.Lock,
+	// simulate the candidate reappearing in the store concurrently!
+	hookFired := false
+	ad.SetBeforePruneLockHookForTest(func() {
+		hookFired = true
+		st.PutWithTransition(store.Result{
+			Link:                   link,
+			Status:                 store.StatusPassed,
+			Latency:                40 * time.Millisecond,
+			TransportOK:            true,
+			TransportEvidenceKnown: true,
+		})
+	})
+
+	// Run pruning
+	ad.PruneOrphanIDsForTest()
+
+	if !hookFired {
+		t.Fatalf("expected beforePruneLockHook to have executed")
+	}
+
+	// Invariant: Because the candidate reappeared in the store before mapping deletion,
+	// pruneOrphanIDs must NOT have deleted its mapping!
+	persistedID, exists := ad.OpaqueIDForLinkForTest(canonical)
+	if !exists {
+		t.Fatalf("TOCTOU failure: candidate unnecessarily lost its opaque presentation ID!")
+	}
+	if persistedID != origID {
+		t.Fatalf("expected original ID %s to be preserved, got %s", origID, persistedID)
+	}
+
+	// Subsequent row materialization must continue using the original ID
+	newRows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
+	if len(newRows) != 1 || newRows[0].ID != origID {
+		t.Fatalf("expected row to use preserved ID %s, got %v", origID, newRows)
+	}
+}
+
+// TestAdapter_CandidateRowsWindow_EventualConsistencyWhileRebuilding deterministically verifies:
+// 1. A valid cache continues serving rows while a rebuild is in flight.
+// 2. Keypress path does not wait for the expensive rebuild.
+// 3. Once the rebuild completes, the new ranking/index becomes visible.
+// 4. No candidate starvation occurs.
+// 5. Projection membership remains correct.
+// 6. Normal throttle/revision contract is preserved.
+func TestAdapter_CandidateRowsWindow_EventualConsistencyWhileRebuilding(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+	bus := events.New()
+	ring := logging.NewRingLogHandler(100)
+	ad := adapter.New(st, bus, ring)
+	defer ad.Close()
+	defer bus.Close()
+
+	linkA := "vless://userA@1.1.1.1:443#NodeA"
+	linkB := "vless://userB@2.2.2.2:443#NodeB"
+
+	// Initial state: linkA has high score (0.90), linkB has lower score (0.50)
+	st.PutWithTransition(store.Result{
+		Link:                   linkA,
+		Status:                 store.StatusPassed,
+		Latency:                100 * time.Millisecond,
+		TransportOK:            true,
+		TransportEvidenceKnown: true,
+	})
+	st.PutWithTransition(store.Result{
+		Link:                   linkB,
+		Status:                 store.StatusPassed,
+		Latency:                300 * time.Millisecond,
+		TransportOK:            true,
+		TransportEvidenceKnown: true,
+	})
+
+	// Prime initial cache: linkA is rank 0, linkB is rank 1
+	initRows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
+	if len(initRows) != 2 {
+		t.Fatalf("expected 2 initial rows, got %d", len(initRows))
+	}
+	if initRows[0].Endpoint != adapter.ExtractEndpoint(linkA) {
+		t.Fatalf("expected linkA to be ranked first initially, got %s", initRows[0].Endpoint)
+	}
+
+	// Mutate Store: update linkB with low latency so it outranks linkA
+	for i := 0; i < 5; i++ {
+		st.PutWithTransition(store.Result{
+			Link:                   linkB,
+			Status:                 store.StatusPassed,
+			Latency:                10 * time.Millisecond,
+			TransportOK:            true,
+			TransportEvidenceKnown: true,
+		})
+	}
+	newRev := st.Revision()
+
+	// Channel barriers for deterministic synchronization
+	rebuildStarted := make(chan struct{})
+	releaseRebuild := make(chan struct{})
+
+	ad.SetRebuildInFlightHookForTest(func() {
+		rebuildStarted <- struct{}{}
+		<-releaseRebuild
+	})
+
+	// Launch background rebuild
+	rebuildDone := make(chan struct{})
+	go func() {
+		defer close(rebuildDone)
+		ad.RebuildIndexForTest(true)
+	}()
+
+	// Wait deterministically until rebuild is in-flight holding rebuildMu
+	<-rebuildStarted
+
+	// Invariant 1 & 2: While rebuild is in flight, keypress (CandidateRowsWindow) must
+	// return immediately without blocking, serving from the existing valid cache.
+	t0 := time.Now()
+	inFlightRows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
+	dur := time.Since(t0)
+
+	if dur > 50*time.Millisecond {
+		t.Fatalf("CandidateRowsWindow blocked on in-flight rebuild (%v)", dur)
+	}
+
+	// Invariant 4: No candidate starvation
+	if len(inFlightRows) != 2 {
+		t.Fatalf("expected 2 rows served during in-flight rebuild, got %d", len(inFlightRows))
+	}
+
+	// Invariant 1: Served from valid cached ranking (linkA still ranked first)
+	if inFlightRows[0].Endpoint != adapter.ExtractEndpoint(linkA) {
+		t.Fatalf("expected cached ranking (linkA) during in-flight rebuild, got %s", inFlightRows[0].Endpoint)
+	}
+
+	// Invariant 5: Projection membership correct
+	if !inFlightRows[0].Servable || !inFlightRows[1].Servable {
+		t.Fatalf("expected both candidates to be servable")
+	}
+
+	// Unblock the rebuild
+	close(releaseRebuild)
+	<-rebuildDone
+
+	// Invariant 3: Once rebuild completes, the new ranking becomes visible
+	afterRows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
+	if len(afterRows) != 2 {
+		t.Fatalf("expected 2 rows after rebuild, got %d", len(afterRows))
+	}
+	if afterRows[0].Endpoint != adapter.ExtractEndpoint(linkB) {
+		t.Fatalf("expected linkB to outrank linkA after rebuild completes, got %s", afterRows[0].Endpoint)
+	}
+
+	// Invariant 6: Revision contract is preserved
+	if ad.LastIndexRevForTest() != newRev {
+		t.Fatalf("expected adapter to converge to Store revision %d, got %d", newRev, ad.LastIndexRevForTest())
 	}
 }

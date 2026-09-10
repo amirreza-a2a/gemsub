@@ -1,9 +1,10 @@
 package adapter
 
 import (
+	"cmp"
 	"fmt"
 	"log/slog"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,7 +58,8 @@ type Adapter struct {
 	flagMode country.Mode
 
 	// Cached sorted index and throttling
-	indexMu               sync.Mutex
+	indexMu               sync.RWMutex
+	rebuildMu             sync.Mutex
 	lastIndexTime         time.Time
 	lastIndexRev          uint64
 	indexThrottleInterval time.Duration
@@ -65,6 +67,10 @@ type Adapter struct {
 	cachedFilterAll       []int
 	cachedFilterGem       []int
 	cachedFilterGen       []int
+
+	// Test synchronization hooks
+	beforePruneLockHook func()
+	rebuildInFlightHook func()
 }
 
 // New creates an unstarted Adapter.
@@ -226,8 +232,8 @@ func (a *Adapter) reconcileCycleStateLocked() bool {
 // CheckAndResetDirty returns true if state has been invalidated since last check,
 // checking EventBus notifications, Store revision increments, and overdue throttled index refreshes.
 func (a *Adapter) CheckAndResetDirty() bool {
-	a.indexMu.Lock()
-	defer a.indexMu.Unlock()
+	a.indexMu.RLock()
+	defer a.indexMu.RUnlock()
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -268,11 +274,12 @@ func (a *Adapter) MarkDirty() {
 // Header returns the current HeaderViewModel constructed from Store metadata
 // and ephemeral cycle lifecycle metrics. Pass/Fail/Incon counts represent the active cycle only.
 func (a *Adapter) Header() viewmodel.HeaderViewModel {
-	a.indexMu.Lock()
-	a.rebuildIndexLocked(false)
+	a.rebuildIndex(false)
+
+	a.indexMu.RLock()
 	servableCount := len(a.cachedFilterGem)
 	genericServableCount := len(a.cachedFilterGen)
-	a.indexMu.Unlock()
+	a.indexMu.RUnlock()
 
 	a.mu.Lock()
 	cycleStatus := a.cycleStatus
@@ -315,14 +322,122 @@ func (a *Adapter) StoreStats() store.Stats {
 	return store.Stats{}
 }
 
-// rebuildIndexLocked refreshes the cached candidate index and partitions if necessary.
-// Must be called with a.indexMu locked.
-func (a *Adapter) rebuildIndexLocked(force bool) {
+func (a *Adapter) pruneOrphanIDs() {
 	if a.st == nil {
+		return
+	}
+	a.mu.RLock()
+	if len(a.linkToID) == 0 {
+		a.mu.RUnlock()
+		return
+	}
+	links := make([]string, 0, len(a.linkToID))
+	for link := range a.linkToID {
+		links = append(links, link)
+	}
+	a.mu.RUnlock()
+
+	var toDelete []string
+	for _, link := range links {
+		if !a.st.HasCanonicalRecord(link) {
+			toDelete = append(toDelete, link)
+		}
+	}
+	if len(toDelete) == 0 {
+		return
+	}
+
+	if a.beforePruneLockHook != nil {
+		a.beforePruneLockHook()
+	}
+
+	a.mu.Lock()
+	for _, link := range toDelete {
+		// TOCTOU mitigation: re-verify with HasCanonicalRecord before deleting to ensure
+		// a candidate that reappeared in Store concurrently is not unnecessarily pruned.
+		if !a.st.HasCanonicalRecord(link) {
+			if id, ok := a.linkToID[link]; ok {
+				delete(a.linkToID, link)
+				delete(a.idToLink, id)
+			}
+		}
+	}
+	a.mu.Unlock()
+}
+
+// computeCandidateIndex fetches candidate presentation entries from Store,
+// prunes evicted presentation IDs, and returns deterministically sorted entries
+// along with precomputed filter index slices.
+func (a *Adapter) computeCandidateIndex() ([]store.CandidateIndexEntry, []int, []int, []int) {
+	if a.st == nil {
+		return nil, nil, nil, nil
+	}
+
+	entries := a.st.CandidateIndex()
+	a.pruneOrphanIDs()
+
+	// Deterministic Candidate Ordering Policy (Ticket 25, Ticket 33):
+	// 1. Tier 1: Gemini-servable candidates (Tier == 1).
+	// 2. Tier 2: Generic-servable candidates (Tier == 2).
+	// 3. Tier 3: Unservable candidates (Tier == 3).
+	// 4. Within each tier, proven candidates (HasPassed == true) before unproven candidates.
+	// 5. Reliability Score descending.
+	// 6. Effective latency ascending (LastPassedLatency, then TransportLatency).
+	// 7. Stable canonical link ascending as deterministic tie-breaker.
+	slices.SortFunc(entries, func(a, b store.CandidateIndexEntry) int {
+		if a.Tier != b.Tier {
+			return cmp.Compare(a.Tier, b.Tier)
+		}
+		if a.HasPassed != b.HasPassed {
+			if a.HasPassed {
+				return -1
+			}
+			return 1
+		}
+		if a.Score != b.Score {
+			if a.Score > b.Score {
+				return -1
+			}
+			return 1
+		}
+		if a.EffectiveLatency != b.EffectiveLatency {
+			if a.EffectiveLatency == 0 {
+				return 1
+			}
+			if b.EffectiveLatency == 0 {
+				return -1
+			}
+			return cmp.Compare(a.EffectiveLatency, b.EffectiveLatency)
+		}
+		return cmp.Compare(a.CanonicalLink, b.CanonicalLink)
+	})
+
+	allIndices := make([]int, len(entries))
+	var numGem, numGen int
+	for i := range entries {
+		allIndices[i] = i
+		if entries[i].Tier == 1 {
+			numGem++
+		}
+		if entries[i].Tier <= 2 {
+			numGen++
+		}
+	}
+	gemIndices := allIndices[:numGem]
+	genIndices := allIndices[:numGen]
+
+	return entries, allIndices, gemIndices, genIndices
+}
+
+// rebuildIndex refreshes the cached candidate index and partitions if necessary.
+func (a *Adapter) rebuildIndex(force bool) {
+	if a.st == nil {
+		a.indexMu.Lock()
 		a.cachedEntries = nil
 		a.cachedFilterAll = nil
 		a.cachedFilterGem = nil
 		a.cachedFilterGen = nil
+		a.indexMu.Unlock()
 		a.mu.Lock()
 		a.idToLink = make(map[string]string)
 		a.linkToID = make(map[string]string)
@@ -330,106 +445,73 @@ func (a *Adapter) rebuildIndexLocked(force bool) {
 		return
 	}
 
+	a.indexMu.RLock()
+	hasCache := a.cachedEntries != nil
+	lastRev := a.lastIndexRev
+	lastTime := a.lastIndexTime
+	cachedCount := len(a.cachedEntries)
+	throttle := a.indexThrottleInterval
+	a.indexMu.RUnlock()
+
 	currentRev := a.st.Revision()
 	count := a.st.Count()
 	now := time.Now()
-	throttle := a.indexThrottleInterval
 	if throttle < 0 {
 		throttle = 0
 	}
-	if !force && a.cachedEntries != nil && len(a.cachedEntries) == count {
-		if currentRev == a.lastIndexRev || (throttle > 0 && now.Sub(a.lastIndexTime) < throttle) {
+
+	// Fast path: if cache is valid and up to date, or throttled, return immediately.
+	if !force && hasCache && cachedCount == count {
+		if currentRev == lastRev || (throttle > 0 && now.Sub(lastTime) < throttle) {
 			return
 		}
 	}
 
-	entries := a.st.CandidateIndex()
-
-	// Prune orphaned presentation IDs for candidates evicted from Store (P1 fix).
-	// Surviving candidates retain their stable opaque IDs; evicted candidates are removed.
-	activeLinks := make(map[string]struct{}, len(entries))
-	for _, e := range entries {
-		activeLinks[e.CanonicalLink] = struct{}{}
+	// Single-flight coordination: only one goroutine rebuilds at a time.
+	// If another goroutine is actively rebuilding:
+	// - If we already have a valid cache and this is not a forced request, return immediately
+	//   and allow the caller to serve from the existing valid cache without blocking.
+	// - If force is true or hasCache is false, wait for the rebuild to complete.
+	if !a.rebuildMu.TryLock() {
+		if hasCache && !force {
+			return
+		}
+		a.rebuildMu.Lock()
 	}
-	a.mu.Lock()
-	for link, id := range a.linkToID {
-		if _, ok := activeLinks[link]; !ok {
-			delete(a.linkToID, link)
-			delete(a.idToLink, id)
-		}
-	}
-	a.mu.Unlock()
+	defer a.rebuildMu.Unlock()
 
-	// Deterministic Candidate Ordering Policy (Ticket 25):
-	// 1. Tier 1: Gemini-servable candidates (Servable == true).
-	// 2. Tier 2: Generic-servable candidates (NetworkHealthy == true && Servable == false).
-	// 3. Tier 3: Unservable candidates.
-	// 4. Within each tier, proven candidates (HasPassed == true) before unproven candidates.
-	// 5. Reliability Score descending.
-	// 6. Effective latency ascending (LastPassedLatency, then TransportLatency).
-	// 7. Stable internal identity ascending as deterministic tie-breaker.
-	tier := func(e store.CandidateIndexEntry) int {
-		if e.Servable {
-			return 1
-		}
-		if e.NetworkHealthy {
-			return 2
-		}
-		return 3
-	}
+	// Re-check conditions after acquiring rebuildMu in case another goroutine just refreshed.
+	a.indexMu.RLock()
+	hasCache = a.cachedEntries != nil
+	lastRev = a.lastIndexRev
+	lastTime = a.lastIndexTime
+	cachedCount = len(a.cachedEntries)
+	a.indexMu.RUnlock()
 
-	sort.Slice(entries, func(i, j int) bool {
-		tI := tier(entries[i])
-		tJ := tier(entries[j])
-		if tI != tJ {
-			return tI < tJ
-		}
-		if entries[i].HasPassed != entries[j].HasPassed {
-			return entries[i].HasPassed
-		}
-		if entries[i].Score != entries[j].Score {
-			return entries[i].Score > entries[j].Score
-		}
-		latI := entries[i].LastPassedLatency
-		if latI == 0 && entries[i].TransportLatency > 0 {
-			latI = entries[i].TransportLatency
-		}
-		latJ := entries[j].LastPassedLatency
-		if latJ == 0 && entries[j].TransportLatency > 0 {
-			latJ = entries[j].TransportLatency
-		}
-		if latI != latJ {
-			if latI == 0 {
-				return false
-			}
-			if latJ == 0 {
-				return true
-			}
-			return latI < latJ
-		}
-		return entries[i].CanonicalLink < entries[j].CanonicalLink
-	})
+	currentRev = a.st.Revision()
+	count = a.st.Count()
+	now = time.Now()
 
-	allIndices := make([]int, len(entries))
-	gemIndices := make([]int, 0, len(entries))
-	genIndices := make([]int, 0, len(entries))
-
-	for i, e := range entries {
-		allIndices[i] = i
-		if e.Servable {
-			gemIndices = append(gemIndices, i)
-		}
-		if e.NetworkHealthy {
-			genIndices = append(genIndices, i)
+	if !force && hasCache && cachedCount == count {
+		if currentRev == lastRev || (throttle > 0 && now.Sub(lastTime) < throttle) {
+			return
 		}
 	}
 
+	if a.rebuildInFlightHook != nil {
+		a.rebuildInFlightHook()
+	}
+
+	entries, all, gem, gen := a.computeCandidateIndex()
+
+	a.indexMu.Lock()
 	a.cachedEntries = entries
-	a.cachedFilterAll = allIndices
-	a.cachedFilterGem = gemIndices
-	a.cachedFilterGen = genIndices
+	a.cachedFilterAll = all
+	a.cachedFilterGem = gem
+	a.cachedFilterGen = gen
 	a.lastIndexTime = now
 	a.lastIndexRev = currentRev
+	a.indexMu.Unlock()
 }
 
 func (a *Adapter) filteredIndicesLocked(filter viewmodel.FilterMode) []int {
@@ -443,16 +525,8 @@ func (a *Adapter) filteredIndicesLocked(filter viewmodel.FilterMode) []int {
 	}
 }
 
-func (a *Adapter) materializeRowViewModelLocked(entry store.CandidateIndexEntry) viewmodel.CandidateRowViewModel {
+func (a *Adapter) materializeRowViewModel(entry store.CandidateIndexEntry, opaqueID string, mode country.Mode) viewmodel.CandidateRowViewModel {
 	canonical := entry.CanonicalLink
-	opaqueID, exists := a.linkToID[canonical]
-	if !exists {
-		a.idCounter++
-		opaqueID = fmt.Sprintf("cand-%d", a.idCounter)
-		a.linkToID[canonical] = opaqueID
-		a.idToLink[opaqueID] = canonical
-	}
-
 	activeLink := entry.ActiveLink
 	if activeLink == "" {
 		activeLink = canonical
@@ -460,7 +534,7 @@ func (a *Adapter) materializeRowViewModelLocked(entry store.CandidateIndexEntry)
 
 	proto := ExtractProtocol(activeLink)
 	endpoint := ExtractEndpoint(activeLink)
-	remark := country.FormatRemark(ExtractRemark(activeLink), a.flagMode)
+	remark := country.FormatRemark(ExtractRemark(activeLink), mode)
 
 	status := "PEND"
 	if entry.LatestStatus != "" {
@@ -496,10 +570,8 @@ func (a *Adapter) materializeRowViewModelLocked(entry store.CandidateIndexEntry)
 	}
 
 	glyphs := ""
-	if a.st != nil {
-		if rec, ok := a.st.GetRecord(canonical); ok && rec != nil {
-			glyphs = FormatHistoryGlyphs(rec.History.ChronologicalSamples(), rec.History.Capacity)
-		}
+	if entry.HistoryCapacity > 0 {
+		glyphs = FormatHistoryGlyphsFromStatuses(entry.HistoryStatuses, entry.HistoryCount, entry.HistoryCapacity)
 	}
 
 	return viewmodel.CandidateRowViewModel{
@@ -522,10 +594,16 @@ func (a *Adapter) materializeRowViewModelLocked(entry store.CandidateIndexEntry)
 
 // CandidateRowsWindow materializes CandidateRowViewModels ONLY for the specified slice window.
 func (a *Adapter) CandidateRowsWindow(filter viewmodel.FilterMode, offset, limit int) []viewmodel.CandidateRowViewModel {
-	a.indexMu.Lock()
-	defer a.indexMu.Unlock()
+	a.indexMu.RLock()
+	hasCache := a.cachedEntries != nil
+	throttle := a.indexThrottleInterval
+	a.indexMu.RUnlock()
 
-	a.rebuildIndexLocked(false)
+	if !hasCache || throttle <= 0 {
+		a.rebuildIndex(false)
+	}
+
+	a.indexMu.RLock()
 	indices := a.filteredIndicesLocked(filter)
 	total := len(indices)
 
@@ -540,18 +618,36 @@ func (a *Adapter) CandidateRowsWindow(filter viewmodel.FilterMode, offset, limit
 		end = total
 	}
 	if offset >= end {
+		a.indexMu.RUnlock()
 		return nil
 	}
 
 	window := indices[offset:end]
-	out := make([]viewmodel.CandidateRowViewModel, 0, len(window))
+	entries := make([]store.CandidateIndexEntry, len(window))
+	for i, idx := range window {
+		entries[i] = a.cachedEntries[idx]
+	}
+	a.indexMu.RUnlock()
 
+	ids := make([]string, len(entries))
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	mode := a.flagMode
+	for i, entry := range entries {
+		canonical := entry.CanonicalLink
+		opaqueID, exists := a.linkToID[canonical]
+		if !exists {
+			a.idCounter++
+			opaqueID = fmt.Sprintf("cand-%d", a.idCounter)
+			a.linkToID[canonical] = opaqueID
+			a.idToLink[opaqueID] = canonical
+		}
+		ids[i] = opaqueID
+	}
+	a.mu.Unlock()
 
-	for _, idx := range window {
-		entry := a.cachedEntries[idx]
-		out = append(out, a.materializeRowViewModelLocked(entry))
+	out := make([]viewmodel.CandidateRowViewModel, len(entries))
+	for i, entry := range entries {
+		out[i] = a.materializeRowViewModel(entry, ids[i], mode)
 	}
 	return out
 }
@@ -762,10 +858,10 @@ func (a *Adapter) CycleMinLogLevel() slog.Level {
 }
 
 func (a *Adapter) buildSnapshot(filter viewmodel.FilterMode, forceIndex bool) viewmodel.SnapshotViewModel {
-	a.indexMu.Lock()
-	a.rebuildIndexLocked(forceIndex)
+	a.rebuildIndex(forceIndex)
+	a.indexMu.RLock()
 	total := len(a.filteredIndicesLocked(filter))
-	a.indexMu.Unlock()
+	a.indexMu.RUnlock()
 
 	rows := a.CandidateRowsWindow(filter, 0, 50)
 

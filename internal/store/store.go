@@ -167,6 +167,23 @@ func (s *Store) primaryPathLocked() string {
 }
 
 // servabilityGateLocked evaluates the 4 operational policy gates for candidate servability
+// isAbsentLocked evaluates Gate 1: Source Presence Gate.
+// Disqualified if candidate is absent in active cycle or absent from upstream without reappearing.
+func (s *Store) isAbsentLocked(rec *CandidateRecord) (bool, string) {
+	if len(s.pendingAbsent) > 0 {
+		if _, pending := s.pendingAbsent[rec.CanonicalLink]; pending {
+			return true, "Absent in active cycle"
+		}
+	}
+	if rec.AbsentCycles > 0 {
+		if _, present := s.pendingPresent[rec.CanonicalLink]; !present {
+			return true, "Absent from source upstream"
+		}
+	}
+	return false, ""
+}
+
+// servabilityGateLocked evaluates the 4 operational policy gates for candidate servability
 // and returns both the decision and human-readable explanation.
 // mu must be locked (RLock or Lock) by caller.
 func (s *Store) servabilityGateLocked(rec *CandidateRecord) (bool, string) {
@@ -176,11 +193,8 @@ func (s *Store) servabilityGateLocked(rec *CandidateRecord) (bool, string) {
 
 	// Gate 1: Source Presence Gate
 	// Disqualified if candidate is absent in active cycle or absent from upstream without reappearing.
-	if _, pending := s.pendingAbsent[rec.CanonicalLink]; pending {
-		return false, "Absent in active cycle"
-	}
-	if _, present := s.pendingPresent[rec.CanonicalLink]; !present && rec.AbsentCycles > 0 {
-		return false, "Absent from source upstream"
+	if absent, reason := s.isAbsentLocked(rec); absent {
+		return false, reason
 	}
 
 	// Gate 2: Target Policy Override
@@ -235,7 +249,7 @@ func (s *Store) IsServableRecord(rec *CandidateRecord) bool {
 }
 
 // networkHealthyStateLocked checks whether a record is network-healthy, and returns both
-// whether it is network-healthy and whether it is Gemini-servable, avoiding duplicate gate evaluations.
+// whether it is network-healthy and whether it is Gemini-servable, without duplicating servability policy.
 // mu must be locked (RLock or Lock) by caller.
 func (s *Store) networkHealthyStateLocked(rec *CandidateRecord) (healthy bool, servable bool) {
 	if rec == nil {
@@ -244,10 +258,7 @@ func (s *Store) networkHealthyStateLocked(rec *CandidateRecord) (healthy bool, s
 
 	// Gate 1: Source Presence Gate
 	// Disqualified if candidate is absent in active cycle or absent from upstream without reappearing.
-	if _, pending := s.pendingAbsent[rec.CanonicalLink]; pending {
-		return false, false
-	}
-	if _, present := s.pendingPresent[rec.CanonicalLink]; !present && rec.AbsentCycles > 0 {
+	if absent, _ := s.isAbsentLocked(rec); absent {
 		return false, false
 	}
 
@@ -268,7 +279,6 @@ func (s *Store) networkHealthyStateLocked(rec *CandidateRecord) (healthy bool, s
 		if rec.Latest.TransportOK {
 			return true, false
 		}
-		// Explicit transport failure in latest observation: candidate is not network-healthy
 		return false, false
 	}
 
@@ -2142,6 +2152,15 @@ func (s *Store) GetRecord(link string) (*CandidateRecord, bool) {
 	return rec.Clone(), true
 }
 
+// HasCanonicalRecord returns whether a candidate record exists in the store for an already-canonical link.
+func (s *Store) HasCanonicalRecord(canonicalLink string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	_, ok := s.records[canonicalLink]
+	return ok
+}
+
 // CandidateSnapshot pairs a cloned CandidateRecord with its atomic servability status and gate reason.
 type CandidateSnapshot struct {
 	Record                 *CandidateRecord
@@ -2192,6 +2211,10 @@ type CandidateIndexEntry struct {
 	LatestCategory         ErrorCategory
 	HistoryCount           int
 	LastCycleID            uint64
+	Tier                   uint8
+	EffectiveLatency       time.Duration
+	HistoryStatuses        [16]byte
+	HistoryCapacity        int
 }
 
 // CandidateIndex returns a lightweight slice of presentation index entries for all candidates.
@@ -2202,7 +2225,7 @@ func (s *Store) CandidateIndex() []CandidateIndexEntry {
 
 	out := make([]CandidateIndexEntry, 0, len(s.records))
 	for _, rec := range s.records {
-		servable, _ := s.servabilityGateLocked(rec)
+		netHealthy, servable := s.networkHealthyStateLocked(rec)
 		var lastCycleID uint64
 		var lastStatus Status
 		if lastSample, ok := rec.History.Last(); ok {
@@ -2217,11 +2240,36 @@ func (s *Store) CandidateIndex() []CandidateIndexEntry {
 			activeLink = rec.CanonicalLink
 		}
 
+		tier := uint8(3)
+		if servable {
+			tier = 1
+		} else if netHealthy {
+			tier = 2
+		}
+
+		effLat := rec.LastPassedLatency
+		if effLat == 0 && rec.Latest.TransportLatency > 0 {
+			effLat = rec.Latest.TransportLatency
+		}
+
+		var histStatuses [16]byte
+		for i := 0; i < rec.History.Count && i < 16; i++ {
+			idx := (rec.History.Start + i) % rec.History.Capacity
+			switch rec.History.Samples[idx].Status {
+			case StatusPassed:
+				histStatuses[i] = 'P'
+			case StatusFailed:
+				histStatuses[i] = 'F'
+			case StatusInconclusive:
+				histStatuses[i] = 'I'
+			}
+		}
+
 		out = append(out, CandidateIndexEntry{
 			CanonicalLink:          rec.CanonicalLink,
 			ActiveLink:             activeLink,
 			Servable:               servable,
-			NetworkHealthy:         s.isNetworkHealthyRecordLocked(rec),
+			NetworkHealthy:         netHealthy,
 			HasPassed:              rec.HasPassed,
 			Score:                  rec.Score,
 			LastPassedLatency:      rec.LastPassedLatency,
@@ -2232,6 +2280,10 @@ func (s *Store) CandidateIndex() []CandidateIndexEntry {
 			LatestCategory:         rec.Latest.Category,
 			HistoryCount:           rec.History.Count,
 			LastCycleID:            lastCycleID,
+			Tier:                   tier,
+			EffectiveLatency:       effLat,
+			HistoryStatuses:        histStatuses,
+			HistoryCapacity:        rec.History.Capacity,
 		})
 	}
 	return out

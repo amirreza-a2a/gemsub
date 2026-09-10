@@ -352,3 +352,38 @@ func FormatHistoryGlyphs(samples []store.ProbeSample, capacity int) string {
 	sb.WriteRune(']')
 	return sb.String()
 }
+
+// FormatHistoryGlyphsFromStatuses formats bounded history sample statuses into a compact glyph string e.g. "[●●○×······]".
+func FormatHistoryGlyphsFromStatuses(statuses [16]byte, count, capacity int) string {
+	if capacity <= 0 {
+		capacity = 10
+	}
+	if count > 16 {
+		count = 16
+	}
+
+	var sb strings.Builder
+	sb.Grow(capacity*3 + 2)
+	sb.WriteRune('[')
+
+	for i := 0; i < count; i++ {
+		switch statuses[i] {
+		case 'P':
+			sb.WriteRune('●')
+		case 'F':
+			sb.WriteRune('×')
+		case 'I':
+			sb.WriteRune('○')
+		default:
+			sb.WriteRune('·')
+		}
+	}
+
+	// Pad remaining capacity with dim dot
+	for i := count; i < capacity; i++ {
+		sb.WriteRune('·')
+	}
+
+	sb.WriteRune(']')
+	return sb.String()
+}

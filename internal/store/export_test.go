@@ -50,3 +50,10 @@ func (s *Store) IsPendingAbsentForTest(canonicalLink string) bool {
 	_, ok := s.pendingAbsent[canonicalLink]
 	return ok
 }
+
+// NetworkHealthyStateForTest exposes networkHealthyStateLocked for testing.
+func (s *Store) NetworkHealthyStateForTest(rec *CandidateRecord) (healthy bool, servable bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.networkHealthyStateLocked(rec)
+}
