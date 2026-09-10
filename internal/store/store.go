@@ -63,7 +63,7 @@ func (c ErrorCategory) IsTargetSpecific() bool {
 // Result is the outcome of testing a single candidate link.
 type Result struct {
 	Link                    string        `json:"link,omitempty"`
-	Status                  Status        `json:"status"` // Canonical internal state
+	Status                  Status        `json:"status"`           // Canonical internal state
 	Passed                  bool          `json:"passed,omitempty"` // Outcome of latest probe (Status == StatusPassed)
 	Reason                  string        `json:"reason"`
 	Category                ErrorCategory `json:"category,omitempty"`
@@ -2229,4 +2229,12 @@ func (s *Store) Revision() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.revision
+}
+
+// Count returns the total number of stored candidate records in O(1) time
+// without traversing records or evaluating servability policies.
+func (s *Store) Count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.records)
 }

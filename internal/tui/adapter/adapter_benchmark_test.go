@@ -126,3 +126,19 @@ func BenchmarkCandidateIndex_50k(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkCheckAndResetDirty_50k measures the steady-state 10 Hz dirty check
+// across a 50,000 candidate dataset when no updates occurred, confirming O(1) performance.
+func BenchmarkCheckAndResetDirty_50k(b *testing.B) {
+	ad, _ := setup50kAdapter(b)
+
+	// Prime initial snapshot and cached index
+	_ = ad.Snapshot(viewmodel.FilterAll)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_ = ad.CheckAndResetDirty()
+	}
+}

@@ -4,6 +4,7 @@
 # Runtime state files
 /gemsub_state.json
 /gemsub_state.json.tmp
+/gemsub_state.json.gz
 /test_state.json
 /test_state.json.tmp
 

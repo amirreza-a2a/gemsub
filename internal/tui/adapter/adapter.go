@@ -251,7 +251,7 @@ func (a *Adapter) CheckAndResetDirty() bool {
 			throttle = 0
 		}
 		if a.cachedEntries != nil {
-			isStale := (a.lastIndexRev != currentRev || len(a.cachedEntries) != a.st.Stats().Total)
+			isStale := (a.lastIndexRev != currentRev || len(a.cachedEntries) != a.st.Count())
 			if isStale && (throttle == 0 || time.Since(a.lastIndexTime) >= throttle) {
 				dirty = true
 			}
@@ -324,13 +324,13 @@ func (a *Adapter) rebuildIndexLocked(force bool) {
 	}
 
 	currentRev := a.st.Revision()
-	stats := a.st.Stats()
+	count := a.st.Count()
 	now := time.Now()
 	throttle := a.indexThrottleInterval
 	if throttle < 0 {
 		throttle = 0
 	}
-	if !force && a.cachedEntries != nil && len(a.cachedEntries) == stats.Total {
+	if !force && a.cachedEntries != nil && len(a.cachedEntries) == count {
 		if currentRev == a.lastIndexRev || (throttle > 0 && now.Sub(a.lastIndexTime) < throttle) {
 			return
 		}

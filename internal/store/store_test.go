@@ -1496,3 +1496,75 @@ func TestPersistence_SaveSerializer_EdgeCases(t *testing.T) {
 		t.Errorf("multiline warnings mismatch:\nexpected: %v\ngot:      %v", multilineWarnings, recEmoji.Latest.Warnings)
 	}
 }
+
+func TestStore_Count(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "count_state.json")
+	st := store.New(stateFile, 2)
+
+	// 1. Empty store
+	if got := st.Count(); got != 0 {
+		t.Fatalf("expected Count() on empty store to be 0, got %d", got)
+	}
+	if got, total := st.Count(), st.Stats().Total; got != total {
+		t.Fatalf("Count() (%d) != Stats().Total (%d) on empty store", got, total)
+	}
+
+	// 2. Inserts
+	st.PutWithTransition(store.Result{
+		Link:     "vless://user1@1.1.1.1:443",
+		Status:   store.StatusPassed,
+		TestedAt: time.Now(),
+	})
+	st.PutWithTransition(store.Result{
+		Link:     "vless://user2@2.2.2.2:443",
+		Status:   store.StatusPassed,
+		TestedAt: time.Now(),
+	})
+
+	if got := st.Count(); got != 2 {
+		t.Fatalf("expected Count() to be 2 after 2 inserts, got %d", got)
+	}
+	if got, total := st.Count(), st.Stats().Total; got != total {
+		t.Fatalf("Count() (%d) != Stats().Total (%d) after inserts", got, total)
+	}
+	if got, snaps := st.Count(), len(st.Snapshots()); got != snaps {
+		t.Fatalf("Count() (%d) != len(Snapshots()) (%d)", got, snaps)
+	}
+
+	// 3. Update existing candidate does not change count
+	st.PutWithTransition(store.Result{
+		Link:     "vless://user1@1.1.1.1:443",
+		Status:   store.StatusFailed,
+		TestedAt: time.Now(),
+	})
+	if got := st.Count(); got != 2 {
+		t.Fatalf("expected Count() to remain 2 after update, got %d", got)
+	}
+
+	// 4. Removals / Evictions via absent cycles
+	activeLinks := map[string]struct{}{
+		"vless://user1@1.1.1.1:443": {},
+	}
+	// Cycle 1: user2 missing
+	st.StartCycle(activeLinks)
+	st.FinishCycle()
+	if got := st.Count(); got != 2 {
+		t.Fatalf("expected Count() to remain 2 during absent grace period, got %d", got)
+	}
+	// Cycle 2: user2 missing
+	st.StartCycle(activeLinks)
+	st.FinishCycle()
+	if got := st.Count(); got != 2 {
+		t.Fatalf("expected Count() to remain 2 during absent grace period, got %d", got)
+	}
+	// Cycle 3: user2 missing (exceeds MaxAbsentCycles=2 -> evicted)
+	st.StartCycle(activeLinks)
+	st.FinishCycle()
+	if got := st.Count(); got != 1 {
+		t.Fatalf("expected Count() to be 1 after eviction, got %d", got)
+	}
+	if got, total := st.Count(), st.Stats().Total; got != total {
+		t.Fatalf("Count() (%d) != Stats().Total (%d) after eviction", got, total)
+	}
+}

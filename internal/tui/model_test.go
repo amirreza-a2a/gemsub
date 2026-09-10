@@ -1,6 +1,7 @@
 package tui_test
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,6 +19,7 @@ import (
 
 func setupTestModel(t *testing.T) (*tui.Model, *store.Store, *events.EventBus, *logging.RingLogHandler) {
 	t.Helper()
+	t.Setenv("COLORTERM", "")
 	tmpDir := t.TempDir()
 	stateFile := filepath.Join(tmpDir, "state.json")
 
@@ -585,4 +587,57 @@ func TestModel_EmptyCandidatesView(t *testing.T) {
 	m = updated.(*tui.Model)
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	m = updated.(*tui.Model)
+}
+
+// BenchmarkDownKey_WithScroll_50k measures the latency and allocations of pressing
+// the Down arrow key when the cursor is at the viewport boundary, forcing a viewport scroll
+// across a 50,000 candidate dataset.
+func BenchmarkDownKey_WithScroll_50k(b *testing.B) {
+	tmpDir := b.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+	bus := events.New()
+	ring := logging.NewRingLogHandler(100)
+	ad := adapter.New(st, bus, ring)
+
+	now := time.Now()
+	for i := 0; i < 50000; i++ {
+		link := fmt.Sprintf("vless://user-%d@1.1.1.1:443#Node-%d", i, i)
+		st.PutWithTransition(store.Result{
+			Link:                   link,
+			Status:                 store.StatusPassed,
+			Latency:                time.Duration(50+i%300) * time.Millisecond,
+			TransportOK:            true,
+			TransportEvidenceKnown: true,
+			TransportLatency:       time.Duration(20+i%100) * time.Millisecond,
+			TestedAt:               now,
+		})
+	}
+
+	m := tui.New(ad)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = updated.(*tui.Model)
+
+	// Scroll cursor to bottom of viewport so every Down key forces a scroll
+	visibleRows := 32 // height 40 - 8 = 32
+	for i := 0; i < visibleRows-1; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = updated.(*tui.Model)
+	}
+
+	b.Cleanup(func() {
+		ad.Close()
+		bus.Close()
+	})
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = updated.(*tui.Model)
+		output := m.View()
+		if len(output) == 0 {
+			b.Fatal("empty view")
+		}
+	}
 }

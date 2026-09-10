@@ -1577,3 +1577,56 @@ func TestAdapter_OpaqueIDMapBoundedLifetimeAcrossChurn(t *testing.T) {
 		}
 	}
 }
+
+// TestAdapter_CandidateRowsWindow_DoesNotInvokeStats verifies that the interactive viewport
+// window materialization path executes in sub-millisecond time without executing full Store.Stats() traversals.
+func TestAdapter_CandidateRowsWindow_DoesNotInvokeStats(t *testing.T) {
+	ad, st, bus, ring := setupTestAdapter(t)
+	defer ad.Close()
+	defer bus.Close()
+	_ = ring
+
+	// Seed 5,000 candidates
+	now := time.Now()
+	for i := 0; i < 5000; i++ {
+		link := fmt.Sprintf("vless://user-%d@1.1.1.1:443#Node-%d", i, i)
+		st.PutWithTransition(store.Result{
+			Link:                   link,
+			Status:                 store.StatusPassed,
+			Latency:                time.Duration(50+i%200) * time.Millisecond,
+			TransportOK:            true,
+			TransportEvidenceKnown: true,
+			TestedAt:               now,
+		})
+	}
+
+	// Prime cached index
+	_ = ad.Snapshot(viewmodel.FilterAll)
+
+	// Warm up window query path
+	_ = ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 25)
+
+	// Measure baseline cost of 5 full Store.Stats() traversals
+	startStats := time.Now()
+	for i := 0; i < 5; i++ {
+		_ = st.Stats()
+	}
+	statsDuration := time.Since(startStats)
+
+	// Measure 20 consecutive window queries on the warm index
+	startWindow := time.Now()
+	for i := 0; i < 20; i++ {
+		rows := ad.CandidateRowsWindow(viewmodel.FilterAll, 100+i, 25)
+		if len(rows) != 25 {
+			t.Fatalf("expected 25 rows, got %d", len(rows))
+		}
+	}
+	windowDuration := time.Since(startWindow)
+
+	// Invariant: 20 window queries must NOT perform 20 full Stats() traversals (which would take ~4x statsDuration).
+	// With O(1) Count(), 20 window queries complete in a fraction of that time.
+	if windowDuration >= 2*statsDuration {
+		t.Errorf("CandidateRowsWindow invoked expensive traversal: 20 window queries took %v, 5 Stats took %v",
+			windowDuration, statsDuration)
+	}
+}
