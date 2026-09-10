@@ -64,3 +64,17 @@ func CanonicalizeLink(raw string) string {
 
 	return u.String() + frag
 }
+
+// CanonicalizeLinks transforms a set of raw candidate links into canonical form.
+// Duplicate raw links that share a canonical identity are naturally deduplicated.
+// This is a pure transformation that executes without locking Store state.
+func CanonicalizeLinks(currentLinks map[string]struct{}) map[string]struct{} {
+	if currentLinks == nil {
+		return nil
+	}
+	canonicalPresent := make(map[string]struct{}, len(currentLinks))
+	for raw := range currentLinks {
+		canonicalPresent[CanonicalizeLink(raw)] = struct{}{}
+	}
+	return canonicalPresent
+}
