@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-var httpClient = &http.Client{Timeout: 20 * time.Second}
+var httpClient = newHTTPClient()
 
 // FetchAll pulls every source URL and returns the deduplicated union
 // of all links found. A single failing source is logged by the
