@@ -1,4 +1,4 @@
-.PHONY: all build test clean
+.PHONY: all build test clean release-check release-snapshot
 
 BINARY := gemsub
 
@@ -12,3 +12,10 @@ test:
 
 clean:
 	rm -f $(BINARY)
+	rm -rf dist/
+
+release-check:
+	goreleaser check
+
+release-snapshot: release-check
+	goreleaser release --snapshot --clean

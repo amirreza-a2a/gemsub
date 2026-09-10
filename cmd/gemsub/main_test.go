@@ -11,6 +11,7 @@ import (
 	"gemsub/internal/config"
 	"gemsub/internal/store"
 	"gemsub/internal/tui/country"
+	"gemsub/internal/version"
 )
 
 func TestHeadlessIsolation_ZeroTUIComponents(t *testing.T) {
@@ -245,5 +246,18 @@ func TestFlagMode_Initialization(t *testing.T) {
 				t.Errorf("expected adapter flagMode %v, got %v", tt.wantMode, rt.Adapter.FlagMode())
 			}
 		})
+	}
+}
+
+func TestVersionOutput(t *testing.T) {
+	info := version.Info()
+	if !bytes.Contains([]byte(info), []byte("gemsub")) {
+		t.Errorf("expected version output to contain app name, got: %s", info)
+	}
+	if !bytes.Contains([]byte(info), []byte("commit:")) {
+		t.Errorf("expected version output to contain 'commit:', got: %s", info)
+	}
+	if !bytes.Contains([]byte(info), []byte("built:")) {
+		t.Errorf("expected version output to contain 'built:', got: %s", info)
 	}
 }

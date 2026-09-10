@@ -15,3 +15,6 @@
 # Test configurations (ephemeral)
 /test-config.json
 gemini_response.html
+
+# GoReleaser build artifacts
+/dist/

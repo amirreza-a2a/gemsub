@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"gemsub/internal/tui"
 	"gemsub/internal/tui/adapter"
 	"gemsub/internal/tui/country"
+	"gemsub/internal/version"
 )
 
 func main() {
@@ -36,7 +38,14 @@ func main() {
 	probeLimit := flag.Int("limit", 0, "limit number of parsed candidates to probe per cycle (0 = unlimited)")
 	publish := flag.Bool("publish", false, "enable git publishing after test cycles (overrides config)")
 	flagMode := flag.String("flag-mode", "", "country flag presentation mode: auto, unicode, ascii")
+	showVersion := flag.Bool("version", false, "print version information and exit")
+	flag.BoolVar(showVersion, "v", false, "print version information and exit (shorthand)")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.Info())
+		return
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {

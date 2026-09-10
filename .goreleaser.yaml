@@ -1,0 +1,99 @@
+# GoReleaser configuration for gemsub
+# Reference: https://goreleaser.com
+version: 2
+
+project_name: gemsub
+
+builds:
+  - id: gemsub-linux
+    main: ./cmd/gemsub
+    binary: gemsub
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+    tags:
+      - with_utls
+    ldflags:
+      - -s -w
+      - -X gemsub/internal/version.Version={{.Version}}
+      - -X gemsub/internal/version.Commit={{.Commit}}
+      - -X gemsub/internal/version.Date={{.Date}}
+
+  - id: gemsub-termux
+    main: ./cmd/gemsub
+    binary: gemsub
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - android
+    goarch:
+      - arm64
+    tags:
+      - with_utls
+    ldflags:
+      - -s -w
+      - -X gemsub/internal/version.Version={{.Version}}
+      - -X gemsub/internal/version.Commit={{.Commit}}
+      - -X gemsub/internal/version.Date={{.Date}}
+
+archives:
+  - id: linux-archive
+    ids:
+      - gemsub-linux
+    name_template: >-
+      {{ .ProjectName }}_Linux_{{ if eq .Arch "amd64" }}x86_64{{ else if eq .Arch "arm" }}armv{{ .Arm }}{{ else }}{{ .Arch }}{{ end }}
+    formats:
+      - tar.gz
+    files:
+      - README.md
+      - config.example.json
+
+  - id: termux-archive
+    ids:
+      - gemsub-termux
+    name_template: >-
+      {{ .ProjectName }}_Termux_{{ .Arch }}
+    formats:
+      - tar.gz
+    files:
+      - README.md
+      - config.example.json
+
+nfpms:
+  - id: linux-packages
+    ids:
+      - gemsub-linux
+    package_name: gemsub
+    vendor: gemsub
+    homepage: https://github.com/amirreza-a2a/gemsub
+    maintainer: Amirreza Ash <amirrezaashrafi000@gmail.com>
+    description: Subscription and proxy testing daemon with real target validation.
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    contents:
+      - src: config.example.json
+        dst: /etc/gemsub/config.example.json
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
