@@ -3,11 +3,14 @@ package tui_test
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"gemsub/internal/events"
 	"gemsub/internal/logging"
@@ -639,5 +642,387 @@ func BenchmarkDownKey_WithScroll_50k(b *testing.B) {
 		if len(output) == 0 {
 			b.Fatal("empty view")
 		}
+	}
+}
+
+var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+func stripANSI(s string) string {
+	return ansiEscapeRe.ReplaceAllString(s, "")
+}
+
+func TestModel_DetailBoundedSampleHistoryRendering(t *testing.T) {
+	m, st, _, _ := setupTestModel(t)
+
+	now := time.Now()
+	link := "vless://c1@1.1.1.1:443#DetailSampleTest"
+	// Push 3 distinct samples into history
+	st.PutWithTransition(store.Result{
+		Link:       link,
+		Status:     store.StatusInconclusive,
+		Category:   store.ErrTimeout,
+		Latency:    10706 * time.Millisecond,
+		Attempts:   1,
+		StatusCode: 0,
+		TestedAt:   now.Add(-23 * time.Minute),
+	})
+	st.PutWithTransition(store.Result{
+		Link:       link,
+		Status:     store.StatusPassed,
+		Category:   store.ErrNone,
+		Latency:    120 * time.Millisecond,
+		Attempts:   1,
+		StatusCode: 200,
+		TestedAt:   now.Add(-10 * time.Minute),
+	})
+	st.PutWithTransition(store.Result{
+		Link:       link,
+		Status:     store.StatusFailed,
+		Category:   store.ErrTargetRateLimited,
+		Latency:    0,
+		Attempts:   12,
+		StatusCode: 429,
+		TestedAt:   now.Add(-2 * time.Minute),
+	})
+
+	updated, _ := m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	view := m.View()
+	t.Logf("RENDERED DETAIL VIEW:\n%s\n", view)
+	lines := strings.Split(view, "\n")
+
+	var headerLine string
+	var rowLines []string
+	foundHeader := false
+	for _, l := range lines {
+		clean := stripANSI(l)
+		if strings.Contains(clean, "Bounded Sample History") {
+			continue
+		}
+		if strings.Contains(clean, "AGE") && strings.Contains(clean, "STATUS") && strings.Contains(clean, "CATEGORY") {
+			headerLine = clean
+			foundHeader = true
+			continue
+		}
+		if foundHeader {
+			if strings.TrimSpace(clean) == "" || strings.Contains(clean, "[Esc]") {
+				break
+			}
+			rowLines = append(rowLines, clean)
+		}
+	}
+
+	if !foundHeader {
+		t.Fatalf("sample history header line not found in view:\n%s", view)
+	}
+	if len(rowLines) != 3 {
+		t.Fatalf("expected 3 sample rows, got %d:\n%s", len(rowLines), strings.Join(rowLines, "\n"))
+	}
+
+	colNames := []string{"#", "AGE", "STATUS", "CATEGORY", "CODE", "LATENCY", "ATTEMPTS"}
+	headerColIndices := make(map[string]int)
+	for _, name := range colNames {
+		idx := strings.Index(headerLine, name)
+		if idx == -1 {
+			t.Fatalf("column %q not found in header line: %q", name, headerLine)
+		}
+		headerColIndices[name] = idx
+	}
+
+	expectedValues := [][]string{
+		{"1", "23m ago", "inconclusive", "timeout", "0", "10.706s", "1"},
+		{"2", "10m ago", "passed", "none", "200", "120ms", "1"},
+		{"3", "2m ago", "failed", "target_rate_limited", "429", "---", "12"},
+	}
+
+	for rowIdx, row := range rowLines {
+		if strings.HasPrefix(row, strings.Repeat(" ", 20)) {
+			t.Errorf("row %d has excessive leading whitespace (misaligned to right): %q", rowIdx+1, row)
+		}
+		for cIdx, colName := range colNames {
+			val := expectedValues[rowIdx][cIdx]
+			expectedCol := headerColIndices[colName]
+			if expectedCol+len(val) > len(row) {
+				t.Errorf("row %d column %q (%q): row line too short (len %d), expected start at %d\nHeader: %s\nRow:    %s",
+					rowIdx+1, colName, val, len(row), expectedCol, headerLine, row)
+				continue
+			}
+			actualVal := row[expectedCol : expectedCol+len(val)]
+			if actualVal != val {
+				t.Errorf("row %d column %q: expected %q at column %d, got %q\nHeader: %s\nRow:    %s",
+					rowIdx+1, colName, val, expectedCol, actualVal, headerLine, row)
+			}
+		}
+	}
+}
+
+func TestModel_DetailBoundedSampleHistoryRendering_ANSIColor(t *testing.T) {
+	// Enable ANSI color output explicitly
+	prevProfile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(prevProfile)
+
+	m, st, _, _ := setupTestModel(t)
+
+	now := time.Now()
+	link := "vless://c1@1.1.1.1:443#DetailSampleTest"
+	st.PutWithTransition(store.Result{
+		Link:       link,
+		Status:     store.StatusPassed,
+		Category:   store.ErrNone,
+		Latency:    120 * time.Millisecond,
+		Attempts:   1,
+		StatusCode: 200,
+		TestedAt:   now.Add(-10 * time.Minute),
+	})
+	st.PutWithTransition(store.Result{
+		Link:       link,
+		Status:     store.StatusFailed,
+		Category:   store.ErrTimeout,
+		Latency:    5000 * time.Millisecond,
+		Attempts:   2,
+		StatusCode: 0,
+		TestedAt:   now.Add(-5 * time.Minute),
+	})
+	st.PutWithTransition(store.Result{
+		Link:       link,
+		Status:     store.StatusInconclusive,
+		Category:   store.ErrProxyRateLimited,
+		Latency:    10706 * time.Millisecond,
+		Attempts:   3,
+		StatusCode: 429,
+		TestedAt:   now.Add(-1 * time.Minute),
+	})
+
+	updated, _ := m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	view := m.View()
+	lines := strings.Split(view, "\n")
+
+	var headerLine string
+	var rowLines []string
+	foundHeader := false
+	for _, l := range lines {
+		clean := stripANSI(l)
+		if strings.Contains(clean, "Bounded Sample History") {
+			continue
+		}
+		if strings.Contains(clean, "AGE") && strings.Contains(clean, "STATUS") && strings.Contains(clean, "CATEGORY") {
+			headerLine = clean
+			foundHeader = true
+			continue
+		}
+		if foundHeader {
+			if strings.TrimSpace(clean) == "" || strings.Contains(clean, "[Esc]") {
+				break
+			}
+			rowLines = append(rowLines, clean)
+		}
+	}
+
+	if !foundHeader {
+		t.Fatalf("sample history header line not found in view:\n%s", view)
+	}
+	if len(rowLines) != 3 {
+		t.Fatalf("expected 3 sample rows, got %d:\n%s", len(rowLines), strings.Join(rowLines, "\n"))
+	}
+
+	colNames := []string{"#", "AGE", "STATUS", "CATEGORY", "CODE", "LATENCY", "ATTEMPTS"}
+	headerColIndices := make(map[string]int)
+	for _, name := range colNames {
+		idx := strings.Index(headerLine, name)
+		if idx == -1 {
+			t.Fatalf("column %q not found in header line: %q", name, headerLine)
+		}
+		headerColIndices[name] = idx
+	}
+
+	expectedValues := [][]string{
+		{"1", "10m ago", "passed", "none", "200", "120ms", "1"},
+		{"2", "5m ago", "failed", "timeout", "0", "5s", "2"},
+		{"3", "1m ago", "inconclusive", "proxy_rate_limited", "429", "10.706s", "3"},
+	}
+
+	for rowIdx, row := range rowLines {
+		for cIdx, colName := range colNames {
+			val := expectedValues[rowIdx][cIdx]
+			expectedCol := headerColIndices[colName]
+			if expectedCol+len(val) > len(row) {
+				t.Errorf("row %d column %q (%q): row line too short (len %d), expected start at %d\nHeader: %s\nRow:    %s",
+					rowIdx+1, colName, val, len(row), expectedCol, headerLine, row)
+				continue
+			}
+			actualVal := row[expectedCol : expectedCol+len(val)]
+			if actualVal != val {
+				t.Errorf("row %d column %q: expected %q at column %d, got %q\nHeader: %s\nRow:    %s",
+					rowIdx+1, colName, val, expectedCol, actualVal, headerLine, row)
+			}
+		}
+	}
+}
+
+func TestModel_DetailBoundedSampleHistoryRendering_FitsMinimumTerminalWidth(t *testing.T) {
+	m, st, _, _ := setupTestModel(t)
+
+	now := time.Now()
+	link := "vless://c1@1.1.1.1:443#DetailSampleTest"
+	st.PutWithTransition(store.Result{
+		Link:       link,
+		Status:     store.StatusInconclusive,
+		Category:   store.ErrTargetRateLimited, // 19 chars (longest standard category)
+		Latency:    10706 * time.Millisecond,
+		Attempts:   99,
+		StatusCode: 429,
+		TestedAt:   now.Add(-23 * time.Minute),
+	})
+
+	// Minimum supported terminal geometry is 80x24
+	const minWidth = 80
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: minWidth, Height: 24})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	view := m.View()
+	lines := strings.Split(view, "\n")
+
+	var historyLines []string
+	inHistory := false
+	for _, l := range lines {
+		clean := stripANSI(l)
+		if strings.Contains(clean, "Bounded Sample History") {
+			inHistory = true
+		}
+		if inHistory {
+			if strings.TrimSpace(clean) == "" || strings.Contains(clean, "[Esc]") {
+				break
+			}
+			historyLines = append(historyLines, clean)
+		}
+	}
+
+	if len(historyLines) < 2 {
+		t.Fatalf("expected at least header and row in history, got %d lines", len(historyLines))
+	}
+
+	// Verify every history line fits strictly within minWidth without wrapping
+	for _, l := range historyLines {
+		if len(l) > minWidth {
+			t.Errorf("history line exceeds minimum terminal width %d (len %d): %q", minWidth, len(l), l)
+		}
+	}
+}
+
+func TestModel_DetailBoundedSampleHistoryRendering_MultiDigitAndClamping(t *testing.T) {
+	m, st, _, _ := setupTestModel(t)
+
+	now := time.Now()
+	link := "vless://c1@1.1.1.1:443#DetailSampleTest"
+	// Push 10 samples to test multi-digit index (10) and multi-digit attempts (e.g. 99)
+	for i := 1; i <= 9; i++ {
+		st.PutWithTransition(store.Result{
+			Link:       link,
+			Status:     store.StatusPassed,
+			Category:   store.ErrNone,
+			Latency:    time.Duration(i*10) * time.Millisecond,
+			Attempts:   1,
+			StatusCode: 200,
+			TestedAt:   now.Add(time.Duration(-10+i) * time.Minute),
+		})
+	}
+	// 10th sample: index 10, attempts 99
+	st.PutWithTransition(store.Result{
+		Link:       link,
+		Status:     store.StatusFailed,
+		Category:   store.ErrTargetRateLimited, // 19 chars
+		Latency:    9999 * time.Millisecond,
+		Attempts:   99,
+		StatusCode: 429,
+		TestedAt:   now,
+	})
+
+	updated, _ := m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	view := m.View()
+	lines := strings.Split(view, "\n")
+
+	var headerLine string
+	var row10 string
+	foundHeader := false
+	for _, l := range lines {
+		clean := stripANSI(l)
+		if strings.Contains(clean, "AGE") && strings.Contains(clean, "STATUS") {
+			headerLine = clean
+			foundHeader = true
+			continue
+		}
+		if foundHeader && strings.Contains(clean, "10 ") {
+			row10 = clean
+			break
+		}
+	}
+
+	if headerLine == "" || row10 == "" {
+		t.Fatalf("failed to locate header or row 10 in view:\n%s", view)
+	}
+
+	// In row 10, check that column # starts with "10"
+	idxCol := strings.Index(headerLine, "#")
+	if row10[idxCol:idxCol+2] != "10" {
+		t.Errorf("row 10 index expected '10' at col %d, got %q\nHeader: %s\nRow:    %s",
+			idxCol, row10[idxCol:idxCol+2], headerLine, row10)
+	}
+
+	// AGE must start at exact header AGE column
+	ageCol := strings.Index(headerLine, "AGE")
+	if !strings.HasPrefix(row10[ageCol:], "0s ago") {
+		t.Errorf("row 10 AGE expected '0s ago' at col %d\nHeader: %s\nRow:    %s",
+			ageCol, headerLine, row10)
+	}
+
+	// STATUS must start at exact header STATUS column
+	statusCol := strings.Index(headerLine, "STATUS")
+	if !strings.HasPrefix(row10[statusCol:], "failed") {
+		t.Errorf("row 10 STATUS expected 'failed' at col %d\nHeader: %s\nRow:    %s",
+			statusCol, headerLine, row10)
+	}
+
+	// CATEGORY must start at exact header CATEGORY column
+	catCol := strings.Index(headerLine, "CATEGORY")
+	if !strings.HasPrefix(row10[catCol:], "target_rate_limited") {
+		t.Errorf("row 10 CATEGORY expected 'target_rate_limited' at col %d\nHeader: %s\nRow:    %s",
+			catCol, headerLine, row10)
+	}
+
+	// CODE must start at exact header CODE column
+	codeCol := strings.Index(headerLine, "CODE")
+	if !strings.HasPrefix(row10[codeCol:], "429") {
+		t.Errorf("row 10 CODE expected '429' at col %d\nHeader: %s\nRow:    %s",
+			codeCol, headerLine, row10)
+	}
+
+	// LATENCY must start at exact header LATENCY column
+	latCol := strings.Index(headerLine, "LATENCY")
+	if !strings.HasPrefix(row10[latCol:], "9.999s") {
+		t.Errorf("row 10 LATENCY expected '9.999s' at col %d\nHeader: %s\nRow:    %s",
+			latCol, headerLine, row10)
+	}
+
+	// ATTEMPTS must start at exact header ATTEMPTS column
+	attCol := strings.Index(headerLine, "ATTEMPTS")
+	if !strings.HasPrefix(row10[attCol:], "99") {
+		t.Errorf("row 10 ATTEMPTS expected '99' at col %d\nHeader: %s\nRow:    %s",
+			attCol, headerLine, row10)
 	}
 }

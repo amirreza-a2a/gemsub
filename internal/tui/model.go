@@ -703,7 +703,10 @@ func (m *Model) renderDetail() string {
 		sb.WriteString(dim.Render("  No samples recorded."))
 		sb.WriteString("\n")
 	} else {
-		sb.WriteString(dim.Render("  #  AGE        STATUS    CATEGORY              CODE  LATENCY    ATTEMPTS\n"))
+		headerStr := fmt.Sprintf("  %-2s %-10s %-12s %-21s %-5s %-10s %-8s",
+			"#", "AGE", "STATUS", "CATEGORY", "CODE", "LATENCY", "ATTEMPTS")
+		sb.WriteString(dim.Render(headerStr))
+		sb.WriteString("\n")
 		for _, s := range m.detail.Samples {
 			statusColor := dim
 			switch s.Status {
@@ -716,12 +719,27 @@ func (m *Model) renderDetail() string {
 			if cat == "" {
 				cat = "none"
 			}
+			if len(cat) > 21 {
+				cat = cat[:20] + "…"
+			}
 			latStr := "---"
 			if s.Latency > 0 {
 				latStr = s.Latency.Round(time.Millisecond).String()
 			}
-			sb.WriteString(fmt.Sprintf("  %-2d %-10s %-9s %-21s %-5d %-10s %-8d\n",
-				s.Index, s.Age, statusColor.Render(s.Status), cat, s.StatusCode, latStr, s.Attempts))
+			if len(latStr) > 10 {
+				latStr = latStr[:10]
+			}
+			ageStr := s.Age
+			if len(ageStr) > 10 {
+				ageStr = ageStr[:10]
+			}
+			st := s.Status
+			if len(st) > 12 {
+				st = st[:12]
+			}
+			statusCell := statusColor.Render(fmt.Sprintf("%-12s", st))
+			sb.WriteString(fmt.Sprintf("  %-2d %-10s %s %-21s %-5d %-10s %-8d\n",
+				s.Index, ageStr, statusCell, cat, s.StatusCode, latStr, s.Attempts))
 		}
 	}
 
