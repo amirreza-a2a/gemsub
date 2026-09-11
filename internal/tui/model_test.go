@@ -12,12 +12,14 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
+	"gemsub/internal/config"
 	"gemsub/internal/events"
 	"gemsub/internal/logging"
 	"gemsub/internal/store"
 	"gemsub/internal/tui"
 	"gemsub/internal/tui/adapter"
 	"gemsub/internal/tui/country"
+	"gemsub/internal/tui/viewmodel"
 )
 
 func setupTestModel(t *testing.T) (*tui.Model, *store.Store, *events.EventBus, *logging.RingLogHandler) {
@@ -1024,5 +1026,473 @@ func TestModel_DetailBoundedSampleHistoryRendering_MultiDigitAndClamping(t *test
 	if !strings.HasPrefix(row10[attCol:], "99") {
 		t.Errorf("row 10 ATTEMPTS expected '99' at col %d\nHeader: %s\nRow:    %s",
 			attCol, headerLine, row10)
+	}
+}
+
+func TestModel_ConfigCenterViewSwitching(t *testing.T) {
+	m, _, _, _ := setupTestModel(t)
+
+	// 1. Initial view is Candidates view
+	view0 := m.View()
+	if !strings.Contains(view0, "SERV") || !strings.Contains(view0, "ENDPOINT") {
+		t.Fatalf("expected candidate table initially, got:\n%s", view0)
+	}
+	if !strings.Contains(view0, "[c] Config") {
+		t.Errorf("expected '[c] Config' hint in Candidates footer, got:\n%s", view0)
+	}
+
+	// 2. Press 'c' from Candidates -> switches to ViewConfig
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(*tui.Model)
+
+	viewConfig := m.View()
+	if !strings.Contains(viewConfig, "CONFIGURATION CENTER") {
+		t.Fatalf("expected CONFIGURATION CENTER view after pressing 'c', got:\n%s", viewConfig)
+	}
+	if !strings.Contains(viewConfig, "[General]") {
+		t.Errorf("expected [General] active tab in config center, got:\n%s", viewConfig)
+	}
+	if !strings.Contains(viewConfig, "[Esc] Back") {
+		t.Errorf("expected '[Esc] Back' hint in Config Center footer, got:\n%s", viewConfig)
+	}
+
+	// 3. Press 'Esc' from ViewConfig -> returns cleanly to Candidates
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	m = updated.(*tui.Model)
+
+	viewBack := m.View()
+	if !strings.Contains(viewBack, "SERV") || !strings.Contains(viewBack, "ENDPOINT") {
+		t.Fatalf("expected return to Candidates table after Esc, got:\n%s", viewBack)
+	}
+	if strings.Contains(viewBack, "CONFIGURATION CENTER") {
+		t.Errorf("did not expect CONFIGURATION CENTER after Esc, got:\n%s", viewBack)
+	}
+
+	// 4. Press 'Tab' to switch to Logs view
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+
+	viewLogs := m.View()
+	if !strings.Contains(viewLogs, "LOG VIEWER") {
+		t.Fatalf("expected LOG VIEWER after Tab, got:\n%s", viewLogs)
+	}
+	if !strings.Contains(viewLogs, "[c] Config") {
+		t.Errorf("expected '[c] Config' hint in Logs footer, got:\n%s", viewLogs)
+	}
+
+	// 5. Press 'c' from Logs -> switches to ViewConfig
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(*tui.Model)
+
+	viewConfigFromLogs := m.View()
+	if !strings.Contains(viewConfigFromLogs, "CONFIGURATION CENTER") {
+		t.Fatalf("expected CONFIGURATION CENTER from Logs, got:\n%s", viewConfigFromLogs)
+	}
+
+	// 6. Press 'Esc' from ViewConfig -> returns cleanly to Logs
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	m = updated.(*tui.Model)
+
+	viewBackToLogs := m.View()
+	if !strings.Contains(viewBackToLogs, "LOG VIEWER") {
+		t.Fatalf("expected return to LOG VIEWER after Esc, got:\n%s", viewBackToLogs)
+	}
+}
+
+func TestModel_ConfigCenterCategoryNavigation(t *testing.T) {
+	m, _, _, _ := setupTestModel(t)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(*tui.Model)
+
+	expectedOrder := []string{"General", "Sources", "Testing", "Gemini", "Scheduler", "Publishing"}
+
+	// Verify initial category is General
+	view := m.View()
+	if !strings.Contains(view, "["+expectedOrder[0]+"]") {
+		t.Fatalf("expected active category [%s], got:\n%s", expectedOrder[0], view)
+	}
+
+	// 1. Forward navigation with Tab
+	for i := 1; i < len(expectedOrder); i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = updated.(*tui.Model)
+		v := m.View()
+		if !strings.Contains(v, "["+expectedOrder[i]+"]") {
+			t.Errorf("after Tab %d: expected active category [%s], got:\n%s", i, expectedOrder[i], v)
+		}
+	}
+
+	// Tab wraps from Publishing -> General
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+	if v := m.View(); !strings.Contains(v, "[General]") {
+		t.Errorf("expected Tab to wrap to [General], got:\n%s", v)
+	}
+
+	// 2. Forward navigation with 'l' and 'right'
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(*tui.Model)
+	if v := m.View(); !strings.Contains(v, "[Sources]") {
+		t.Errorf("expected 'l' to navigate to [Sources], got:\n%s", v)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m = updated.(*tui.Model)
+	if v := m.View(); !strings.Contains(v, "[Testing]") {
+		t.Errorf("expected 'right' to navigate to [Testing], got:\n%s", v)
+	}
+
+	// 3. Backward navigation with 'h' and 'left'
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m = updated.(*tui.Model)
+	if v := m.View(); !strings.Contains(v, "[Sources]") {
+		t.Errorf("expected 'h' to navigate back to [Sources], got:\n%s", v)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m = updated.(*tui.Model)
+	if v := m.View(); !strings.Contains(v, "[General]") {
+		t.Errorf("expected 'left' to navigate back to [General], got:\n%s", v)
+	}
+
+	// 4. Backward navigation with Shift+Tab (wraps to Publishing)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	m = updated.(*tui.Model)
+	if v := m.View(); !strings.Contains(v, "[Publishing]") {
+		t.Errorf("expected Shift+Tab from General to wrap to [Publishing], got:\n%s", v)
+	}
+
+	// Shift+Tab from Publishing -> Scheduler
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	m = updated.(*tui.Model)
+	if v := m.View(); !strings.Contains(v, "[Scheduler]") {
+		t.Errorf("expected Shift+Tab from Publishing to move to [Scheduler], got:\n%s", v)
+	}
+}
+
+func TestModel_ConfigCenterItemNavigation(t *testing.T) {
+	m, _, _, _ := setupTestModel(t)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(*tui.Model)
+
+	// In General category, cursor should initially highlight the first item
+	view0 := m.View()
+	if !strings.Contains(view0, "> Listen Address") {
+		t.Fatalf("expected cursor '> ' on 'Listen Address', got:\n%s", view0)
+	}
+
+	// Move cursor down: 'j'
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = updated.(*tui.Model)
+	view1 := m.View()
+	if !strings.Contains(view1, "> Subscription Path") {
+		t.Fatalf("expected cursor '> ' on 'Subscription Path', got:\n%s", view1)
+	}
+
+	// Move cursor up: 'k'
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	m = updated.(*tui.Model)
+	view2 := m.View()
+	if !strings.Contains(view2, "> Listen Address") {
+		t.Fatalf("expected cursor '> ' back on 'Listen Address', got:\n%s", view2)
+	}
+
+	// Jump to bottom: 'G'
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	m = updated.(*tui.Model)
+	viewBottom := m.View()
+	if !strings.Contains(viewBottom, "> Headless Mode") {
+		t.Fatalf("expected cursor on last item 'Headless Mode', got:\n%s", viewBottom)
+	}
+
+	// Jump to top: 'g'
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = updated.(*tui.Model)
+	viewTop := m.View()
+	if !strings.Contains(viewTop, "> Listen Address") {
+		t.Fatalf("expected cursor on first item 'Listen Address', got:\n%s", viewTop)
+	}
+
+	// Switch category: cursor index should reset to 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+	viewSources := m.View()
+	if !strings.Contains(viewSources, "[Sources]") {
+		t.Fatalf("expected [Sources] tab, got:\n%s", viewSources)
+	}
+	// Cursor should be at the top of the new category
+	if !strings.Contains(viewSources, "> ") {
+		t.Errorf("expected cursor '> ' on first item in Sources, got:\n%s", viewSources)
+	}
+}
+
+func TestModel_ConfigCenterTerminalBounds_80x24(t *testing.T) {
+	m, _, _, _ := setupTestModel(t)
+
+	// Set terminal to minimum supported geometry: 80x24
+	const termWidth = 80
+	const termHeight = 24
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: termWidth, Height: termHeight})
+	m = updated.(*tui.Model)
+
+	// Enter Config Center
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(*tui.Model)
+
+	// Verify for all 6 categories that the output strictly conforms to 80x24 bounds
+	for cat := 0; cat < viewmodel.ConfigCategoryCount; cat++ {
+		view := m.View()
+		cleanView := stripANSI(view)
+		lines := strings.Split(cleanView, "\n")
+
+		if len(lines) != termHeight {
+			t.Errorf("category %d: expected exactly %d lines, got %d", cat, termHeight, len(lines))
+		}
+
+		for lineIdx, line := range lines {
+			if w := lipgloss.Width(line); w > termWidth {
+				t.Errorf("category %d line %d visual width exceeds width %d (got %d): %q",
+					cat, lineIdx+1, termWidth, w, line)
+			}
+		}
+
+		// Navigate to next category
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = updated.(*tui.Model)
+	}
+}
+
+type testDecoupledController struct {
+	configCenter viewmodel.ConfigCenterViewModel
+}
+
+func (c *testDecoupledController) Snapshot(filter viewmodel.FilterMode) viewmodel.SnapshotViewModel {
+	return viewmodel.SnapshotViewModel{}
+}
+
+func (c *testDecoupledController) PollSnapshot(filter viewmodel.FilterMode) (viewmodel.SnapshotViewModel, bool) {
+	return viewmodel.SnapshotViewModel{}, false
+}
+
+func (c *testDecoupledController) CandidateDetail(opaqueID string) (viewmodel.CandidateDetailViewModel, bool) {
+	return viewmodel.CandidateDetailViewModel{}, false
+}
+
+func (c *testDecoupledController) CycleLogLevel() (viewmodel.LogViewModel, string) {
+	return viewmodel.LogViewModel{}, "INFO"
+}
+
+func (c *testDecoupledController) CopyCandidateLink(opaqueID string) error {
+	return nil
+}
+
+func (c *testDecoupledController) CandidateRowsWindow(filter viewmodel.FilterMode, offset, limit int) []viewmodel.CandidateRowViewModel {
+	return nil
+}
+
+func (c *testDecoupledController) ConfigCenter() viewmodel.ConfigCenterViewModel {
+	return c.configCenter
+}
+
+func TestModel_ConfigCenterDecoupledController(t *testing.T) {
+	mock := &testDecoupledController{
+		configCenter: viewmodel.ConfigCenterViewModel{
+			Categories: []viewmodel.ConfigCategoryViewModel{
+				{
+					Category: viewmodel.CategoryGeneral,
+					Name:     "General",
+					Items: []viewmodel.ConfigItemViewModel{
+						{Label: "Mock Host", Value: "127.0.0.1:9090"},
+						{Label: "Mock State", Value: "/var/tmp/mock.json"},
+					},
+				},
+				{
+					Category: viewmodel.CategorySources,
+					Name:     "Sources",
+					Items: []viewmodel.ConfigItemViewModel{
+						{Label: "Mock Source", Value: "https://mock.example.com/sub"},
+					},
+				},
+				{
+					Category: viewmodel.CategoryTesting,
+					Name:     "Testing",
+					Items: []viewmodel.ConfigItemViewModel{
+						{Label: "Mock Concurrency", Value: "42"},
+					},
+				},
+				{
+					Category: viewmodel.CategoryGemini,
+					Name:     "Gemini",
+					Items: []viewmodel.ConfigItemViewModel{
+						{Label: "Mock Gemini URL", Value: "https://mock.gemini.dev"},
+					},
+				},
+				{
+					Category: viewmodel.CategoryScheduler,
+					Name:     "Scheduler",
+					Items: []viewmodel.ConfigItemViewModel{
+						{Label: "Mock Daemon", Value: "Running Active"},
+					},
+				},
+				{
+					Category: viewmodel.CategoryPublishing,
+					Name:     "Publishing",
+					Items: []viewmodel.ConfigItemViewModel{
+						{Label: "Mock Pub", Value: "Published 99 times"},
+					},
+				},
+			},
+		},
+	}
+
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(*tui.Model)
+
+	view := m.View()
+	if !strings.Contains(view, "Mock Host") || !strings.Contains(view, "127.0.0.1:9090") {
+		t.Errorf("expected view to render decoupled mock data 'Mock Host: 127.0.0.1:9090', got:\n%s", view)
+	}
+
+	// Switch to Sources
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+	viewSources := m.View()
+	if !strings.Contains(viewSources, "Mock Source") || !strings.Contains(viewSources, "https://mock.example.com/sub") {
+		t.Errorf("expected view to render decoupled mock data for Sources, got:\n%s", viewSources)
+	}
+}
+
+func TestModel_ConfigCenter_LiveRefreshWhileInViewConfig(t *testing.T) {
+	t.Setenv("COLORTERM", "")
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "state.json")
+
+	st := store.New(stateFile, 2)
+	bus := events.New()
+	ring := logging.NewRingLogHandler(100)
+
+	ad := adapter.New(st, bus, ring)
+	ad.Subscribe()
+	t.Cleanup(func() {
+		ad.Close()
+		bus.Close()
+	})
+
+	m := tui.New(ad)
+
+	// 1. Enter ViewConfig
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(*tui.Model)
+
+	// Verify we are in ViewConfig
+	view := m.View()
+	if !strings.Contains(view, "CONFIGURATION CENTER") {
+		t.Fatalf("expected CONFIGURATION CENTER, got:\n%s", view)
+	}
+
+	// 2. Navigate to Scheduler category (Tab x4 from General: Sources -> Testing -> Gemini -> Scheduler)
+	for i := 0; i < 4; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = updated.(*tui.Model)
+	}
+	if v := m.View(); !strings.Contains(v, "[Scheduler]") {
+		t.Fatalf("expected [Scheduler] tab, got:\n%s", v)
+	}
+	if v := m.View(); strings.Contains(v, "77 candidates") {
+		t.Fatalf("unexpected '77 candidates' before ConfigUpdated event, got:\n%s", v)
+	}
+
+	// 3. Emit ConfigUpdated while remaining in ViewConfig
+	bus.Publish(events.ConfigUpdated{
+		Old: config.Config{ProbeLimit: 0},
+		New: config.Config{ProbeLimit: 77, FetchIntervalRaw: "7m"},
+	})
+
+	// Wait briefly for the adapter's event loop to mark dirty
+	time.Sleep(50 * time.Millisecond)
+
+	// Send TickMsg to trigger presentation polling and refresh
+	updated, _ = m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+
+	schedView := m.View()
+	if !strings.Contains(schedView, "77 candidates") {
+		t.Errorf("expected live refresh to show '77 candidates' while in ViewConfig, got:\n%s", schedView)
+	}
+	if !strings.Contains(schedView, "7m") {
+		t.Errorf("expected live refresh to show '7m' interval while in ViewConfig, got:\n%s", schedView)
+	}
+
+	// 4. Navigate to Publishing category (Tab x1: Scheduler -> Publishing)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+	if v := m.View(); !strings.Contains(v, "[Publishing]") {
+		t.Fatalf("expected [Publishing] tab, got:\n%s", v)
+	}
+
+	// 5. Emit PublishingStarted while remaining in ViewConfig
+	bus.Publish(events.PublishingStarted{
+		StartedAt:  time.Now(),
+		Repository: "test-repo",
+		Branch:     "main",
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	updated, _ = m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+	pubView1 := m.View()
+	if !strings.Contains(pubView1, "Publishing...") {
+		t.Errorf("expected live refresh to show 'Publishing...' on PublishingStarted, got:\n%s", pubView1)
+	}
+
+	// 6. Emit PublishingFinished while remaining in ViewConfig
+	bus.Publish(events.PublishingFinished{
+		StartedAt:  time.Now().Add(-1 * time.Second),
+		FinishedAt: time.Now(),
+		Duration:   time.Second,
+		Repository: "test-repo",
+		Branch:     "main",
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	updated, _ = m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+	pubView2 := m.View()
+	if !strings.Contains(pubView2, "Idle") {
+		t.Errorf("expected live refresh to show 'Idle' on PublishingFinished, got:\n%s", pubView2)
+	}
+	if !strings.Contains(pubView2, "1 succeeded") {
+		t.Errorf("expected live refresh to show '1 succeeded' on PublishingFinished, got:\n%s", pubView2)
+	}
+
+	// 7. Emit PublishingFailed while remaining in ViewConfig
+	bus.Publish(events.PublishingFailed{
+		StartedAt:  time.Now().Add(-1 * time.Second),
+		FailedAt:   time.Now(),
+		Duration:   time.Second,
+		Repository: "test-repo",
+		Branch:     "main",
+		Error:      "git remote rejected credentials for https://oauth2:secretToken@github.com/test/repo",
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	updated, _ = m.Update(tui.TickMsg(time.Now()))
+	m = updated.(*tui.Model)
+	pubView3 := m.View()
+	if !strings.Contains(pubView3, "1 failed") {
+		t.Errorf("expected live refresh to show '1 failed' on PublishingFailed, got:\n%s", pubView3)
+	}
+	if !strings.Contains(pubView3, "git remote rejected") {
+		t.Errorf("expected live refresh to display sanitized error on PublishingFailed, got:\n%s", pubView3)
+	}
+	if strings.Contains(pubView3, "secretToken") {
+		t.Errorf("CRITICAL: secretToken leaked in failure message: %s", pubView3)
 	}
 }

@@ -5,13 +5,18 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"gemsub/internal/clipboard"
+	"gemsub/internal/config"
 	"gemsub/internal/events"
 	"gemsub/internal/logging"
+	"gemsub/internal/publisher"
+	"gemsub/internal/scheduler"
+	"gemsub/internal/source"
 	"gemsub/internal/store"
 	"gemsub/internal/tui/country"
 	"gemsub/internal/tui/viewmodel"
@@ -71,6 +76,20 @@ type Adapter struct {
 	// Test synchronization hooks
 	beforePruneLockHook func()
 	rebuildInFlightHook func()
+
+	// Application services for Configuration Center
+	configSvc     *config.Service
+	sourceSvc     *source.Service
+	publishSvc    *publisher.Service
+	schedulerCtrl *scheduler.ControlService
+
+	// Event-driven configuration/publishing cache (used when services are nil or as event fallback)
+	lastCfg          config.Config
+	pubRunning       bool
+	lastPublished    time.Time
+	lastPublishError string
+	publishCount     int
+	publishFailCount int
 }
 
 // New creates an unstarted Adapter.
@@ -185,14 +204,31 @@ func (a *Adapter) handleEvent(evt any) {
 		atomic.StoreInt32(&a.dirty, 1)
 
 	case events.ConfigUpdated:
+		a.lastCfg = e.New
 		newMode := country.Mode(e.New.FlagMode)
 		if newMode == "" {
 			newMode = country.ModeAuto
 		}
 		if newMode != a.flagMode {
 			a.flagMode = newMode
-			atomic.StoreInt32(&a.dirty, 1)
 		}
+		atomic.StoreInt32(&a.dirty, 1)
+
+	case events.PublishingStarted:
+		a.pubRunning = true
+		atomic.StoreInt32(&a.dirty, 1)
+
+	case events.PublishingFinished:
+		a.pubRunning = false
+		a.lastPublished = e.FinishedAt
+		a.publishCount++
+		atomic.StoreInt32(&a.dirty, 1)
+
+	case events.PublishingFailed:
+		a.pubRunning = false
+		a.lastPublishError = e.Error
+		a.publishFailCount++
+		atomic.StoreInt32(&a.dirty, 1)
 	}
 }
 
@@ -911,4 +947,277 @@ func (a *Adapter) CopyCandidateLink(opaqueID string) error {
 		return fmt.Errorf("candidate not found: %s", opaqueID)
 	}
 	return clipboard.CopyToClipboard(rawLink)
+}
+
+// SetServices injects application services into the Adapter for Configuration Center presentation queries.
+func (a *Adapter) SetServices(cfgSvc *config.Service, srcSvc *source.Service, pubSvc *publisher.Service, schedCtrl *scheduler.ControlService) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.configSvc = cfgSvc
+	a.sourceSvc = srcSvc
+	a.publishSvc = pubSvc
+	a.schedulerCtrl = schedCtrl
+	atomic.StoreInt32(&a.dirty, 1)
+}
+
+// ConfigCenter queries application services and builds a decoupled presentation ViewModel
+// for all configuration categories.
+func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
+	a.mu.RLock()
+	cfgSvc := a.configSvc
+	srcSvc := a.sourceSvc
+	pubSvc := a.publishSvc
+	schedCtrl := a.schedulerCtrl
+	flagMode := a.flagMode
+
+	eventCfg := a.lastCfg
+	eventPubRunning := a.pubRunning
+	eventLastPublished := a.lastPublished
+	eventLastPublishError := a.lastPublishError
+	eventPublishCount := a.publishCount
+	eventPublishFailCount := a.publishFailCount
+	a.mu.RUnlock()
+
+	var cfg config.Config
+	if cfgSvc != nil {
+		cfg = cfgSvc.Get()
+	} else {
+		cfg = eventCfg
+	}
+
+	categories := make([]viewmodel.ConfigCategoryViewModel, viewmodel.ConfigCategoryCount)
+
+	// 1. General Category
+	generalItems := []viewmodel.ConfigItemViewModel{
+		{Label: "Listen Address", Value: valueOrFallback(cfg.Serve.Listen, "(not set)")},
+		{Label: "Subscription Path", Value: valueOrFallback(cfg.Serve.Path, "(not set)")},
+		{Label: "Subscription Format", Value: valueOrFallback(cfg.Serve.Format, "raw")},
+		{Label: "Country Flag Mode", Value: valueOrFallback(cfg.FlagMode, string(flagMode))},
+		{Label: "State File", Value: valueOrFallback(cfg.StateFile, "(none)")},
+		{Label: "Headless Mode", Value: fmt.Sprintf("%t", cfg.Headless)},
+	}
+	categories[viewmodel.CategoryGeneral] = viewmodel.ConfigCategoryViewModel{
+		Category: viewmodel.CategoryGeneral,
+		Name:     viewmodel.CategoryGeneral.Name(),
+		Items:    generalItems,
+	}
+
+	// 2. Sources Category
+	var sources []config.SourceItem
+	if srcSvc != nil {
+		sources = srcSvc.List()
+	} else {
+		sources = cfg.Sources
+	}
+	var sourceItems []viewmodel.ConfigItemViewModel
+	if len(sources) == 0 {
+		sourceItems = append(sourceItems, viewmodel.ConfigItemViewModel{
+			Label: "Status",
+			Value: "No subscription sources configured",
+		})
+	} else {
+		sourceItems = append(sourceItems, viewmodel.ConfigItemViewModel{
+			Label: "Total Sources",
+			Value: fmt.Sprintf("%d configured", len(sources)),
+		})
+		for i, src := range sources {
+			state := "enabled"
+			if !src.Enabled {
+				state = "disabled"
+			}
+			name := src.Name
+			if name == "" {
+				name = fmt.Sprintf("Source #%d", i+1)
+			}
+			sourceItems = append(sourceItems, viewmodel.ConfigItemViewModel{
+				Label: name,
+				Value: fmt.Sprintf("[%s] %s", state, publisher.SanitizeURL(src.URL)),
+			})
+		}
+	}
+	categories[viewmodel.CategorySources] = viewmodel.ConfigCategoryViewModel{
+		Category: viewmodel.CategorySources,
+		Name:     viewmodel.CategorySources.Name(),
+		Items:    sourceItems,
+	}
+
+	// 3. Testing Category
+	maxRetriesStr := fmt.Sprintf("%d", cfg.Test.MaxRetries)
+	if cfg.Test.MaxRetriesRaw == nil {
+		maxRetriesStr += " (default)"
+	}
+	rateLimitStr := "unlimited"
+	if cfg.Test.RateLimitRPS > 0 {
+		rateLimitStr = fmt.Sprintf("%d rps", cfg.Test.RateLimitRPS)
+	}
+	testingItems := []viewmodel.ConfigItemViewModel{
+		{Label: "Test Timeout", Value: valueOrFallback(cfg.Test.TimeoutRaw, "(default)")},
+		{Label: "Concurrency", Value: fmt.Sprintf("%d workers", cfg.Test.Concurrency)},
+		{Label: "Max Retries", Value: maxRetriesStr},
+		{Label: "Retry Backoff", Value: valueOrFallback(cfg.Test.RetryBackoffRaw, "(default)")},
+		{Label: "Health Check URL", Value: valueOrFallback(publisher.SanitizeURL(cfg.Test.HealthURL), "(none)")},
+		{Label: "Dial Timeout", Value: valueOrFallback(cfg.Test.DialTimeoutRaw, "(default)")},
+		{Label: "Max Inconclusive Cycles", Value: fmt.Sprintf("%d", cfg.Test.MaxInconclusiveCycles)},
+		{Label: "Rate Limit RPS", Value: rateLimitStr},
+	}
+	categories[viewmodel.CategoryTesting] = viewmodel.ConfigCategoryViewModel{
+		Category: viewmodel.CategoryTesting,
+		Name:     viewmodel.CategoryTesting.Name(),
+		Items:    testingItems,
+	}
+
+	// 4. Gemini Category
+	blockPhrasesStr := "(none)"
+	if len(cfg.Test.Gemini.BlockPhrases) > 0 {
+		blockPhrasesStr = strings.Join(cfg.Test.Gemini.BlockPhrases, ", ")
+	}
+	geminiItems := []viewmodel.ConfigItemViewModel{
+		{Label: "Gemini Target URL", Value: valueOrFallback(publisher.SanitizeURL(cfg.Test.Gemini.URL), "(none)")},
+		{Label: "Block Phrases", Value: blockPhrasesStr},
+	}
+	categories[viewmodel.CategoryGemini] = viewmodel.ConfigCategoryViewModel{
+		Category: viewmodel.CategoryGemini,
+		Name:     viewmodel.CategoryGemini.Name(),
+		Items:    geminiItems,
+	}
+
+	// 5. Scheduler Category
+	probeLimitStr := "unlimited"
+	if cfg.ProbeLimit > 0 {
+		probeLimitStr = fmt.Sprintf("%d candidates", cfg.ProbeLimit)
+	}
+	schedulerItems := []viewmodel.ConfigItemViewModel{
+		{Label: "Fetch Interval", Value: valueOrFallback(cfg.FetchIntervalRaw, "(not set)")},
+		{Label: "Probe Limit", Value: probeLimitStr},
+	}
+	if schedCtrl != nil {
+		schedStatus := schedCtrl.Status()
+		daemonStatus := "Stopped"
+		if schedStatus.Running {
+			daemonStatus = "Running"
+		}
+		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
+			Label: "Daemon Status",
+			Value: daemonStatus,
+		})
+		cycleActive := "No"
+		if schedStatus.CycleActive {
+			cycleActive = "Yes (probes in progress)"
+		}
+		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
+			Label: "Cycle Active",
+			Value: cycleActive,
+		})
+		lastCycleStr := "Never"
+		if !schedStatus.LastCycleStart.IsZero() {
+			lastCycleStr = schedStatus.LastCycleStart.Format("15:04:05")
+		}
+		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
+			Label: "Last Cycle Start",
+			Value: lastCycleStr,
+		})
+		if schedStatus.LastDuration > 0 {
+			schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
+				Label: "Last Duration",
+				Value: schedStatus.LastDuration.Round(time.Millisecond).String(),
+			})
+		}
+	} else {
+		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
+			Label: "Daemon Status",
+			Value: "Not initialized",
+		})
+	}
+	categories[viewmodel.CategoryScheduler] = viewmodel.ConfigCategoryViewModel{
+		Category: viewmodel.CategoryScheduler,
+		Name:     viewmodel.CategoryScheduler.Name(),
+		Items:    schedulerItems,
+	}
+
+	// 6. Publishing Category
+	cleanRepo := publisher.SanitizeMessage(cfg.Publishing.Repository)
+	cleanRemoteURL := publisher.SanitizeURL(cfg.Publishing.RemoteURL)
+	publishingItems := []viewmodel.ConfigItemViewModel{
+		{Label: "Publishing Enabled", Value: fmt.Sprintf("%t", cfg.Publishing.Enabled)},
+		{Label: "Target Repository", Value: valueOrFallback(cleanRepo, "(none)")},
+		{Label: "Target Branch", Value: valueOrFallback(cfg.Publishing.Branch, "(default)")},
+		{Label: "Remote URL", Value: valueOrFallback(cleanRemoteURL, "(none)")},
+	}
+	if pubSvc != nil {
+		pStatus := pubSvc.Status()
+		pubRun := "Idle"
+		if pStatus.Running {
+			pubRun = "Publishing..."
+		}
+		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+			Label: "Publish Status",
+			Value: pubRun,
+		})
+		lastPub := "Never"
+		if !pStatus.LastPublished.IsZero() {
+			lastPub = pStatus.LastPublished.Format("15:04:05")
+		}
+		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+			Label: "Last Published",
+			Value: lastPub,
+		})
+		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+			Label: "Publish Count",
+			Value: fmt.Sprintf("%d succeeded, %d failed", pStatus.PublishCount, pStatus.FailCount),
+		})
+		if pStatus.LastError != "" {
+			publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+				Label: "Last Error",
+				Value: publisher.SanitizeMessage(pStatus.LastError),
+			})
+		}
+	} else if eventPublishCount > 0 || eventPublishFailCount > 0 || eventPubRunning || eventLastPublishError != "" || !eventLastPublished.IsZero() {
+		pubRun := "Idle"
+		if eventPubRunning {
+			pubRun = "Publishing..."
+		}
+		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+			Label: "Publish Status",
+			Value: pubRun,
+		})
+		lastPub := "Never"
+		if !eventLastPublished.IsZero() {
+			lastPub = eventLastPublished.Format("15:04:05")
+		}
+		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+			Label: "Last Published",
+			Value: lastPub,
+		})
+		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+			Label: "Publish Count",
+			Value: fmt.Sprintf("%d succeeded, %d failed", eventPublishCount, eventPublishFailCount),
+		})
+		if eventLastPublishError != "" {
+			publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+				Label: "Last Error",
+				Value: publisher.SanitizeMessage(eventLastPublishError),
+			})
+		}
+	} else {
+		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+			Label: "Publish Status",
+			Value: "Not initialized",
+		})
+	}
+	categories[viewmodel.CategoryPublishing] = viewmodel.ConfigCategoryViewModel{
+		Category: viewmodel.CategoryPublishing,
+		Name:     viewmodel.CategoryPublishing.Name(),
+		Items:    publishingItems,
+	}
+
+	return viewmodel.ConfigCenterViewModel{
+		Categories: categories,
+	}
+}
+
+func valueOrFallback(val, fallback string) string {
+	if strings.TrimSpace(val) == "" {
+		return fallback
+	}
+	return val
 }

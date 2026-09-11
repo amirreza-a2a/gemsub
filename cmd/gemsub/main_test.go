@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -461,5 +463,94 @@ func TestProductionRuntime_PublishingServiceWiring(t *testing.T) {
 	}
 	if cfgSvc.Get().Publishing.Branch != "release" {
 		t.Errorf("expected ConfigService to reflect Branch=release, got %s", cfgSvc.Get().Publishing.Branch)
+	}
+}
+
+func TestProductionRuntime_AdapterServicesWiring(t *testing.T) {
+	origLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	pubRepo := filepath.Join(tmpDir, "pub-repo")
+	_ = os.MkdirAll(pubRepo, 0o755)
+
+	secretToken := "ghp_prodSecret123"
+	rawRemoteURL := fmt.Sprintf("https://token:%s@github.com/prod/sub.git", secretToken)
+
+	cfg := &config.Config{
+		StateFile: filepath.Join(tmpDir, "state.json"),
+		Sources: []config.SourceItem{
+			{URL: "https://source.example.com/feed", Name: "FeedOne", Enabled: true},
+		},
+		FetchIntervalRaw: "3m",
+		Serve: config.ServeConfig{
+			Listen: ":8899",
+			Path:   "/prod-sub",
+			Format: "raw",
+		},
+		Test: config.TestConfig{
+			TimeoutRaw:  "8s",
+			Concurrency: 4,
+			Gemini: config.GeminiConfig{
+				URL:          "https://gemini.google.com/",
+				BlockPhrases: []string{"blocked"},
+			},
+		},
+		Publishing: config.PublishingConfig{
+			Enabled:    true,
+			Repository: pubRepo,
+			Branch:     "prod",
+			RemoteURL:  rawRemoteURL,
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg.Validate: %v", err)
+	}
+
+	cfgSvc, err := config.NewService(cfgPath, cfg, nil)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	rt, cleanup := setupRuntime(cfg, &logBuf, cfgSvc)
+	defer cleanup()
+
+	if rt.Adapter == nil {
+		t.Fatal("expected rt.Adapter to be non-nil in non-headless mode")
+	}
+
+	// Query ConfigCenter from the wired adapter
+	vm := rt.Adapter.ConfigCenter()
+	if len(vm.Categories) != 6 {
+		t.Fatalf("expected 6 categories in ConfigCenter, got %d", len(vm.Categories))
+	}
+
+	// 1. General category reflects wired cfg
+	foundListen := false
+	for _, item := range vm.Categories[0].Items {
+		if item.Label == "Listen Address" && item.Value == ":8899" {
+			foundListen = true
+		}
+	}
+	if !foundListen {
+		t.Errorf("expected Listen Address :8899 in General category")
+	}
+
+	// 2. Publishing category sanitizes credentials
+	for _, item := range vm.Categories[5].Items {
+		if strings.Contains(item.Value, secretToken) {
+			t.Fatalf("CRITICAL: secret %q leaked in ConfigCenter: %q", secretToken, item.Value)
+		}
+	}
+	foundMasked := false
+	for _, item := range vm.Categories[5].Items {
+		if item.Label == "Remote URL" && item.Value == "https://***@github.com/prod/sub.git" {
+			foundMasked = true
+		}
+	}
+	if !foundMasked {
+		t.Errorf("expected masked Remote URL in Publishing category")
 	}
 }

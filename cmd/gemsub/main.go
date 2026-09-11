@@ -221,6 +221,7 @@ func setupRuntime(cfg *config.Config, logWriter io.Writer, configSvc ...*config.
 		if cfg.FlagMode != "" {
 			ad.SetFlagMode(country.Mode(cfg.FlagMode))
 		}
+		ad.SetServices(svc, srcSvc, pubSvc, schedCtrl)
 		ad.Subscribe()
 		rt.Adapter = ad
 		rt.TUIModel = tui.New(ad)

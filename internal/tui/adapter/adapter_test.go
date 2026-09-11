@@ -19,6 +19,9 @@ import (
 	"gemsub/internal/config"
 	"gemsub/internal/events"
 	"gemsub/internal/logging"
+	"gemsub/internal/publisher"
+	"gemsub/internal/scheduler"
+	"gemsub/internal/source"
 	"gemsub/internal/store"
 	"gemsub/internal/tui/adapter"
 	"gemsub/internal/tui/country"
@@ -2445,5 +2448,341 @@ func TestAdapter_ConfigUpdated_DynamicFlagMode(t *testing.T) {
 	}
 	if !ad.CheckAndResetDirty() {
 		t.Errorf("expected adapter dirty to be true after second FlagMode update")
+	}
+}
+
+func TestAdapter_ConfigCenter_NilServices_SafeDefaults(t *testing.T) {
+	ad, _, _, _ := setupTestAdapter(t)
+
+	// Calling ConfigCenter with nil services should return all 6 categories populated with safe defaults
+	vm := ad.ConfigCenter()
+	if len(vm.Categories) != viewmodel.ConfigCategoryCount {
+		t.Fatalf("expected %d categories, got %d", viewmodel.ConfigCategoryCount, len(vm.Categories))
+	}
+
+	for i, cat := range vm.Categories {
+		if cat.Category != viewmodel.ConfigCategory(i) {
+			t.Errorf("expected category enum %d, got %d", i, cat.Category)
+		}
+		if cat.Name == "" {
+			t.Errorf("category %d has empty Name", i)
+		}
+		if len(cat.Items) == 0 {
+			t.Errorf("category %d (%s) has no items", i, cat.Name)
+		}
+		for _, item := range cat.Items {
+			if item.Label == "" {
+				t.Errorf("category %s has item with empty Label", cat.Name)
+			}
+		}
+	}
+}
+
+func TestAdapter_ConfigCenter_WithServices_SanitizationAndLiveData(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	pubRepo := filepath.Join(tmpDir, "pub-repo")
+	_ = os.MkdirAll(pubRepo, 0o755)
+
+	secretToken := "ghp_secretToken12345"
+	rawRemoteURL := fmt.Sprintf("https://oauth2:%s@github.com/org/repo.git", secretToken)
+
+	cfg := &config.Config{
+		StateFile: filepath.Join(tmpDir, "state.json"),
+		Sources: []config.SourceItem{
+			{URL: "https://example.com/sub1", Name: "Primary", Enabled: true},
+			{URL: "https://example.com/sub2", Name: "Secondary", Enabled: false},
+		},
+		FetchIntervalRaw: "2m",
+		FlagMode:         "unicode",
+		Serve: config.ServeConfig{
+			Listen: ":9099",
+			Path:   "/sub",
+			Format: "raw",
+		},
+		Test: config.TestConfig{
+			TimeoutRaw:    "12s",
+			Concurrency:   8,
+			HealthURL:     "https://health.check",
+			RateLimitRPS:  50,
+			MaxRetriesRaw: new(int), // 0 retries
+			Gemini: config.GeminiConfig{
+				URL:          "https://gemini.test.dev",
+				BlockPhrases: []string{"blocked", "denied"},
+			},
+		},
+		Publishing: config.PublishingConfig{
+			Enabled:    true,
+			Repository: pubRepo,
+			Branch:     "main",
+			RemoteURL:  rawRemoteURL,
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg.Validate: %v", err)
+	}
+
+	bus := events.New()
+	defer bus.Close()
+
+	cfgSvc, err := config.NewService(cfgPath, cfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+
+	srcSvc := source.NewService(cfgSvc)
+	st := store.New(filepath.Join(tmpDir, "store.json"), 2)
+	pubSvc := publisher.NewService(cfgSvc, st, bus)
+	sched := scheduler.New(cfg, st, bus)
+	schedCtrl := scheduler.NewControlService(sched)
+
+	ring := logging.NewRingLogHandler(50)
+	ad := adapter.New(st, bus, ring)
+	defer ad.Close()
+
+	// Inject services
+	ad.SetServices(cfgSvc, srcSvc, pubSvc, schedCtrl)
+
+	vm := ad.ConfigCenter()
+
+	// 1. General category verification
+	gen := vm.Categories[viewmodel.CategoryGeneral]
+	foundListen := false
+	for _, item := range gen.Items {
+		if item.Label == "Listen Address" && item.Value == ":9099" {
+			foundListen = true
+		}
+	}
+	if !foundListen {
+		t.Errorf("General category missing Listen Address :9099")
+	}
+
+	// 2. Sources category verification
+	sourcesCat := vm.Categories[viewmodel.CategorySources]
+	foundPrimary := false
+	foundSecondary := false
+	for _, item := range sourcesCat.Items {
+		if item.Label == "Primary" && strings.Contains(item.Value, "[enabled]") {
+			foundPrimary = true
+		}
+		if item.Label == "Secondary" && strings.Contains(item.Value, "[disabled]") {
+			foundSecondary = true
+		}
+	}
+	if !foundPrimary || !foundSecondary {
+		t.Errorf("Sources category missing Primary or Secondary source: %+v", sourcesCat.Items)
+	}
+
+	// 3. Testing category verification
+	testCat := vm.Categories[viewmodel.CategoryTesting]
+	foundTimeout := false
+	for _, item := range testCat.Items {
+		if item.Label == "Test Timeout" && item.Value == "12s" {
+			foundTimeout = true
+		}
+	}
+	if !foundTimeout {
+		t.Errorf("Testing category missing Test Timeout 12s")
+	}
+
+	// 4. Gemini category verification
+	gemCat := vm.Categories[viewmodel.CategoryGemini]
+	foundGeminiURL := false
+	for _, item := range gemCat.Items {
+		if item.Label == "Gemini Target URL" && item.Value == "https://gemini.test.dev" {
+			foundGeminiURL = true
+		}
+	}
+	if !foundGeminiURL {
+		t.Errorf("Gemini category missing Target URL")
+	}
+
+	// 5. Scheduler category verification
+	schedCat := vm.Categories[viewmodel.CategoryScheduler]
+	foundDaemonStatus := false
+	for _, item := range schedCat.Items {
+		if item.Label == "Daemon Status" && item.Value == "Stopped" {
+			foundDaemonStatus = true
+		}
+	}
+	if !foundDaemonStatus {
+		t.Errorf("Scheduler category missing Daemon Status Stopped")
+	}
+
+	// 6. Publishing category credential sanitization verification
+	pubCat := vm.Categories[viewmodel.CategoryPublishing]
+	for _, item := range pubCat.Items {
+		if strings.Contains(item.Value, secretToken) {
+			t.Fatalf("CRITICAL: secret credential %q leaked in Publishing item %q: %q",
+				secretToken, item.Label, item.Value)
+		}
+	}
+	foundMaskedURL := false
+	for _, item := range pubCat.Items {
+		if item.Label == "Remote URL" && item.Value == "https://***@github.com/org/repo.git" {
+			foundMaskedURL = true
+		}
+	}
+	if !foundMaskedURL {
+		t.Errorf("expected masked Remote URL 'https://***@github.com/org/repo.git' in Publishing category")
+	}
+}
+
+func TestAdapter_ConfigCenter_DirtyOnConfigAndPublishingEvents(t *testing.T) {
+	ad, _, bus, _ := setupTestAdapter(t)
+	ad.Subscribe()
+
+	// Clear any initial dirty state
+	_ = ad.CheckAndResetDirty()
+
+	// 1. PublishingFinished event sets dirty
+	bus.Publish(events.PublishingFinished{
+		StartedAt:  time.Now(),
+		FinishedAt: time.Now(),
+		Repository: "test-repo",
+		Branch:     "main",
+	})
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	isDirty := false
+	for time.Now().Before(deadline) {
+		if ad.CheckAndResetDirty() {
+			isDirty = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !isDirty {
+		t.Errorf("expected adapter dirty to be true after PublishingFinished event")
+	}
+
+	// 2. ConfigUpdated event sets dirty
+	bus.Publish(events.ConfigUpdated{
+		Old: config.Config{ProbeLimit: 10},
+		New: config.Config{ProbeLimit: 20},
+	})
+
+	deadline = time.Now().Add(500 * time.Millisecond)
+	isDirty = false
+	for time.Now().Before(deadline) {
+		if ad.CheckAndResetDirty() {
+			isDirty = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !isDirty {
+		t.Errorf("expected adapter dirty to be true after ConfigUpdated event")
+	}
+}
+
+func TestAdapter_ConfigCenter_URLSanitizationAcrossAllCategories(t *testing.T) {
+	ad, _, _, _ := setupTestAdapter(t)
+	tmpDir := t.TempDir()
+
+	secretSourcePass := "sourceSecretPass999"
+	secretHealthPass := "healthSecretPass888"
+	secretGeminiPass := "geminiSecretPass777"
+	secretPubToken := "ghp_pubSecretToken666"
+
+	rawSourceURL := fmt.Sprintf("https://alice:%s@sub.domain.com/feed", secretSourcePass)
+	rawHealthURL := fmt.Sprintf("https://probe:%s@health.probe.internal/204", secretHealthPass)
+	rawGeminiURL := fmt.Sprintf("https://gemini:%s@api.gemini.internal/v1", secretGeminiPass)
+	rawRemoteURL := fmt.Sprintf("https://git:%s@github.com/myorg/repo.git", secretPubToken)
+
+	cfg := config.Config{
+		FetchIntervalRaw: "1m",
+		Sources: []config.SourceItem{
+			{Name: "Private Feed", URL: rawSourceURL, Enabled: true},
+		},
+		Test: config.TestConfig{
+			TimeoutRaw: "5s",
+			HealthURL:  rawHealthURL,
+			Gemini: config.GeminiConfig{
+				URL:          rawGeminiURL,
+				BlockPhrases: []string{"blocked"},
+			},
+		},
+		Publishing: config.PublishingConfig{
+			Enabled:    true,
+			Repository: filepath.Join(tmpDir, "repo"),
+			RemoteURL:  rawRemoteURL,
+		},
+	}
+
+	// Inject cfg via ConfigUpdated event
+	ad.Subscribe()
+	bus := events.New()
+	defer bus.Close()
+
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	cfgSvc, err := config.NewService(cfgPath, &cfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+
+	ad.SetServices(cfgSvc, nil, nil, nil)
+	vm := ad.ConfigCenter()
+
+	secrets := []string{secretSourcePass, secretHealthPass, secretGeminiPass, secretPubToken}
+
+	// Verify that NO secret appears anywhere in any category item
+	for _, cat := range vm.Categories {
+		for _, item := range cat.Items {
+			for _, sec := range secrets {
+				if strings.Contains(item.Value, sec) {
+					t.Fatalf("CRITICAL: secret %q leaked in category %q item %q: %q",
+						sec, cat.Name, item.Label, item.Value)
+				}
+			}
+		}
+	}
+
+	// Verify that the sanitized values actually contain the masked credentials
+	sourcesCat := vm.Categories[viewmodel.CategorySources]
+	if !strings.Contains(sourcesCat.Items[1].Value, "https://***@sub.domain.com/feed") {
+		t.Errorf("expected masked source URL, got: %s", sourcesCat.Items[1].Value)
+	}
+
+	testCat := vm.Categories[viewmodel.CategoryTesting]
+	foundHealth := false
+	for _, item := range testCat.Items {
+		if item.Label == "Health Check URL" {
+			foundHealth = true
+			if item.Value != "https://***@health.probe.internal/204" {
+				t.Errorf("expected masked health check URL, got: %s", item.Value)
+			}
+		}
+	}
+	if !foundHealth {
+		t.Errorf("Health Check URL item not found in Testing category")
+	}
+
+	gemCat := vm.Categories[viewmodel.CategoryGemini]
+	foundGemini := false
+	for _, item := range gemCat.Items {
+		if item.Label == "Gemini Target URL" {
+			foundGemini = true
+			if item.Value != "https://***@api.gemini.internal/v1" {
+				t.Errorf("expected masked gemini target URL, got: %s", item.Value)
+			}
+		}
+	}
+	if !foundGemini {
+		t.Errorf("Gemini Target URL item not found in Gemini category")
+	}
+
+	pubCat := vm.Categories[viewmodel.CategoryPublishing]
+	foundRemote := false
+	for _, item := range pubCat.Items {
+		if item.Label == "Remote URL" {
+			foundRemote = true
+			if item.Value != "https://***@github.com/myorg/repo.git" {
+				t.Errorf("expected masked publishing remote URL, got: %s", item.Value)
+			}
+		}
+	}
+	if !foundRemote {
+		t.Errorf("Remote URL item not found in Publishing category")
 	}
 }

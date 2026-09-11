@@ -22,6 +22,7 @@ type Controller interface {
 	CycleLogLevel() (viewmodel.LogViewModel, string)
 	CopyCandidateLink(opaqueID string) error
 	CandidateRowsWindow(filter viewmodel.FilterMode, offset, limit int) []viewmodel.CandidateRowViewModel
+	ConfigCenter() viewmodel.ConfigCenterViewModel
 }
 
 // ActiveView represents the primary content pane currently displayed.
@@ -30,6 +31,7 @@ type ActiveView int
 const (
 	ViewCandidates ActiveView = iota
 	ViewLogs
+	ViewConfig
 )
 
 // TickMsg represents a periodic background refresh tick (bounded at 10 Hz / 100 ms).
@@ -73,6 +75,12 @@ type Model struct {
 	// Log view scrolling
 	logScrollOffset int
 	logFollow       bool
+
+	// Config Center state
+	prevActiveView  ActiveView
+	configCenter    viewmodel.ConfigCenterViewModel
+	configCategory  viewmodel.ConfigCategory
+	configItemIndex int
 }
 
 // New creates and pre-hydrates a new Bubble Tea Model using the presentation Controller.
@@ -117,6 +125,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.ctrl != nil {
 			if snap, ok := m.ctrl.PollSnapshot(m.filterMode); ok {
 				m.applySnapshot(snap, false)
+				if m.activeView == ViewConfig {
+					m.refreshConfigCenter()
+				}
 			}
 		}
 		// Clear expired status messages
@@ -134,6 +145,30 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 
+	case "c":
+		// Enter Config Center from Candidates or Logs (not from detail)
+		if !m.showDetail && m.activeView != ViewConfig {
+			m.prevActiveView = m.activeView
+			m.activeView = ViewConfig
+			m.configItemIndex = 0
+			m.refreshConfigCenter()
+			return m, nil
+		}
+
+	case "esc":
+		// From Config Center, return to previous view
+		if m.activeView == ViewConfig {
+			m.activeView = m.prevActiveView
+			return m, nil
+		}
+	}
+
+	// Config Center has its own key handling; do not process global keys
+	if m.activeView == ViewConfig {
+		return m.handleConfigKeys(msg)
+	}
+
+	switch msg.String() {
 	case "tab":
 		if m.showDetail {
 			m.showDetail = false
@@ -319,6 +354,63 @@ func (m *Model) handleLogKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	catCount := viewmodel.ConfigCategoryCount
+	switch msg.String() {
+	case "tab", "l", "right":
+		m.configCategory = (m.configCategory + 1) % viewmodel.ConfigCategory(catCount)
+		m.configItemIndex = 0
+	case "shift+tab", "h", "left":
+		if m.configCategory == 0 {
+			m.configCategory = viewmodel.ConfigCategory(catCount - 1)
+		} else {
+			m.configCategory--
+		}
+		m.configItemIndex = 0
+	case "j", "down":
+		items := m.configCategoryItems()
+		if m.configItemIndex < len(items)-1 {
+			m.configItemIndex++
+		}
+	case "k", "up":
+		if m.configItemIndex > 0 {
+			m.configItemIndex--
+		}
+	case "g":
+		m.configItemIndex = 0
+	case "G":
+		items := m.configCategoryItems()
+		if len(items) > 0 {
+			m.configItemIndex = len(items) - 1
+		}
+	}
+	return m, nil
+}
+
+// configCategoryItems returns the items for the currently active config category.
+func (m *Model) configCategoryItems() []viewmodel.ConfigItemViewModel {
+	for _, cat := range m.configCenter.Categories {
+		if cat.Category == m.configCategory {
+			return cat.Items
+		}
+	}
+	return nil
+}
+
+// refreshConfigCenter re-queries the presentation Controller for updated configuration
+// ViewModels and clamps the active item cursor to the bounds of the active category.
+func (m *Model) refreshConfigCenter() {
+	if m.ctrl != nil {
+		m.configCenter = m.ctrl.ConfigCenter()
+		items := m.configCategoryItems()
+		if m.configItemIndex >= len(items) && len(items) > 0 {
+			m.configItemIndex = len(items) - 1
+		} else if len(items) == 0 {
+			m.configItemIndex = 0
+		}
+	}
+}
+
 func (m *Model) applySnapshot(snap viewmodel.SnapshotViewModel, resetCursor bool) {
 	m.header = snap.Header
 	m.logs = snap.Logs
@@ -466,6 +558,8 @@ func (m *Model) View() string {
 			sb.WriteString(m.renderCandidateTable())
 		case ViewLogs:
 			sb.WriteString(m.renderLogs())
+		case ViewConfig:
+			sb.WriteString(m.renderConfigCenter())
 		}
 	}
 
@@ -496,6 +590,17 @@ func (m *Model) renderHeader() string {
 	lastCycleStr := "Never"
 	if !m.header.LastCycle.IsZero() {
 		lastCycleStr = m.header.LastCycle.Format("15:04:05")
+	}
+
+	if m.activeView == ViewConfig {
+		line1 := fmt.Sprintf("%s  >  %s  |  Cycle: %s  |  Last: %s",
+			bold.Render("GEMSUB"),
+			bold.Render("CONFIGURATION CENTER"),
+			statusStyle.Render(string(m.header.CycleStatus)),
+			lastCycleStr,
+		)
+		divider := dim.Render(strings.Repeat("─", m.width))
+		return line1 + "\n" + divider
 	}
 
 	line1 := fmt.Sprintf("%s  |  Cycle: %s #%d  |  Last: %s",
@@ -797,6 +902,107 @@ func (m *Model) renderLogs() string {
 	return sb.String()
 }
 
+func (m *Model) renderConfigCenter() string {
+	bold := lipgloss.NewStyle().Bold(true)
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	cyan := lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+	selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("236")).Bold(true)
+
+	var sb strings.Builder
+
+	// Category tab bar
+	var tabs []string
+	for i := 0; i < viewmodel.ConfigCategoryCount; i++ {
+		cat := viewmodel.ConfigCategory(i)
+		name := cat.Name()
+		if cat == m.configCategory {
+			tabs = append(tabs, cyan.Render("["+name+"]"))
+		} else {
+			tabs = append(tabs, dim.Render(" "+name+" "))
+		}
+	}
+	sb.WriteString("  " + strings.Join(tabs, " "))
+	sb.WriteString("\n")
+	sb.WriteString(dim.Render(strings.Repeat("─", m.width)))
+	sb.WriteString("\n")
+
+	// Items for the active category
+	items := m.configCategoryItems()
+	if len(items) == 0 {
+		sb.WriteString(dim.Render("  No settings in this category."))
+		sb.WriteString("\n")
+		return sb.String()
+	}
+
+	visibleItems := m.visibleConfigRows()
+	// Scroll offset for items if needed
+	scrollOffset := 0
+	if m.configItemIndex >= scrollOffset+visibleItems {
+		scrollOffset = m.configItemIndex - visibleItems + 1
+	}
+	if m.configItemIndex < scrollOffset {
+		scrollOffset = m.configItemIndex
+	}
+
+	end := scrollOffset + visibleItems
+	if end > len(items) {
+		end = len(items)
+	}
+
+	// Calculate label width for alignment (capped to avoid overflow on narrow terminals)
+	maxLabel := 0
+	for _, item := range items {
+		if len(item.Label) > maxLabel {
+			maxLabel = len(item.Label)
+		}
+	}
+	if maxLabel > 25 {
+		maxLabel = 25
+	}
+
+	for i := scrollOffset; i < end; i++ {
+		item := items[i]
+		cursor := "  "
+		if i == m.configItemIndex {
+			cursor = "> "
+		}
+
+		label := item.Label
+		if len(label) > maxLabel {
+			label = label[:maxLabel]
+		}
+
+		valueWidth := m.width - maxLabel - 8 // cursor(2) + padding(4) + colon(2)
+		if valueWidth < 10 {
+			valueWidth = 10
+		}
+		value := item.Value
+		if len(value) > valueWidth {
+			value = value[:valueWidth-1] + "…"
+		}
+
+		line := fmt.Sprintf("%s%-*s  %s", cursor, maxLabel, label, value)
+		if i == m.configItemIndex {
+			sb.WriteString(selectedStyle.Render(line))
+		} else {
+			sb.WriteString("  " + bold.Render(fmt.Sprintf("%-*s", maxLabel, label)) + "  " + value)
+		}
+		sb.WriteString("\n")
+	}
+
+	return sb.String()
+}
+
+// visibleConfigRows returns the number of item rows visible in the config center.
+func (m *Model) visibleConfigRows() int {
+	// Total height minus Header (3), Divider (1), Tab bar (1), Tab divider (1), Footer (1)
+	avail := m.height - 7
+	if avail < 3 {
+		return 3
+	}
+	return avail
+}
+
 func (m *Model) renderFooter() string {
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	cyan := lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
@@ -817,11 +1023,14 @@ func (m *Model) renderFooter() string {
 	var hints string
 	if m.showDetail {
 		hints = "[Esc] Close Detail  [y] Copy Link  [q] Quit"
+	} else if m.activeView == ViewConfig {
+		hints = fmt.Sprintf("%s [Tab/h/l] Category  [j/k] Navigate  [Esc] Back  [q] Quit",
+			statusStr)
 	} else if m.activeView == ViewCandidates {
-		hints = fmt.Sprintf("%s [s] Filter %s  [Enter] Detail  [y] Copy  [Tab] Logs  [q] Quit",
+		hints = fmt.Sprintf("%s [s] Filter %s  [Enter] Detail  [y] Copy  [c] Config  [Tab] Logs  [q] Quit",
 			statusStr, filterState)
 	} else {
-		hints = fmt.Sprintf("%s [l] Level  [g/G] Top/Bottom  [Tab] Candidates  [q] Quit",
+		hints = fmt.Sprintf("%s [l] Level  [g/G] Top/Bottom  [c] Config  [Tab] Candidates  [q] Quit",
 			statusStr)
 	}
 
