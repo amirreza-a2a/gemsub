@@ -2,6 +2,7 @@ package tui_test
 
 import (
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"gemsub/internal/config"
 	"gemsub/internal/events"
 	"gemsub/internal/logging"
+	"gemsub/internal/publisher"
 	"gemsub/internal/store"
 	"gemsub/internal/tui"
 	"gemsub/internal/tui/adapter"
@@ -1315,6 +1317,10 @@ func (c *testDecoupledController) DeleteSource(id string) error {
 	return nil
 }
 
+func (c *testDecoupledController) UpdateSetting(key string, value string) error {
+	return nil
+}
+
 func TestModel_ConfigCenterDecoupledController(t *testing.T) {
 	mock := &testDecoupledController{
 		configCenter: viewmodel.ConfigCenterViewModel{
@@ -1526,10 +1532,20 @@ type testSourceMockController struct {
 	updatedName string
 	deletedID   string
 
-	toggleErr error
-	addErr    error
-	updateErr error
-	deleteErr error
+	generalItems    []viewmodel.ConfigItemViewModel
+	testingItems    []viewmodel.ConfigItemViewModel
+	geminiItems     []viewmodel.ConfigItemViewModel
+	schedulerItems  []viewmodel.ConfigItemViewModel
+	publishingItems []viewmodel.ConfigItemViewModel
+
+	updatedSettingKey string
+	updatedSettingVal string
+
+	toggleErr        error
+	addErr           error
+	updateErr        error
+	deleteErr        error
+	updateSettingErr error
 }
 
 func newTestSourceMockController() *testSourceMockController {
@@ -1544,14 +1560,48 @@ func newTestSourceMockController() *testSourceMockController {
 }
 
 func (c *testSourceMockController) syncConfigCenter() {
+	if len(c.generalItems) == 0 {
+		c.generalItems = []viewmodel.ConfigItemViewModel{
+			{Key: "serve.listen", Label: "Listen Address", Value: "127.0.0.1:8080", EditorValue: "127.0.0.1:8080", RawValue: "127.0.0.1:8080", Type: viewmodel.SettingTypeString, Editable: true, RestartRequired: true, Description: "HTTP listen address"},
+			{Key: "serve.path", Label: "Subscription Path", Value: "/sub", EditorValue: "/sub", RawValue: "/sub", Type: viewmodel.SettingTypeString, Editable: true, RestartRequired: true},
+			{Key: "serve.format", Label: "Subscription Format", Value: "base64", EditorValue: "base64", RawValue: "base64", Type: viewmodel.SettingTypeEnum, Editable: true, EnumOptions: []string{"base64", "raw"}},
+			{Key: "headless", Label: "Headless Mode", Value: "false", EditorValue: "false", RawValue: "false", Type: viewmodel.SettingTypeBool, Editable: true, RestartRequired: true},
+		}
+	}
+	if len(c.testingItems) == 0 {
+		c.testingItems = []viewmodel.ConfigItemViewModel{
+			{Key: "test.timeout", Label: "Test Timeout", Value: "10s", EditorValue: "10s", RawValue: "10s", Type: viewmodel.SettingTypeDuration, Editable: true},
+			{Key: "test.concurrency", Label: "Concurrency", Value: "8 workers", EditorValue: "8", RawValue: "8", Type: viewmodel.SettingTypeInt, Editable: true},
+		}
+	}
+	if len(c.geminiItems) == 0 {
+		c.geminiItems = []viewmodel.ConfigItemViewModel{
+			{Key: "test.gemini.url", Label: "Gemini Target URL", Value: "https://gemini.google.com/", EditorValue: "https://gemini.google.com/", RawValue: "https://gemini.google.com/", Type: viewmodel.SettingTypeURL, Editable: true},
+			{Key: "test.gemini.block_phrases", Label: "Block Phrases", Value: "blocked", EditorValue: "blocked", RawValue: "blocked", Type: viewmodel.SettingTypeString, Editable: true},
+		}
+	}
+	if len(c.schedulerItems) == 0 {
+		c.schedulerItems = []viewmodel.ConfigItemViewModel{
+			{Key: "fetch_interval", Label: "Fetch Interval", Value: "5m", EditorValue: "5m", RawValue: "5m", Type: viewmodel.SettingTypeDuration, Editable: true},
+			{Label: "Daemon Status", Value: "Running", Type: viewmodel.SettingTypeReadOnly, Editable: false},
+		}
+	}
+	if len(c.publishingItems) == 0 {
+		c.publishingItems = []viewmodel.ConfigItemViewModel{
+			{Key: "publishing.enabled", Label: "Publishing Enabled", Value: "true", EditorValue: "true", RawValue: "true", Type: viewmodel.SettingTypeBool, Editable: true},
+			{Key: "publishing.remote_url", Label: "Remote URL", Value: "https://github.com/example/repo.git", EditorValue: "https://github.com/example/repo.git", RawValue: "https://github.com/example/repo.git", Type: viewmodel.SettingTypeURL, Editable: true},
+			{Label: "Publish Status", Value: "Idle", Type: viewmodel.SettingTypeReadOnly, Editable: false},
+		}
+	}
+
 	c.configCenter = viewmodel.ConfigCenterViewModel{
 		Categories: []viewmodel.ConfigCategoryViewModel{
-			{Category: viewmodel.CategoryGeneral, Name: "General"},
+			{Category: viewmodel.CategoryGeneral, Name: "General", Items: c.generalItems},
 			{Category: viewmodel.CategorySources, Name: "Sources", Sources: c.sources},
-			{Category: viewmodel.CategoryTesting, Name: "Testing"},
-			{Category: viewmodel.CategoryGemini, Name: "Gemini"},
-			{Category: viewmodel.CategoryScheduler, Name: "Scheduler"},
-			{Category: viewmodel.CategoryPublishing, Name: "Publishing"},
+			{Category: viewmodel.CategoryTesting, Name: "Testing", Items: c.testingItems},
+			{Category: viewmodel.CategoryGemini, Name: "Gemini", Items: c.geminiItems},
+			{Category: viewmodel.CategoryScheduler, Name: "Scheduler", Items: c.schedulerItems},
+			{Category: viewmodel.CategoryPublishing, Name: "Publishing", Items: c.publishingItems},
 		},
 	}
 }
@@ -1624,6 +1674,73 @@ func (c *testSourceMockController) DeleteSource(id string) error {
 			break
 		}
 	}
+	c.syncConfigCenter()
+	return nil
+}
+
+func (c *testSourceMockController) UpdateSetting(key string, value string) error {
+	c.updatedSettingKey = key
+	c.updatedSettingVal = value
+	if c.updateSettingErr != nil {
+		return c.updateSettingErr
+	}
+
+	trimmed := strings.TrimSpace(value)
+	isURLSetting := strings.HasSuffix(key, "_url") || key == "test.gemini.url" || key == "test.health_url" || key == "publishing.remote_url"
+	if isURLSetting {
+		if trimmed == "" {
+			return fmt.Errorf("URL cannot be empty")
+		}
+		norm, err := config.NormalizeURL(trimmed)
+		if err != nil {
+			return fmt.Errorf("invalid URL")
+		}
+		p, err := url.Parse(norm)
+		if err != nil {
+			return fmt.Errorf("invalid URL")
+		}
+		if p.User != nil {
+			user := p.User.Username()
+			pass, hasPass := p.User.Password()
+			isMasked := (user == "***" && (!hasPass || pass == "***"))
+			if !isMasked {
+				return fmt.Errorf("credentials must be managed separately")
+			}
+		}
+	}
+
+	updateItem := func(items []viewmodel.ConfigItemViewModel) {
+		for i := range items {
+			if items[i].Key == key {
+				if items[i].HasSecret {
+					// Existing credentials preserved; display and editor values remain masked
+					sanitized := publisher.SanitizeURL(value)
+					if !strings.Contains(sanitized, "***@") {
+						if p, err := url.Parse(value); err == nil {
+							p.User = url.User("***")
+							sanitized = p.String()
+						}
+					}
+					items[i].Value = sanitized
+					items[i].EditorValue = sanitized
+					items[i].RawValue = ""
+				} else {
+					displayVal := value
+					if items[i].Type == viewmodel.SettingTypeInt && items[i].Key == "test.concurrency" {
+						displayVal = fmt.Sprintf("%s workers", value)
+					}
+					items[i].Value = displayVal
+					items[i].RawValue = value
+					items[i].EditorValue = value
+				}
+			}
+		}
+	}
+	updateItem(c.generalItems)
+	updateItem(c.testingItems)
+	updateItem(c.geminiItems)
+	updateItem(c.schedulerItems)
+	updateItem(c.publishingItems)
 	c.syncConfigCenter()
 	return nil
 }
@@ -2374,4 +2491,842 @@ func TestModel_SourceManager_Backspace_UTF8Safety(t *testing.T) {
 	if name := m.SourceInputNameForTest(); name != "" {
 		t.Fatalf("expected empty Name after deleting emoji, got %q", name)
 	}
+}
+
+func TestModel_SettingsEditor_NavigationAndSelection(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// Default category should be General (0)
+	if m.ConfigCategoryForTest() != 0 {
+		t.Fatalf("expected category 0, got %d", m.ConfigCategoryForTest())
+	}
+	if m.ConfigItemIndexForTest() != 0 {
+		t.Fatalf("expected item index 0, got %d", m.ConfigItemIndexForTest())
+	}
+
+	// Move cursor down with j
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	m = updated.(*tui.Model)
+	if m.ConfigItemIndexForTest() != 1 {
+		t.Fatalf("expected item index 1 after 'j', got %d", m.ConfigItemIndexForTest())
+	}
+
+	// Move cursor down with down arrow
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(*tui.Model)
+	if m.ConfigItemIndexForTest() != 2 {
+		t.Fatalf("expected item index 2 after Down, got %d", m.ConfigItemIndexForTest())
+	}
+
+	// Move to bottom with G
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+	m = updated.(*tui.Model)
+	if m.ConfigItemIndexForTest() != 3 {
+		t.Fatalf("expected item index 3 after 'G', got %d", m.ConfigItemIndexForTest())
+	}
+
+	// Move to top with g
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	m = updated.(*tui.Model)
+	if m.ConfigItemIndexForTest() != 0 {
+		t.Fatalf("expected item index 0 after 'g', got %d", m.ConfigItemIndexForTest())
+	}
+
+	// Move cursor up with k (should remain at 0)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	m = updated.(*tui.Model)
+	if m.ConfigItemIndexForTest() != 0 {
+		t.Fatalf("expected item index 0 after 'k' at top, got %d", m.ConfigItemIndexForTest())
+	}
+
+	// Next category with l
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m = updated.(*tui.Model)
+	if m.ConfigCategoryForTest() != 1 { // Sources
+		t.Fatalf("expected category 1 after 'l', got %d", m.ConfigCategoryForTest())
+	}
+
+	// Previous category with h
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
+	m = updated.(*tui.Model)
+	if m.ConfigCategoryForTest() != 0 { // General
+		t.Fatalf("expected category 0 after 'h', got %d", m.ConfigCategoryForTest())
+	}
+}
+
+func TestModel_SettingsEditor_EditModalLifecycle(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// General -> cursor at 0 is "serve.listen"
+	// Press Enter to start editing
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	if !m.SettingEditModeForTest() {
+		t.Fatalf("expected settingEditMode=true after Enter")
+	}
+	if m.SettingKeyForTest() != "serve.listen" {
+		t.Fatalf("expected settingKey 'serve.listen', got %q", m.SettingKeyForTest())
+	}
+	if m.SettingInputValForTest() != "127.0.0.1:8080" {
+		t.Fatalf("expected settingInputVal '127.0.0.1:8080', got %q", m.SettingInputValForTest())
+	}
+
+	// Check rendered view in edit mode contains modal
+	view := m.View()
+	if !strings.Contains(view, "Edit Listen Address") {
+		t.Fatalf("expected modal title in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "127.0.0.1:8080_") {
+		t.Fatalf("expected input value with cursor in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "[Restart Required]") {
+		t.Fatalf("expected restart required badge in modal view, got:\n%s", view)
+	}
+
+	// Press Esc to cancel edit
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(*tui.Model)
+
+	if m.SettingEditModeForTest() {
+		t.Fatalf("expected settingEditMode=false after Esc")
+	}
+	if mock.updatedSettingKey != "" {
+		t.Fatalf("expected no setting updated on cancel, got %q", mock.updatedSettingKey)
+	}
+}
+
+func TestModel_SettingsEditor_TextEditingAndValidation(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// Open edit on "serve.listen"
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	// Clear value with backspaces
+	for i := 0; i < 15; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(*tui.Model)
+	}
+	if m.SettingInputValForTest() != "" {
+		t.Fatalf("expected empty inputVal, got %q", m.SettingInputValForTest())
+	}
+
+	// Type new address: ":9090"
+	for _, ch := range ":9090" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m = updated.(*tui.Model)
+	}
+	if m.SettingInputValForTest() != ":9090" {
+		t.Fatalf("expected ':9090', got %q", m.SettingInputValForTest())
+	}
+
+	// Mock error on update
+	mock.updateSettingErr = fmt.Errorf("mock listen address conflict")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	// Error should keep modal open and display error in status bar
+	if !m.SettingEditModeForTest() {
+		t.Fatalf("expected modal to remain open on validation error")
+	}
+	view := m.View()
+	if !strings.Contains(view, "mock listen address conflict") {
+		t.Fatalf("expected error message in view, got:\n%s", view)
+	}
+
+	// Fix error and submit again
+	mock.updateSettingErr = nil
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	if m.SettingEditModeForTest() {
+		t.Fatalf("expected modal to close on success")
+	}
+	if mock.updatedSettingKey != "serve.listen" || mock.updatedSettingVal != ":9090" {
+		t.Fatalf("expected setting update for 'serve.listen' to ':9090', got key=%q val=%q",
+			mock.updatedSettingKey, mock.updatedSettingVal)
+	}
+
+	view = m.View()
+	if !strings.Contains(view, "Updated Listen Address: :9090") {
+		t.Fatalf("expected success status message in view, got:\n%s", view)
+	}
+}
+
+func TestModel_SettingsEditor_BooleanToggling(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// Move cursor to "headless" (index 3 in General)
+	m.SetConfigItemIndexForTest(3)
+
+	// Press Space -> should toggle from "false" to "true" immediately without opening modal
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(*tui.Model)
+
+	if m.SettingEditModeForTest() {
+		t.Fatalf("expected no edit modal on boolean toggle")
+	}
+	if mock.updatedSettingKey != "headless" || mock.updatedSettingVal != "true" {
+		t.Fatalf("expected 'headless' updated to 'true', got key=%q val=%q",
+			mock.updatedSettingKey, mock.updatedSettingVal)
+	}
+
+	// Press Space again -> toggles back to "false"
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(*tui.Model)
+	if mock.updatedSettingVal != "false" {
+		t.Fatalf("expected 'headless' updated to 'false', got %q", mock.updatedSettingVal)
+	}
+
+	// Press Enter -> should also toggle boolean without opening modal
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+	if m.SettingEditModeForTest() {
+		t.Fatalf("expected no edit modal on boolean Enter")
+	}
+	if mock.updatedSettingVal != "true" {
+		t.Fatalf("expected 'headless' updated to 'true' via Enter, got %q", mock.updatedSettingVal)
+	}
+}
+
+func TestModel_SettingsEditor_EnumCycling(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// Move cursor to "serve.format" (index 2 in General, options: base64, raw)
+	m.SetConfigItemIndexForTest(2)
+
+	// Press Space in list mode -> cycles from "base64" to "raw" directly
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(*tui.Model)
+
+	if m.SettingEditModeForTest() {
+		t.Fatalf("expected no modal on Space enum cycle in list mode")
+	}
+	if mock.updatedSettingKey != "serve.format" || mock.updatedSettingVal != "raw" {
+		t.Fatalf("expected 'serve.format' cycled to 'raw', got key=%q val=%q",
+			mock.updatedSettingKey, mock.updatedSettingVal)
+	}
+
+	// Press Enter on enum setting -> opens edit modal
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	if !m.SettingEditModeForTest() {
+		t.Fatalf("expected modal open on Enter for enum setting")
+	}
+
+	// Inside modal, Tab cycles to next option ("base64")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+	if m.SettingInputValForTest() != "base64" {
+		t.Fatalf("expected modal inputVal 'base64' after Tab, got %q", m.SettingInputValForTest())
+	}
+
+	// Press Enter to save
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	if m.SettingEditModeForTest() {
+		t.Fatalf("expected modal closed after saving enum")
+	}
+	if mock.updatedSettingVal != "base64" {
+		t.Fatalf("expected 'serve.format' saved as 'base64', got %q", mock.updatedSettingVal)
+	}
+}
+
+func TestModel_SettingsEditor_ReadOnlyDiagnostics(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// Navigate to Scheduler category (index 4)
+	m.SetConfigCategoryForTest(4)
+	// Cursor at index 1: "Daemon Status" (read-only diagnostic)
+	m.SetConfigItemIndexForTest(1)
+
+	// Press Enter on read-only item
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	if m.SettingEditModeForTest() {
+		t.Fatalf("expected modal NOT to open on read-only item")
+	}
+	view := m.View()
+	if !strings.Contains(view, "Daemon Status is a read-only diagnostic") {
+		t.Fatalf("expected read-only feedback in status bar, got:\n%s", view)
+	}
+
+	// Press Space on read-only item
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(*tui.Model)
+	if m.SettingEditModeForTest() {
+		t.Fatalf("expected modal NOT to open on read-only item with Space")
+	}
+	view = m.View()
+	if !strings.Contains(view, "Daemon Status is a read-only diagnostic") {
+		t.Fatalf("expected read-only feedback on Space, got:\n%s", view)
+	}
+}
+
+func TestModel_SettingsEditor_KeyCaptureInEditMode(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// Open edit on "serve.listen"
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	// Type 'q' - should NOT quit, but append 'q' to input
+	prevLen := len(m.SettingInputValForTest())
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	m = updated.(*tui.Model)
+
+	if cmd != nil {
+		t.Fatalf("expected no quit cmd when typing 'q' in edit mode")
+	}
+	if len(m.SettingInputValForTest()) != prevLen+1 {
+		t.Fatalf("expected 'q' appended to inputVal, got %q", m.SettingInputValForTest())
+	}
+
+	// Type 'c' - should NOT re-enter or reset Config Center
+	prevLen = len(m.SettingInputValForTest())
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+	if len(m.SettingInputValForTest()) != prevLen+1 {
+		t.Fatalf("expected 'c' appended to inputVal, got %q", m.SettingInputValForTest())
+	}
+
+	// ctrl+c DOES quit
+	_, quitCmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if quitCmd == nil {
+		t.Fatalf("expected tea.Quit on ctrl+c")
+	}
+}
+
+func TestModel_SettingsEditor_RestartIndicators(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	items := []viewmodel.ConfigItemViewModel{
+		{
+			Label:           "Standard Setting",
+			Value:           "normal",
+			RestartRequired: false,
+			PendingRestart:  false,
+		},
+		{
+			Label:           "Listen Address",
+			Value:           ":8080",
+			RestartRequired: true,
+			PendingRestart:  false,
+		},
+		{
+			Label:           "State File",
+			Value:           "state.json",
+			RestartRequired: true,
+			PendingRestart:  true,
+		},
+	}
+
+	m.SetWidthForTest(80)
+	rendered := m.RenderCategoryItemsForTest(items)
+
+	// Verify "[restart]" is present for item 1
+	if !strings.Contains(rendered, "[restart]") {
+		t.Fatalf("expected '[restart]' badge in rendered items, got:\n%s", rendered)
+	}
+	// Verify "[restart pending]" is present for item 2
+	if !strings.Contains(rendered, "[restart pending]") {
+		t.Fatalf("expected '[restart pending]' badge in rendered items, got:\n%s", rendered)
+	}
+}
+
+func TestModel_SettingsEditor_TerminalSafetySweeps(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	items := []viewmodel.ConfigItemViewModel{
+		{
+			Label:           "HTTP Listen Address",
+			Value:           "127.0.0.1:8080",
+			RestartRequired: true,
+			PendingRestart:  false,
+		},
+		{
+			Label:           "Very Long Label That Exceeds Normal Boundaries",
+			Value:           "https://extremely-long-sub-domain-with-credentials.example.com/very/long/path",
+			RestartRequired: true,
+			PendingRestart:  true,
+		},
+		{
+			Label:           "Unicode Label 测试标签 🚀",
+			Value:           "Unicode Value 内容 ✨",
+			RestartRequired: false,
+			PendingRestart:  false,
+		},
+	}
+
+	widths := []int{40, 50, 60, 72, 80, 100, 120}
+
+	for _, w := range widths {
+		m.SetWidthForTest(w)
+
+		// 1. Sweep category items list rendering
+		renderedItems := m.RenderCategoryItemsForTest(items)
+		lines := strings.Split(renderedItems, "\n")
+		for lineIdx, line := range lines {
+			if line == "" {
+				continue
+			}
+			lineWidth := lipgloss.Width(line)
+			if lineWidth > w {
+				t.Fatalf("width %d: line %d in items list exceeded max width: %d > %d:\n%s",
+					w, lineIdx, lineWidth, w, line)
+			}
+		}
+
+		// 2. Sweep edit modal rendering
+		m.SetSettingEditModeForTest(true)
+		m.SetSettingLabelForTest("Very Long Setting Label With Unicode 🚀")
+		m.SetSettingInputValForTest("https://very-long-url-value-that-exceeds-boundaries.com/test")
+		m.SetSettingRestartRequiredForTest(true)
+		m.SetSettingDescriptionForTest("Long description note explaining that restart is needed")
+
+		renderedModal := m.RenderSettingEditorModalForTest()
+		modalLines := strings.Split(renderedModal, "\n")
+		for lineIdx, line := range modalLines {
+			if line == "" {
+				continue
+			}
+			lineWidth := lipgloss.Width(line)
+			if lineWidth > w {
+				t.Fatalf("width %d: line %d in modal exceeded max width: %d > %d:\n%s",
+					w, lineIdx, lineWidth, w, line)
+			}
+		}
+
+		// 3. Sweep footer rendering
+		renderedFooter := m.RenderFooterForTest()
+		footerWidth := lipgloss.Width(renderedFooter)
+		if footerWidth > w {
+			t.Fatalf("width %d: footer exceeded max width: %d > %d:\n%s",
+				w, footerWidth, w, renderedFooter)
+		}
+	}
+}
+
+func TestModel_SettingsEditor_MockStateConsistency_Regression(t *testing.T) {
+	// 1. Boolean: false -> true -> false
+	t.Run("Boolean_FalseTrueFalse", func(t *testing.T) {
+		mock := newTestSourceMockController()
+		m := tui.New(mock)
+
+		// Enter Config Center
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+		m = updated.(*tui.Model)
+
+		// Cursor on "headless" (index 3 in General, initial: false)
+		m.SetConfigItemIndexForTest(3)
+
+		// Initial verification
+		cfg := mock.ConfigCenter()
+		headlessItem := cfg.Categories[viewmodel.CategoryGeneral].Items[3]
+		if headlessItem.EditorValue != "false" || headlessItem.Value != "false" {
+			t.Fatalf("expected initial headless=false, got EditorValue=%q Value=%q", headlessItem.EditorValue, headlessItem.Value)
+		}
+
+		// First toggle: false -> true
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+		m = updated.(*tui.Model)
+		if mock.updatedSettingVal != "true" {
+			t.Fatalf("expected updatedSettingVal='true', got %q", mock.updatedSettingVal)
+		}
+		cfg = mock.ConfigCenter()
+		headlessItem = cfg.Categories[viewmodel.CategoryGeneral].Items[3]
+		if headlessItem.EditorValue != "true" || headlessItem.Value != "true" || headlessItem.RawValue != "true" {
+			t.Fatalf("expected headless=true in mock, got EditorValue=%q Value=%q RawValue=%q",
+				headlessItem.EditorValue, headlessItem.Value, headlessItem.RawValue)
+		}
+
+		// Second toggle: true -> false
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+		m = updated.(*tui.Model)
+		if mock.updatedSettingVal != "false" {
+			t.Fatalf("expected updatedSettingVal='false', got %q", mock.updatedSettingVal)
+		}
+		cfg = mock.ConfigCenter()
+		headlessItem = cfg.Categories[viewmodel.CategoryGeneral].Items[3]
+		if headlessItem.EditorValue != "false" || headlessItem.Value != "false" || headlessItem.RawValue != "false" {
+			t.Fatalf("expected headless=false in mock, got EditorValue=%q Value=%q RawValue=%q",
+				headlessItem.EditorValue, headlessItem.Value, headlessItem.RawValue)
+		}
+	})
+
+	// 2. Enum: base64 -> raw -> base64
+	t.Run("Enum_Base64RawBase64", func(t *testing.T) {
+		mock := newTestSourceMockController()
+		m := tui.New(mock)
+
+		// Enter Config Center
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+		m = updated.(*tui.Model)
+
+		// Cursor on "serve.format" (index 2 in General, options: base64, raw)
+		m.SetConfigItemIndexForTest(2)
+
+		cfg := mock.ConfigCenter()
+		formatItem := cfg.Categories[viewmodel.CategoryGeneral].Items[2]
+		if formatItem.EditorValue != "base64" || formatItem.Value != "base64" {
+			t.Fatalf("expected initial format=base64, got EditorValue=%q", formatItem.EditorValue)
+		}
+
+		// First cycle via Space: base64 -> raw
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+		m = updated.(*tui.Model)
+		if mock.updatedSettingVal != "raw" {
+			t.Fatalf("expected updatedSettingVal='raw', got %q", mock.updatedSettingVal)
+		}
+		cfg = mock.ConfigCenter()
+		formatItem = cfg.Categories[viewmodel.CategoryGeneral].Items[2]
+		if formatItem.EditorValue != "raw" || formatItem.Value != "raw" || formatItem.RawValue != "raw" {
+			t.Fatalf("expected format=raw in mock, got EditorValue=%q Value=%q RawValue=%q",
+				formatItem.EditorValue, formatItem.Value, formatItem.RawValue)
+		}
+
+		// Second cycle via Space: raw -> base64
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+		m = updated.(*tui.Model)
+		if mock.updatedSettingVal != "base64" {
+			t.Fatalf("expected updatedSettingVal='base64', got %q", mock.updatedSettingVal)
+		}
+		cfg = mock.ConfigCenter()
+		formatItem = cfg.Categories[viewmodel.CategoryGeneral].Items[2]
+		if formatItem.EditorValue != "base64" || formatItem.Value != "base64" || formatItem.RawValue != "base64" {
+			t.Fatalf("expected format=base64 in mock, got EditorValue=%q Value=%q RawValue=%q",
+				formatItem.EditorValue, formatItem.Value, formatItem.RawValue)
+		}
+	})
+
+	// 3. Text: old value -> new value -> reopen editor and verify new value is prefilled
+	t.Run("Text_OldToNewAndReopenPrefill", func(t *testing.T) {
+		mock := newTestSourceMockController()
+		m := tui.New(mock)
+
+		// Enter Config Center
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+		m = updated.(*tui.Model)
+
+		// Cursor on "serve.listen" (index 0 in General, initial: "127.0.0.1:8080")
+		m.SetConfigItemIndexForTest(0)
+
+		// Open editor modal
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(*tui.Model)
+		if m.SettingInputValForTest() != "127.0.0.1:8080" {
+			t.Fatalf("expected initial prefill '127.0.0.1:8080', got %q", m.SettingInputValForTest())
+		}
+
+		// Clear existing value
+		for i := 0; i < 20; i++ {
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+			m = updated.(*tui.Model)
+		}
+
+		// Type new value "127.0.0.1:9090"
+		for _, ch := range "127.0.0.1:9090" {
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+			m = updated.(*tui.Model)
+		}
+
+		// Press Enter to save
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(*tui.Model)
+
+		if m.SettingEditModeForTest() {
+			t.Fatalf("expected edit modal to close after Enter")
+		}
+		if mock.updatedSettingVal != "127.0.0.1:9090" {
+			t.Fatalf("expected updatedSettingVal='127.0.0.1:9090', got %q", mock.updatedSettingVal)
+		}
+
+		// Reopen editor on the same setting
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(*tui.Model)
+
+		if !m.SettingEditModeForTest() {
+			t.Fatalf("expected edit modal to reopen on Enter")
+		}
+
+		// Verify that reopened editor is prefilled with the NEW value "127.0.0.1:9090", NOT old value!
+		if got := m.SettingInputValForTest(); got != "127.0.0.1:9090" {
+			t.Fatalf("expected reopened editor prefill '127.0.0.1:9090', got %q", got)
+		}
+
+		// Cancel with Esc
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		m = updated.(*tui.Model)
+		if m.SettingEditModeForTest() {
+			t.Fatalf("expected modal closed after Esc")
+		}
+	})
+
+	// 4. URL: safe display/editor value remains sanitized when secret-bearing,
+	// and explicit userinfo entry is rejected per credential policy.
+	t.Run("URL_SecretBearingRemainsSanitized", func(t *testing.T) {
+		mock := newTestSourceMockController()
+
+		// Configure publishing.remote_url with secret credentials in mock
+		secretToken := "ghp_supersecret12345"
+		plainURL := "https://gituser:" + secretToken + "@github.com/org/private-repo.git"
+		maskedURL := publisher.SanitizeURL(plainURL) // "https://***@github.com/org/private-repo.git"
+
+		mock.publishingItems = []viewmodel.ConfigItemViewModel{
+			{
+				Key:             "publishing.remote_url",
+				Label:           "Remote URL",
+				Value:           maskedURL,
+				EditorValue:     maskedURL,
+				RawValue:        "",
+				HasSecret:       true,
+				Type:            viewmodel.SettingTypeURL,
+				Editable:        true,
+				RestartRequired: false,
+			},
+		}
+		mock.syncConfigCenter()
+
+		m := tui.New(mock)
+
+		// Enter Config Center
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+		m = updated.(*tui.Model)
+
+		// Navigate to Publishing category (index 5)
+		m.SetConfigCategoryForTest(5)
+		m.SetConfigItemIndexForTest(0)
+
+		// 1. Verify initial prefill in editor is masked (never exposes plaintext credentials)
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(*tui.Model)
+		if !m.SettingEditModeForTest() {
+			t.Fatalf("expected modal to open")
+		}
+		if got := m.SettingInputValForTest(); got != maskedURL {
+			t.Fatalf("expected masked editor value %q, got %q", maskedURL, got)
+		}
+		if strings.Contains(m.SettingInputValForTest(), secretToken) {
+			t.Fatalf("plaintext secret leaked in modal input: %s", m.SettingInputValForTest())
+		}
+		if strings.Contains(m.View(), secretToken) {
+			t.Fatalf("plaintext secret leaked in modal view: %s", m.View())
+		}
+
+		// 2. Submitting explicit userinfo is REJECTED per credential policy
+		rejectedSecret := "anothersecret999"
+		unsupportedSecretURL := "https://newuser:" + rejectedSecret + "@github.com/org/new-repo.git"
+
+		// Clear input
+		for m.SettingInputValForTest() != "" {
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+			m = updated.(*tui.Model)
+		}
+
+		// Type explicit credential-bearing URL
+		for _, ch := range unsupportedSecretURL {
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+			m = updated.(*tui.Model)
+		}
+
+		// Verify modal view NEVER displays plaintext secret even while typing
+		if strings.Contains(m.View(), rejectedSecret) {
+			t.Fatalf("plaintext secret leaked in modal view while typing: %s", m.View())
+		}
+
+		// Submit -> must be rejected
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(*tui.Model)
+
+		// Modal should remain open displaying the error
+		if !m.SettingEditModeForTest() {
+			t.Fatalf("expected modal to remain open on rejected credential entry")
+		}
+		viewWithError := m.View()
+		if !strings.Contains(viewWithError, "credentials must be managed separately") {
+			t.Fatalf("expected error 'credentials must be managed separately', got view:\n%s", viewWithError)
+		}
+
+		// 3. Rejected credential input does not leak into:
+		// - retained editor state after rejection
+		if strings.Contains(m.SettingInputValForTest(), rejectedSecret) {
+			t.Fatalf("plaintext secret leaked in m.settingInputVal after rejection: %s", m.SettingInputValForTest())
+		}
+		// - rendered View while modal remains open
+		if strings.Contains(m.View(), rejectedSecret) {
+			t.Fatalf("plaintext secret leaked in rendered View after rejection: %s", m.View())
+		}
+		// - status message / view error
+		lines := strings.Split(viewWithError, "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "Error:") && strings.Contains(line, rejectedSecret) {
+				t.Fatalf("secret leaked in error status line: %s", line)
+			}
+		}
+
+		// - ConfigItemViewModel
+		cfg := mock.ConfigCenter()
+		pubItem := cfg.Categories[viewmodel.CategoryPublishing].Items[0]
+		if strings.Contains(pubItem.Value, rejectedSecret) || strings.Contains(pubItem.EditorValue, rejectedSecret) || strings.Contains(pubItem.RawValue, rejectedSecret) {
+			t.Fatalf("secret leaked in ConfigItemViewModel: %+v", pubItem)
+		}
+
+		// Press Esc to cancel edit
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		m = updated.(*tui.Model)
+		if m.SettingEditModeForTest() {
+			t.Fatalf("expected modal to close after Esc")
+		}
+		// - rendered View after closing
+		if strings.Contains(m.View(), rejectedSecret) {
+			t.Fatalf("secret leaked in rendered view after modal cancelled: %s", m.View())
+		}
+		if strings.Contains(m.SettingInputValForTest(), rejectedSecret) {
+			t.Fatalf("secret leaked in settingInputVal after modal cancelled: %s", m.SettingInputValForTest())
+		}
+
+		// 4. Editing host/path with presentation mask preserves existing credential
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(*tui.Model)
+
+		// Clear input
+		for m.SettingInputValForTest() != "" {
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+			m = updated.(*tui.Model)
+		}
+
+		// Enter new host/path with mask
+		validMaskedEdit := "https://***@gitlab.com/org/renamed-repo.git"
+		for _, ch := range validMaskedEdit {
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+			m = updated.(*tui.Model)
+		}
+
+		// Submit -> success
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(*tui.Model)
+
+		if m.SettingEditModeForTest() {
+			t.Fatalf("expected modal to close after valid host/path edit")
+		}
+
+		// Verify mock state:
+		cfg = mock.ConfigCenter()
+		pubItem = cfg.Categories[viewmodel.CategoryPublishing].Items[0]
+
+		if !pubItem.HasSecret {
+			t.Errorf("expected HasSecret=true, got false")
+		}
+		if pubItem.RawValue != "" {
+			t.Errorf("expected RawValue=\"\" for secret-bearing item, got %q", pubItem.RawValue)
+		}
+		if pubItem.Value != validMaskedEdit {
+			t.Errorf("expected Value=%q, got %q", validMaskedEdit, pubItem.Value)
+		}
+		if pubItem.EditorValue != validMaskedEdit {
+			t.Errorf("expected EditorValue=%q, got %q", validMaskedEdit, pubItem.EditorValue)
+		}
+
+		// 5. Reopening editor verifies that reopened editor value is sanitized:
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(*tui.Model)
+
+		if !m.SettingEditModeForTest() {
+			t.Fatalf("expected modal to reopen")
+		}
+		if got := m.SettingInputValForTest(); got != validMaskedEdit {
+			t.Fatalf("expected reopened editor prefill %q, got %q", validMaskedEdit, got)
+		}
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		m = updated.(*tui.Model)
+
+		// 6. Non-secret URLs remain normally editable
+		mock.geminiItems = []viewmodel.ConfigItemViewModel{
+			{
+				Key:         "test.gemini.url",
+				Label:       "Gemini Target URL",
+				Value:       "https://gemini.google.com/",
+				EditorValue: "https://gemini.google.com/",
+				RawValue:    "https://gemini.google.com/",
+				HasSecret:   false,
+				Type:        viewmodel.SettingTypeURL,
+				Editable:    true,
+			},
+		}
+		mock.syncConfigCenter()
+		m.SetConfigCategoryForTest(3) // Gemini
+		m.SetConfigItemIndexForTest(0)
+
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(*tui.Model)
+		if m.SettingInputValForTest() != "https://gemini.google.com/" {
+			t.Fatalf("expected Gemini URL prefill, got %q", m.SettingInputValForTest())
+		}
+		for m.SettingInputValForTest() != "" {
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+			m = updated.(*tui.Model)
+		}
+		newPublicURL := "https://public-gemini.dev/v1"
+		for _, ch := range newPublicURL {
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+			m = updated.(*tui.Model)
+		}
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(*tui.Model)
+		if m.SettingEditModeForTest() {
+			t.Fatalf("expected modal closed after non-secret URL edit")
+		}
+		geminiItem := mock.ConfigCenter().Categories[viewmodel.CategoryGemini].Items[0]
+		if geminiItem.HasSecret {
+			t.Errorf("expected HasSecret=false for public URL")
+		}
+		if geminiItem.Value != newPublicURL || geminiItem.EditorValue != newPublicURL || geminiItem.RawValue != newPublicURL {
+			t.Errorf("expected public URL saved cleanly across Value, EditorValue, RawValue, got %+v", geminiItem)
+		}
+	})
 }

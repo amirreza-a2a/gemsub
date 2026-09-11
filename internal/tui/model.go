@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -10,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"gemsub/internal/publisher"
 	"gemsub/internal/tui/viewmodel"
 )
 
@@ -29,6 +31,7 @@ type Controller interface {
 	AddSource(rawURL string, name string) error
 	UpdateSource(id string, rawURL string, name string) error
 	DeleteSource(id string) error
+	UpdateSetting(key string, value string) error
 }
 
 // ActiveView represents the primary content pane currently displayed.
@@ -87,6 +90,16 @@ type Model struct {
 	configCenter    viewmodel.ConfigCenterViewModel
 	configCategory  viewmodel.ConfigCategory
 	configItemIndex int
+
+	// Setting Editor state
+	settingEditMode        bool
+	settingKey             string
+	settingLabel           string
+	settingInputVal        string
+	settingType            viewmodel.SettingType
+	settingEnumOptions     []string
+	settingRestartRequired bool
+	settingDescription     string
 
 	// Source Manager state
 	sourceMode        sourceInputMode
@@ -165,8 +178,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// In Config Center Sources category, active input modes capture keys (q, esc, etc.)
-	if m.activeView == ViewConfig && m.configCategory == viewmodel.CategorySources && m.sourceMode != sourceModeNormal {
+	// In Config Center with active input/modal modes, capture keys (q, esc, etc.)
+	if m.activeView == ViewConfig && (m.settingEditMode || (m.configCategory == viewmodel.CategorySources && m.sourceMode != sourceModeNormal)) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
@@ -184,6 +197,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.activeView = ViewConfig
 			m.configItemIndex = 0
 			m.sourceMode = sourceModeNormal
+			m.settingEditMode = false
 			m.refreshConfigCenter()
 			return m, nil
 		}
@@ -193,6 +207,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.activeView == ViewConfig {
 			m.activeView = m.prevActiveView
 			m.sourceMode = sourceModeNormal
+			m.settingEditMode = false
 			return m, nil
 		}
 	}
@@ -393,6 +408,10 @@ func (m *Model) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleSourceKeys(msg)
 	}
 
+	if m.settingEditMode {
+		return m.handleSettingEditKeys(msg)
+	}
+
 	catCount := viewmodel.ConfigCategoryCount
 	switch msg.String() {
 	case "tab", "l", "right":
@@ -421,8 +440,202 @@ func (m *Model) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(items) > 0 {
 			m.configItemIndex = len(items) - 1
 		}
+	case "enter", "e":
+		items := m.configCategoryItems()
+		if len(items) == 0 || m.configItemIndex >= len(items) {
+			return m, nil
+		}
+		item := items[m.configItemIndex]
+		if !item.Editable {
+			m.setStatus(fmt.Sprintf("%s is a read-only diagnostic", item.Label))
+			return m, nil
+		}
+		if item.Type == viewmodel.SettingTypeBool {
+			boolVal := item.EditorValue
+			if boolVal == "" {
+				boolVal = item.RawValue
+			}
+			newVal := "true"
+			if strings.EqualFold(boolVal, "true") || strings.EqualFold(item.Value, "true") {
+				newVal = "false"
+			}
+			if m.ctrl != nil {
+				if err := m.ctrl.UpdateSetting(item.Key, newVal); err != nil {
+					m.setStatus(fmt.Sprintf("Error: %s", publisher.SanitizeMessage(err.Error())))
+				} else {
+					m.setStatus(fmt.Sprintf("Updated %s: %s", item.Label, newVal))
+					m.refreshConfigCenter()
+				}
+			}
+			return m, nil
+		}
+		m.settingEditMode = true
+		m.settingKey = item.Key
+		m.settingLabel = item.Label
+		m.settingInputVal = item.EditorValue
+		if m.settingInputVal == "" && item.RawValue != "" {
+			m.settingInputVal = item.RawValue
+		}
+		m.settingType = item.Type
+		m.settingEnumOptions = item.EnumOptions
+		m.settingRestartRequired = item.RestartRequired
+		m.settingDescription = item.Description
+		return m, nil
+
+	case " ", "space":
+		items := m.configCategoryItems()
+		if len(items) == 0 || m.configItemIndex >= len(items) {
+			return m, nil
+		}
+		item := items[m.configItemIndex]
+		if !item.Editable {
+			m.setStatus(fmt.Sprintf("%s is a read-only diagnostic", item.Label))
+			return m, nil
+		}
+		if item.Type == viewmodel.SettingTypeBool {
+			boolVal := item.EditorValue
+			if boolVal == "" {
+				boolVal = item.RawValue
+			}
+			newVal := "true"
+			if strings.EqualFold(boolVal, "true") || strings.EqualFold(item.Value, "true") {
+				newVal = "false"
+			}
+			if m.ctrl != nil {
+				if err := m.ctrl.UpdateSetting(item.Key, newVal); err != nil {
+					m.setStatus(fmt.Sprintf("Error: %s", publisher.SanitizeMessage(err.Error())))
+				} else {
+					m.setStatus(fmt.Sprintf("Updated %s: %s", item.Label, newVal))
+					m.refreshConfigCenter()
+				}
+			}
+			return m, nil
+		}
+		if item.Type == viewmodel.SettingTypeEnum && len(item.EnumOptions) > 0 {
+			curVal := item.EditorValue
+			if curVal == "" {
+				curVal = item.RawValue
+			}
+			curIdx := -1
+			for idx, opt := range item.EnumOptions {
+				if opt == curVal {
+					curIdx = idx
+					break
+				}
+			}
+			nextIdx := (curIdx + 1) % len(item.EnumOptions)
+			newVal := item.EnumOptions[nextIdx]
+			if m.ctrl != nil {
+				if err := m.ctrl.UpdateSetting(item.Key, newVal); err != nil {
+					m.setStatus(fmt.Sprintf("Error: %s", publisher.SanitizeMessage(err.Error())))
+				} else {
+					m.setStatus(fmt.Sprintf("Updated %s: %s", item.Label, newVal))
+					m.refreshConfigCenter()
+				}
+			}
+			return m, nil
+		}
 	}
 	return m, nil
+}
+
+func sanitizeURLInput(input string) string {
+	if input == "" {
+		return ""
+	}
+	sanitized := publisher.SanitizeURL(input)
+	if p, err := url.Parse(sanitized); err == nil && p.User != nil {
+		p.User = url.User("***")
+		return p.String()
+	}
+	return sanitized
+}
+
+func (m *Model) handleSettingEditKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.settingEditMode = false
+		m.settingKey = ""
+		m.settingLabel = ""
+		m.settingInputVal = ""
+		m.settingEnumOptions = nil
+		m.setStatus("Edit cancelled")
+		return m, nil
+
+	case "tab":
+		if m.settingType == viewmodel.SettingTypeEnum && len(m.settingEnumOptions) > 0 {
+			curIdx := -1
+			for idx, opt := range m.settingEnumOptions {
+				if opt == m.settingInputVal {
+					curIdx = idx
+					break
+				}
+			}
+			nextIdx := (curIdx + 1) % len(m.settingEnumOptions)
+			m.settingInputVal = m.settingEnumOptions[nextIdx]
+		}
+		return m, nil
+
+	case " ", "space":
+		if m.settingType == viewmodel.SettingTypeEnum && len(m.settingEnumOptions) > 0 {
+			curIdx := -1
+			for idx, opt := range m.settingEnumOptions {
+				if opt == m.settingInputVal {
+					curIdx = idx
+					break
+				}
+			}
+			nextIdx := (curIdx + 1) % len(m.settingEnumOptions)
+			m.settingInputVal = m.settingEnumOptions[nextIdx]
+		} else {
+			m.settingInputVal += " "
+		}
+		return m, nil
+
+	case "backspace":
+		_, size := utf8.DecodeLastRuneInString(m.settingInputVal)
+		if size > 0 {
+			m.settingInputVal = m.settingInputVal[:len(m.settingInputVal)-size]
+		}
+		return m, nil
+
+	case "enter":
+		trimmedVal := strings.TrimSpace(m.settingInputVal)
+		if m.ctrl != nil {
+			if err := m.ctrl.UpdateSetting(m.settingKey, trimmedVal); err != nil {
+				if m.settingType == viewmodel.SettingTypeURL || strings.Contains(m.settingInputVal, "@") {
+					// Purge plaintext credentials from retained editor state on rejection
+					m.settingInputVal = sanitizeURLInput(m.settingInputVal)
+				}
+				m.setStatus(fmt.Sprintf("Error: %s", publisher.SanitizeMessage(err.Error())))
+				return m, nil
+			}
+			dispVal := trimmedVal
+			if m.settingType == viewmodel.SettingTypeURL || strings.Contains(dispVal, "@") {
+				dispVal = sanitizeURLInput(dispVal)
+			}
+			m.setStatus(fmt.Sprintf("Updated %s: %s", m.settingLabel, dispVal))
+			m.refreshConfigCenter()
+		}
+		m.settingEditMode = false
+		m.settingKey = ""
+		m.settingLabel = ""
+		m.settingInputVal = ""
+		m.settingEnumOptions = nil
+		return m, nil
+
+	default:
+		var char string
+		if msg.Type == tea.KeyRunes {
+			char = string(msg.Runes)
+		} else if len(msg.String()) == 1 {
+			char = msg.String()
+		}
+		if char != "" {
+			m.settingInputVal += char
+		}
+		return m, nil
+	}
 }
 
 func (m *Model) handleSourceKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1208,6 +1421,11 @@ func (m *Model) renderConfigCenter() string {
 		return sb.String()
 	}
 
+	if m.settingEditMode {
+		sb.WriteString(m.renderSettingEditorModal())
+		return sb.String()
+	}
+
 	// Items for the active category
 	items := m.configCategoryItems()
 	if len(items) == 0 {
@@ -1222,6 +1440,8 @@ func (m *Model) renderConfigCenter() string {
 
 func (m *Model) renderCategoryItems(items []viewmodel.ConfigItemViewModel) string {
 	bold := lipgloss.NewStyle().Bold(true)
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	yellow := lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("236")).Bold(true)
 
 	var sb strings.Builder
@@ -1241,8 +1461,9 @@ func (m *Model) renderCategoryItems(items []viewmodel.ConfigItemViewModel) strin
 
 	maxLabel := 0
 	for _, item := range items {
-		if len(item.Label) > maxLabel {
-			maxLabel = len(item.Label)
+		w := lipgloss.Width(item.Label)
+		if w > maxLabel {
+			maxLabel = w
 		}
 	}
 	if maxLabel > 25 {
@@ -1257,27 +1478,163 @@ func (m *Model) renderCategoryItems(items []viewmodel.ConfigItemViewModel) strin
 		}
 
 		label := item.Label
-		if len(label) > maxLabel {
-			label = label[:maxLabel]
+		if lipgloss.Width(label) > maxLabel {
+			label = ansi.Truncate(label, maxLabel, "…")
+		}
+		labelPad := maxLabel - lipgloss.Width(label)
+		if labelPad < 0 {
+			labelPad = 0
+		}
+		paddedLabel := label + strings.Repeat(" ", labelPad)
+
+		badge := ""
+		badgeWidth := 0
+		if item.PendingRestart {
+			badge = yellow.Render(" [restart pending]")
+			badgeWidth = 18
+		} else if item.RestartRequired {
+			badge = dim.Render(" [restart]")
+			badgeWidth = 10
 		}
 
-		valueWidth := m.width - maxLabel - 8
-		if valueWidth < 10 {
-			valueWidth = 10
+		valueWidth := m.width - maxLabel - 8 - badgeWidth
+		if valueWidth < 6 {
+			valueWidth = 6
 		}
 		value := item.Value
-		if len(value) > valueWidth {
-			value = value[:valueWidth-1] + "…"
+		if lipgloss.Width(value) > valueWidth {
+			value = ansi.Truncate(value, valueWidth, "…")
 		}
 
-		line := fmt.Sprintf("%s%-*s  %s", cursor, maxLabel, label, value)
+		line := fmt.Sprintf("%s%s  %s%s", cursor, paddedLabel, value, badge)
+		if m.width > 0 && lipgloss.Width(line) > m.width {
+			line = ansi.Truncate(line, m.width, "")
+		}
+
 		if i == m.configItemIndex {
 			sb.WriteString(selectedStyle.Render(line))
 		} else {
-			sb.WriteString("  " + bold.Render(fmt.Sprintf("%-*s", maxLabel, label)) + "  " + value)
+			plainLine := "  " + bold.Render(paddedLabel) + "  " + value + badge
+			if m.width > 0 && lipgloss.Width(plainLine) > m.width {
+				plainLine = ansi.Truncate(plainLine, m.width, "")
+			}
+			sb.WriteString(plainLine)
 		}
 		sb.WriteString("\n")
 	}
+
+	return sb.String()
+}
+
+func (m *Model) renderSettingEditorModal() string {
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	cyan := lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+	yellow := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+
+	var sb strings.Builder
+
+	title := "Edit " + m.settingLabel
+	actionHint := "[Enter] Save"
+
+	boxWidth := m.width - 4
+	if boxWidth > 72 {
+		boxWidth = 72
+	}
+	if boxWidth < 40 {
+		if m.width >= 44 {
+			boxWidth = 40
+		} else {
+			boxWidth = m.width - 4
+			if boxWidth < 20 {
+				boxWidth = 20
+			}
+		}
+	}
+
+	titleWidth := lipgloss.Width(title)
+	if titleWidth > boxWidth-6 {
+		title = ansi.Truncate(title, boxWidth-6, "…")
+		titleWidth = lipgloss.Width(title)
+	}
+
+	repeatTop := boxWidth - titleWidth - 5
+	if repeatTop < 0 {
+		repeatTop = 0
+	}
+	repeatBot := boxWidth - 2
+	if repeatBot < 0 {
+		repeatBot = 0
+	}
+	topBar := "┌─ " + title + " " + strings.Repeat("─", repeatTop) + "┐"
+	botBar := "└" + strings.Repeat("─", repeatBot) + "┘"
+
+	innerMax := boxWidth - 4
+	if innerMax < 5 {
+		innerMax = 5
+	}
+
+	valPrefix := cyan.Render("> Value: ")
+	prefixCells := 9
+	fieldWidth := innerMax - prefixCells
+	if fieldWidth < 5 {
+		fieldWidth = 5
+	}
+
+	modalVal := m.settingInputVal
+	if m.settingType == viewmodel.SettingTypeURL || strings.Contains(modalVal, "@") {
+		modalVal = sanitizeURLInput(modalVal)
+	}
+	dispVal := modalVal + "_"
+	if lipgloss.Width(dispVal) > fieldWidth {
+		dispVal = ansi.Truncate(dispVal, fieldWidth, "…")
+	}
+	valPadLen := fieldWidth - lipgloss.Width(dispVal)
+	if valPadLen < 0 {
+		valPadLen = 0
+	}
+	valRow := valPrefix + dispVal + strings.Repeat(" ", valPadLen)
+
+	var noteContent string
+	if m.settingType == viewmodel.SettingTypeEnum && len(m.settingEnumOptions) > 0 {
+		noteContent = "  Options: " + strings.Join(m.settingEnumOptions, " | ")
+	} else if m.settingRestartRequired {
+		noteContent = "  " + yellow.Render("[Restart Required]") + " Changes take effect after service restart"
+	} else if m.settingDescription != "" {
+		noteContent = "  " + m.settingDescription
+	}
+
+	if lipgloss.Width(noteContent) > innerMax {
+		noteContent = ansi.Truncate(noteContent, innerMax, "…")
+	}
+	notePadLen := innerMax - lipgloss.Width(noteContent)
+	if notePadLen < 0 {
+		notePadLen = 0
+	}
+	noteRow := noteContent + strings.Repeat(" ", notePadLen)
+
+	blankRow := strings.Repeat(" ", innerMax)
+
+	var hintContent string
+	if m.settingType == viewmodel.SettingTypeEnum {
+		hintContent = fmt.Sprintf(" %s   [Tab/Space] Cycle Option   [Esc] Cancel", actionHint)
+	} else {
+		hintContent = fmt.Sprintf(" %s   [Esc] Cancel", actionHint)
+	}
+	if lipgloss.Width(hintContent) > innerMax {
+		hintContent = ansi.Truncate(hintContent, innerMax, "…")
+	}
+	hintPadLen := innerMax - lipgloss.Width(hintContent)
+	if hintPadLen < 0 {
+		hintPadLen = 0
+	}
+	hintRow := hintContent + strings.Repeat(" ", hintPadLen)
+
+	sb.WriteString("  " + dim.Render(topBar) + "\n")
+	sb.WriteString("  │ " + valRow + " │\n")
+	sb.WriteString("  │ " + noteRow + " │\n")
+	sb.WriteString("  │ " + blankRow + " │\n")
+	sb.WriteString("  │ " + hintRow + " │\n")
+	sb.WriteString("  " + dim.Render(botBar) + "\n")
 
 	return sb.String()
 }
@@ -1540,7 +1897,15 @@ func (m *Model) renderFooter() string {
 				hints = fmt.Sprintf("%s [Space] Toggle [a] Add [Enter] Edit [d] Delete [Tab] Cat [Esc] Back [q] Quit", statusStr)
 			}
 		} else {
-			hints = fmt.Sprintf("%s [Tab/h/l] Category  [j/k] Navigate  [Esc] Back  [q] Quit", statusStr)
+			if m.settingEditMode {
+				if m.settingType == viewmodel.SettingTypeEnum {
+					hints = fmt.Sprintf("%s [Enter] Save  [Tab/Space] Cycle  [Esc] Cancel", statusStr)
+				} else {
+					hints = fmt.Sprintf("%s [Enter] Save  [Esc] Cancel", statusStr)
+				}
+			} else {
+				hints = fmt.Sprintf("%s [Enter] Edit/Toggle  [Space] Toggle/Cycle  [Tab] Cat  [Esc] Back  [q] Quit", statusStr)
+			}
 		}
 	} else if m.activeView == ViewCandidates {
 		hints = fmt.Sprintf("%s [s] Filter %s  [Enter] Detail  [y] Copy  [c] Config  [Tab] Logs  [q] Quit",

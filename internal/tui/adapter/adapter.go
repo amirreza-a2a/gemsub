@@ -4,7 +4,9 @@ import (
 	"cmp"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -985,16 +987,96 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 		cfg = eventCfg
 	}
 
+	var pendingRestartMap map[string]bool
+	if cfgSvc != nil {
+		pending := cfgSvc.PendingRestartFields()
+		if len(pending) > 0 {
+			pendingRestartMap = make(map[string]bool, len(pending))
+			for _, f := range pending {
+				pendingRestartMap[f] = true
+			}
+		}
+	}
+	isPending := func(key string) bool {
+		return pendingRestartMap != nil && pendingRestartMap[key]
+	}
+
 	categories := make([]viewmodel.ConfigCategoryViewModel, viewmodel.ConfigCategoryCount)
 
 	// 1. General Category
 	generalItems := []viewmodel.ConfigItemViewModel{
-		{Label: "Listen Address", Value: valueOrFallback(cfg.Serve.Listen, "(not set)")},
-		{Label: "Subscription Path", Value: valueOrFallback(cfg.Serve.Path, "(not set)")},
-		{Label: "Subscription Format", Value: valueOrFallback(cfg.Serve.Format, "raw")},
-		{Label: "Country Flag Mode", Value: valueOrFallback(cfg.FlagMode, string(flagMode))},
-		{Label: "State File", Value: valueOrFallback(cfg.StateFile, "(none)")},
-		{Label: "Headless Mode", Value: fmt.Sprintf("%t", cfg.Headless)},
+		{
+			Key:             "serve.listen",
+			Label:           "Listen Address",
+			Value:           valueOrFallback(cfg.Serve.Listen, "(not set)"),
+			EditorValue:     cfg.Serve.Listen,
+			RawValue:        cfg.Serve.Listen,
+			Type:            viewmodel.SettingTypeString,
+			Editable:        true,
+			RestartRequired: true,
+			PendingRestart:  isPending("serve.listen"),
+			Description:     "HTTP subscription listen address (host:port)",
+		},
+		{
+			Key:             "serve.path",
+			Label:           "Subscription Path",
+			Value:           valueOrFallback(cfg.Serve.Path, "(not set)"),
+			EditorValue:     cfg.Serve.Path,
+			RawValue:        cfg.Serve.Path,
+			Type:            viewmodel.SettingTypeString,
+			Editable:        true,
+			RestartRequired: true,
+			PendingRestart:  isPending("serve.path"),
+			Description:     "HTTP subscription request path (e.g. /sub)",
+		},
+		{
+			Key:             "serve.format",
+			Label:           "Subscription Format",
+			Value:           valueOrFallback(cfg.Serve.Format, "base64"),
+			EditorValue:     cfg.Serve.Format,
+			RawValue:        cfg.Serve.Format,
+			Type:            viewmodel.SettingTypeEnum,
+			Editable:        true,
+			RestartRequired: false,
+			EnumOptions:     []string{"base64", "raw"},
+			Description:     "Delivery format: base64 or raw",
+		},
+		{
+			Key:             "flag_mode",
+			Label:           "Country Flag Mode",
+			Value:           valueOrFallback(cfg.FlagMode, string(flagMode)),
+			EditorValue:     cfg.FlagMode,
+			RawValue:        cfg.FlagMode,
+			Type:            viewmodel.SettingTypeEnum,
+			Editable:        true,
+			RestartRequired: false,
+			EnumOptions:     []string{"auto", "unicode", "ascii"},
+			Description:     "Flag presentation: auto, unicode, or ascii",
+		},
+		{
+			Key:             "state_file",
+			Label:           "State File",
+			Value:           valueOrFallback(cfg.StateFile, "(none)"),
+			EditorValue:     cfg.StateFile,
+			RawValue:        cfg.StateFile,
+			Type:            viewmodel.SettingTypeString,
+			Editable:        true,
+			RestartRequired: true,
+			PendingRestart:  isPending("state_file"),
+			Description:     "Candidate state JSON persistence path",
+		},
+		{
+			Key:             "headless",
+			Label:           "Headless Mode",
+			Value:           fmt.Sprintf("%t", cfg.Headless),
+			EditorValue:     fmt.Sprintf("%t", cfg.Headless),
+			RawValue:        fmt.Sprintf("%t", cfg.Headless),
+			Type:            viewmodel.SettingTypeBool,
+			Editable:        true,
+			RestartRequired: true,
+			PendingRestart:  isPending("headless"),
+			Description:     "Run without TUI interface (true/false)",
+		},
 	}
 	categories[viewmodel.CategoryGeneral] = viewmodel.ConfigCategoryViewModel{
 		Category: viewmodel.CategoryGeneral,
@@ -1071,14 +1153,84 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 		rateLimitStr = fmt.Sprintf("%d rps", cfg.Test.RateLimitRPS)
 	}
 	testingItems := []viewmodel.ConfigItemViewModel{
-		{Label: "Test Timeout", Value: valueOrFallback(cfg.Test.TimeoutRaw, "(default)")},
-		{Label: "Concurrency", Value: fmt.Sprintf("%d workers", cfg.Test.Concurrency)},
-		{Label: "Max Retries", Value: maxRetriesStr},
-		{Label: "Retry Backoff", Value: valueOrFallback(cfg.Test.RetryBackoffRaw, "(default)")},
-		{Label: "Health Check URL", Value: valueOrFallback(publisher.SanitizeURL(cfg.Test.HealthURL), "(none)")},
-		{Label: "Dial Timeout", Value: valueOrFallback(cfg.Test.DialTimeoutRaw, "(default)")},
-		{Label: "Max Inconclusive Cycles", Value: fmt.Sprintf("%d", cfg.Test.MaxInconclusiveCycles)},
-		{Label: "Rate Limit RPS", Value: rateLimitStr},
+		{
+			Key:             "test.timeout",
+			Label:           "Test Timeout",
+			Value:           valueOrFallback(cfg.Test.TimeoutRaw, "(default)"),
+			EditorValue:     cfg.Test.TimeoutRaw,
+			RawValue:        cfg.Test.TimeoutRaw,
+			Type:            viewmodel.SettingTypeDuration,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Individual probe overall timeout duration (e.g. 10s)",
+		},
+		{
+			Key:             "test.concurrency",
+			Label:           "Concurrency",
+			Value:           fmt.Sprintf("%d workers", cfg.Test.Concurrency),
+			EditorValue:     fmt.Sprintf("%d", cfg.Test.Concurrency),
+			RawValue:        fmt.Sprintf("%d", cfg.Test.Concurrency),
+			Type:            viewmodel.SettingTypeInt,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Worker pool concurrency limit (> 0)",
+		},
+		{
+			Key:             "test.max_retries",
+			Label:           "Max Retries",
+			Value:           maxRetriesStr,
+			EditorValue:     fmt.Sprintf("%d", cfg.Test.MaxRetries),
+			RawValue:        fmt.Sprintf("%d", cfg.Test.MaxRetries),
+			Type:            viewmodel.SettingTypeInt,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Maximum retry attempts on probe failure (>= 0)",
+		},
+		{
+			Key:             "test.retry_backoff",
+			Label:           "Retry Backoff",
+			Value:           valueOrFallback(cfg.Test.RetryBackoffRaw, "(default)"),
+			EditorValue:     cfg.Test.RetryBackoffRaw,
+			RawValue:        cfg.Test.RetryBackoffRaw,
+			Type:            viewmodel.SettingTypeDuration,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Delay between probe retries (e.g. 1s)",
+		},
+		buildURLSettingItem("test.health_url", "Health Check URL", cfg.Test.HealthURL, "HTTP endpoint for network connectivity probes"),
+		{
+			Key:             "test.dial_timeout",
+			Label:           "Dial Timeout",
+			Value:           valueOrFallback(cfg.Test.DialTimeoutRaw, "(default)"),
+			EditorValue:     cfg.Test.DialTimeoutRaw,
+			RawValue:        cfg.Test.DialTimeoutRaw,
+			Type:            viewmodel.SettingTypeDuration,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "TCP/TLS connection dial timeout (e.g. 4s)",
+		},
+		{
+			Key:             "test.max_inconclusive_cycles",
+			Label:           "Max Inconclusive Cycles",
+			Value:           fmt.Sprintf("%d", cfg.Test.MaxInconclusiveCycles),
+			EditorValue:     fmt.Sprintf("%d", cfg.Test.MaxInconclusiveCycles),
+			RawValue:        fmt.Sprintf("%d", cfg.Test.MaxInconclusiveCycles),
+			Type:            viewmodel.SettingTypeInt,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Cycles before demoting inconclusive candidates (> 0)",
+		},
+		{
+			Key:             "test.rate_limit_rps",
+			Label:           "Rate Limit RPS",
+			Value:           rateLimitStr,
+			EditorValue:     fmt.Sprintf("%d", cfg.Test.RateLimitRPS),
+			RawValue:        fmt.Sprintf("%d", cfg.Test.RateLimitRPS),
+			Type:            viewmodel.SettingTypeInt,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Outbound probe rate limit in requests per second (0 = unlimited)",
+		},
 	}
 	categories[viewmodel.CategoryTesting] = viewmodel.ConfigCategoryViewModel{
 		Category: viewmodel.CategoryTesting,
@@ -1091,9 +1243,23 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 	if len(cfg.Test.Gemini.BlockPhrases) > 0 {
 		blockPhrasesStr = strings.Join(cfg.Test.Gemini.BlockPhrases, ", ")
 	}
+	rawPhrases := ""
+	if len(cfg.Test.Gemini.BlockPhrases) > 0 {
+		rawPhrases = strings.Join(cfg.Test.Gemini.BlockPhrases, ", ")
+	}
 	geminiItems := []viewmodel.ConfigItemViewModel{
-		{Label: "Gemini Target URL", Value: valueOrFallback(publisher.SanitizeURL(cfg.Test.Gemini.URL), "(none)")},
-		{Label: "Block Phrases", Value: blockPhrasesStr},
+		buildURLSettingItem("test.gemini.url", "Gemini Target URL", cfg.Test.Gemini.URL, "Gemini probe verification endpoint"),
+		{
+			Key:             "test.gemini.block_phrases",
+			Label:           "Block Phrases",
+			Value:           blockPhrasesStr,
+			EditorValue:     rawPhrases,
+			RawValue:        rawPhrases,
+			Type:            viewmodel.SettingTypeString,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Comma-separated phrases indicating blocked access",
+		},
 	}
 	categories[viewmodel.CategoryGemini] = viewmodel.ConfigCategoryViewModel{
 		Category: viewmodel.CategoryGemini,
@@ -1107,8 +1273,28 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 		probeLimitStr = fmt.Sprintf("%d candidates", cfg.ProbeLimit)
 	}
 	schedulerItems := []viewmodel.ConfigItemViewModel{
-		{Label: "Fetch Interval", Value: valueOrFallback(cfg.FetchIntervalRaw, "(not set)")},
-		{Label: "Probe Limit", Value: probeLimitStr},
+		{
+			Key:             "fetch_interval",
+			Label:           "Fetch Interval",
+			Value:           valueOrFallback(cfg.FetchIntervalRaw, "(not set)"),
+			EditorValue:     cfg.FetchIntervalRaw,
+			RawValue:        cfg.FetchIntervalRaw,
+			Type:            viewmodel.SettingTypeDuration,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Interval between test cycles (>= 1m)",
+		},
+		{
+			Key:             "probe_limit",
+			Label:           "Probe Limit",
+			Value:           probeLimitStr,
+			EditorValue:     fmt.Sprintf("%d", cfg.ProbeLimit),
+			RawValue:        fmt.Sprintf("%d", cfg.ProbeLimit),
+			Type:            viewmodel.SettingTypeInt,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Maximum candidates to test per cycle (0 = unlimited)",
+		},
 	}
 	if schedCtrl != nil {
 		schedStatus := schedCtrl.Status()
@@ -1117,35 +1303,45 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 			daemonStatus = "Running"
 		}
 		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
-			Label: "Daemon Status",
-			Value: daemonStatus,
+			Label:    "Daemon Status",
+			Value:    daemonStatus,
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
 		})
 		cycleActive := "No"
 		if schedStatus.CycleActive {
 			cycleActive = "Yes (probes in progress)"
 		}
 		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
-			Label: "Cycle Active",
-			Value: cycleActive,
+			Label:    "Cycle Active",
+			Value:    cycleActive,
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
 		})
 		lastCycleStr := "Never"
 		if !schedStatus.LastCycleStart.IsZero() {
 			lastCycleStr = schedStatus.LastCycleStart.Format("15:04:05")
 		}
 		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
-			Label: "Last Cycle Start",
-			Value: lastCycleStr,
+			Label:    "Last Cycle Start",
+			Value:    lastCycleStr,
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
 		})
 		if schedStatus.LastDuration > 0 {
 			schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
-				Label: "Last Duration",
-				Value: schedStatus.LastDuration.Round(time.Millisecond).String(),
+				Label:    "Last Duration",
+				Value:    schedStatus.LastDuration.Round(time.Millisecond).String(),
+				Type:     viewmodel.SettingTypeReadOnly,
+				Editable: false,
 			})
 		}
 	} else {
 		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
-			Label: "Daemon Status",
-			Value: "Not initialized",
+			Label:    "Daemon Status",
+			Value:    "Not initialized",
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
 		})
 	}
 	categories[viewmodel.CategoryScheduler] = viewmodel.ConfigCategoryViewModel{
@@ -1155,13 +1351,41 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 	}
 
 	// 6. Publishing Category
-	cleanRepo := publisher.SanitizeMessage(cfg.Publishing.Repository)
-	cleanRemoteURL := publisher.SanitizeURL(cfg.Publishing.RemoteURL)
 	publishingItems := []viewmodel.ConfigItemViewModel{
-		{Label: "Publishing Enabled", Value: fmt.Sprintf("%t", cfg.Publishing.Enabled)},
-		{Label: "Target Repository", Value: valueOrFallback(cleanRepo, "(none)")},
-		{Label: "Target Branch", Value: valueOrFallback(cfg.Publishing.Branch, "(default)")},
-		{Label: "Remote URL", Value: valueOrFallback(cleanRemoteURL, "(none)")},
+		{
+			Key:             "publishing.enabled",
+			Label:           "Publishing Enabled",
+			Value:           fmt.Sprintf("%t", cfg.Publishing.Enabled),
+			EditorValue:     fmt.Sprintf("%t", cfg.Publishing.Enabled),
+			RawValue:        fmt.Sprintf("%t", cfg.Publishing.Enabled),
+			Type:            viewmodel.SettingTypeBool,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Enable Git-backed subscription publishing (true/false)",
+		},
+		{
+			Key:             "publishing.repository",
+			Label:           "Target Repository",
+			Value:           valueOrFallback(cfg.Publishing.Repository, "(none)"),
+			EditorValue:     cfg.Publishing.Repository,
+			RawValue:        cfg.Publishing.Repository,
+			Type:            viewmodel.SettingTypeString,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Local Git repository directory path",
+		},
+		{
+			Key:             "publishing.branch",
+			Label:           "Target Branch",
+			Value:           valueOrFallback(cfg.Publishing.Branch, "(default)"),
+			EditorValue:     cfg.Publishing.Branch,
+			RawValue:        cfg.Publishing.Branch,
+			Type:            viewmodel.SettingTypeString,
+			Editable:        true,
+			RestartRequired: false,
+			Description:     "Git branch to publish subscription files to",
+		},
+		buildURLSettingItem("publishing.remote_url", "Remote URL", cfg.Publishing.RemoteURL, "Git remote origin URL (credentials masked)"),
 	}
 	if pubSvc != nil {
 		pStatus := pubSvc.Status()
@@ -1170,25 +1394,33 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 			pubRun = "Publishing..."
 		}
 		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label: "Publish Status",
-			Value: pubRun,
+			Label:    "Publish Status",
+			Value:    pubRun,
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
 		})
 		lastPub := "Never"
 		if !pStatus.LastPublished.IsZero() {
 			lastPub = pStatus.LastPublished.Format("15:04:05")
 		}
 		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label: "Last Published",
-			Value: lastPub,
+			Label:    "Last Published",
+			Value:    lastPub,
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
 		})
 		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label: "Publish Count",
-			Value: fmt.Sprintf("%d succeeded, %d failed", pStatus.PublishCount, pStatus.FailCount),
+			Label:    "Publish Count",
+			Value:    fmt.Sprintf("%d succeeded, %d failed", pStatus.PublishCount, pStatus.FailCount),
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
 		})
 		if pStatus.LastError != "" {
 			publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-				Label: "Last Error",
-				Value: publisher.SanitizeMessage(pStatus.LastError),
+				Label:    "Last Error",
+				Value:    publisher.SanitizeMessage(pStatus.LastError),
+				Type:     viewmodel.SettingTypeReadOnly,
+				Editable: false,
 			})
 		}
 	} else if eventPublishCount > 0 || eventPublishFailCount > 0 || eventPubRunning || eventLastPublishError != "" || !eventLastPublished.IsZero() {
@@ -1197,31 +1429,41 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 			pubRun = "Publishing..."
 		}
 		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label: "Publish Status",
-			Value: pubRun,
+			Label:    "Publish Status",
+			Value:    pubRun,
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
 		})
 		lastPub := "Never"
 		if !eventLastPublished.IsZero() {
 			lastPub = eventLastPublished.Format("15:04:05")
 		}
 		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label: "Last Published",
-			Value: lastPub,
+			Label:    "Last Published",
+			Value:    lastPub,
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
 		})
 		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label: "Publish Count",
-			Value: fmt.Sprintf("%d succeeded, %d failed", eventPublishCount, eventPublishFailCount),
+			Label:    "Publish Count",
+			Value:    fmt.Sprintf("%d succeeded, %d failed", eventPublishCount, eventPublishFailCount),
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
 		})
 		if eventLastPublishError != "" {
 			publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-				Label: "Last Error",
-				Value: publisher.SanitizeMessage(eventLastPublishError),
+				Label:    "Last Error",
+				Value:    publisher.SanitizeMessage(eventLastPublishError),
+				Type:     viewmodel.SettingTypeReadOnly,
+				Editable: false,
 			})
 		}
 	} else {
 		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label: "Publish Status",
-			Value: "Not initialized",
+			Label:    "Publish Status",
+			Value:    "Not initialized",
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
 		})
 	}
 	categories[viewmodel.CategoryPublishing] = viewmodel.ConfigCategoryViewModel{
@@ -1240,6 +1482,317 @@ func valueOrFallback(val, fallback string) string {
 		return fallback
 	}
 	return val
+}
+
+// hasUserCredentials returns true if rawURL contains userinfo (credentials/tokens).
+func hasUserCredentials(rawURL string) bool {
+	if rawURL == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return u.User != nil
+}
+
+// updateURLPreservingCredentials validates newURL and returns an updated URL string.
+// updateURLPreservingCredentials updates a URL according to the remote URL credential policy:
+//  1. Existing credentials must never be exposed to TUI presentation or editor state.
+//  2. Existing credentials remain preserved when host, scheme, or path is edited.
+//  3. Submitting an unchanged or edited masked URL (e.g. "https://***@host/path") preserves credentials.
+//  4. Submitting a URL without userinfo (e.g. "https://host/path") preserves existing credentials.
+//  5. Explicit userinfo/credentials typed into the normal URL editor is rejected with
+//     "credentials must be managed separately", never echoing the credential.
+//  6. Empty or invalid URLs are rejected.
+//  7. Non-secret URLs (starting with no credentials) remain editable without adding credentials.
+func updateURLPreservingCredentials(currentURL, newURL string) (string, error) {
+	trimmed := strings.TrimSpace(newURL)
+	if trimmed == "" {
+		return "", fmt.Errorf("URL cannot be empty")
+	}
+
+	normNew, err := config.NormalizeURL(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("invalid URL")
+	}
+
+	parsedNew, err := url.Parse(normNew)
+	if err != nil {
+		return "", fmt.Errorf("invalid URL")
+	}
+
+	// Check for userinfo in the input URL
+	if parsedNew.User != nil {
+		user := parsedNew.User.Username()
+		pass, hasPass := parsedNew.User.Password()
+		isMasked := (user == "***" && (!hasPass || pass == "***"))
+		if !isMasked {
+			// Explicit userinfo entered: reject per credential policy.
+			// Do NOT echo the credential in the error message.
+			return "", fmt.Errorf("credentials must be managed separately")
+		}
+	}
+
+	// If currentURL has existing credentials, preserve them
+	if strings.TrimSpace(currentURL) != "" {
+		if parsedCurrent, err := url.Parse(currentURL); err == nil && parsedCurrent.User != nil {
+			parsedNew.User = parsedCurrent.User
+			return parsedNew.String(), nil
+		}
+	}
+
+	// No existing credentials in currentURL: if user supplied presentation mask "***", strip it
+	if parsedNew.User != nil {
+		parsedNew.User = nil
+	}
+
+	return parsedNew.String(), nil
+}
+
+// buildURLSettingItem constructs a ConfigItemViewModel for a URL setting,
+// ensuring secret-bearing credentials are never placed in RawValue or presentation state.
+func buildURLSettingItem(key, label, rawURL, desc string) viewmodel.ConfigItemViewModel {
+	hasSecret := hasUserCredentials(rawURL)
+	sanitized := publisher.SanitizeURL(rawURL)
+
+	item := viewmodel.ConfigItemViewModel{
+		Key:             key,
+		Label:           label,
+		Type:            viewmodel.SettingTypeURL,
+		Editable:        true,
+		RestartRequired: false,
+		Description:     desc,
+		HasSecret:       hasSecret,
+	}
+
+	if hasSecret {
+		// Secret-bearing: do NOT place cleartext credentials in TUI state.
+		// RawValue must not claim to be raw if it is display-sanitized.
+		item.Value = sanitized
+		item.EditorValue = sanitized
+		item.RawValue = ""
+	} else {
+		// Non-secret URL: RawValue and EditorValue are the exact configured URL.
+		item.Value = valueOrFallback(rawURL, "(none)")
+		item.EditorValue = rawURL
+		item.RawValue = rawURL
+	}
+
+	return item
+}
+
+// UpdateSetting mutates an application setting by key through ConfigService or PublishingService.
+// Architectural boundary:
+//   - Adapter: UI string -> typed value conversion + basic input-shape checks (e.g. non-empty string,
+//     leading slash for path, integer/duration parsing, non-negative bounds).
+//   - ConfigService / config.Config.Validate(): authoritative semantic and configuration validation
+//     (e.g. minimum intervals, positive timeouts, Gemini block phrase requirements, publishing constraints).
+func (a *Adapter) UpdateSetting(key string, value string) error {
+	a.mu.RLock()
+	cfgSvc := a.configSvc
+	pubSvc := a.publishSvc
+	a.mu.RUnlock()
+
+	if cfgSvc == nil {
+		return fmt.Errorf("config service unavailable")
+	}
+
+	trimmed := strings.TrimSpace(value)
+
+	// Route publishing settings through pubSvc.
+	// PublishingService is the single authoritative path for publishing mutations.
+	if strings.HasPrefix(key, "publishing.") {
+		if pubSvc == nil {
+			return fmt.Errorf("publishing service unavailable")
+		}
+		var updateErr error
+		switch key {
+		case "publishing.enabled":
+			b, err := strconv.ParseBool(trimmed)
+			if err != nil {
+				return fmt.Errorf("invalid boolean value: %w", err)
+			}
+			updateErr = pubSvc.SetEnabled(b)
+		case "publishing.repository":
+			updateErr = pubSvc.SetRepository(trimmed)
+		case "publishing.branch":
+			updateErr = pubSvc.SetBranch(trimmed)
+		case "publishing.remote_url":
+			current := pubSvc.Config().RemoteURL
+			newURL, err := updateURLPreservingCredentials(current, trimmed)
+			if err != nil {
+				return err
+			}
+			updateErr = pubSvc.SetRemoteURL(newURL)
+		default:
+			return fmt.Errorf("unknown publishing setting: %q", key)
+		}
+		if updateErr != nil {
+			return fmt.Errorf("%s", publisher.SanitizeMessage(updateErr.Error()))
+		}
+		atomic.StoreInt32(&a.dirty, 1)
+		return nil
+	}
+
+	// All other settings route through cfgSvc.Update.
+	// Adapter converts UI strings into typed values and verifies basic input shape;
+	// authoritative domain and configuration validation is enforced downstream by cfgSvc.Update
+	// via candidate.Validate().
+	err := cfgSvc.Update(func(c *config.Config) error {
+		switch key {
+		case "serve.listen":
+			if trimmed == "" {
+				return fmt.Errorf("listen address cannot be empty")
+			}
+			c.Serve.Listen = trimmed
+
+		case "serve.path":
+			if trimmed == "" {
+				return fmt.Errorf("subscription path cannot be empty")
+			}
+			if !strings.HasPrefix(trimmed, "/") {
+				return fmt.Errorf("subscription path must start with '/'")
+			}
+			c.Serve.Path = trimmed
+
+		case "serve.format":
+			c.Serve.Format = strings.ToLower(trimmed)
+
+		case "flag_mode":
+			c.FlagMode = strings.ToLower(trimmed)
+
+		case "state_file":
+			if trimmed == "" {
+				return fmt.Errorf("state file path cannot be empty")
+			}
+			c.StateFile = trimmed
+
+		case "headless":
+			b, err := strconv.ParseBool(trimmed)
+			if err != nil {
+				return fmt.Errorf("invalid boolean value: %w", err)
+			}
+			c.Headless = b
+
+		case "test.timeout":
+			d, err := time.ParseDuration(trimmed)
+			if err != nil {
+				return fmt.Errorf("invalid timeout duration: %w", err)
+			}
+			c.Test.TimeoutRaw = trimmed
+			c.Test.Timeout = d
+
+		case "test.concurrency":
+			n, err := strconv.Atoi(trimmed)
+			if err != nil {
+				return fmt.Errorf("concurrency must be an integer: %w", err)
+			}
+			if n <= 0 {
+				return fmt.Errorf("concurrency must be positive")
+			}
+			c.Test.Concurrency = n
+
+		case "test.max_retries":
+			n, err := strconv.Atoi(trimmed)
+			if err != nil {
+				return fmt.Errorf("max retries must be an integer: %w", err)
+			}
+			c.Test.MaxRetriesRaw = &n
+			c.Test.MaxRetries = n
+
+		case "test.retry_backoff":
+			d, err := time.ParseDuration(trimmed)
+			if err != nil {
+				return fmt.Errorf("invalid retry backoff duration: %w", err)
+			}
+			c.Test.RetryBackoffRaw = trimmed
+			c.Test.RetryBackoff = d
+
+		case "test.health_url":
+			newURL, err := updateURLPreservingCredentials(c.Test.HealthURL, trimmed)
+			if err != nil {
+				return err
+			}
+			c.Test.HealthURL = newURL
+
+		case "test.dial_timeout":
+			d, err := time.ParseDuration(trimmed)
+			if err != nil {
+				return fmt.Errorf("invalid dial timeout duration: %w", err)
+			}
+			c.Test.DialTimeoutRaw = trimmed
+			c.Test.DialTimeout = d
+
+		case "test.max_inconclusive_cycles":
+			n, err := strconv.Atoi(trimmed)
+			if err != nil {
+				return fmt.Errorf("max inconclusive cycles must be an integer: %w", err)
+			}
+			if n <= 0 {
+				return fmt.Errorf("max inconclusive cycles must be positive")
+			}
+			c.Test.MaxInconclusiveCycles = n
+
+		case "test.rate_limit_rps":
+			n, err := strconv.Atoi(trimmed)
+			if err != nil {
+				return fmt.Errorf("rate limit RPS must be an integer: %w", err)
+			}
+			if n < 0 {
+				return fmt.Errorf("rate limit RPS must not be negative")
+			}
+			c.Test.RateLimitRPS = n
+
+		case "test.gemini.url":
+			newURL, err := updateURLPreservingCredentials(c.Test.Gemini.URL, trimmed)
+			if err != nil {
+				return err
+			}
+			c.Test.Gemini.URL = newURL
+			c.Test.TargetURL = newURL
+
+		case "test.gemini.block_phrases":
+			rawParts := strings.Split(trimmed, ",")
+			var phrases []string
+			for _, p := range rawParts {
+				clean := strings.TrimSpace(p)
+				if clean != "" {
+					phrases = append(phrases, clean)
+				}
+			}
+			c.Test.Gemini.BlockPhrases = phrases
+			c.Test.BlockPhrases = phrases
+
+		case "fetch_interval":
+			d, err := time.ParseDuration(trimmed)
+			if err != nil {
+				return fmt.Errorf("invalid fetch interval duration: %w", err)
+			}
+			c.FetchIntervalRaw = trimmed
+			c.FetchInterval = d
+
+		case "probe_limit":
+			n, err := strconv.Atoi(trimmed)
+			if err != nil {
+				return fmt.Errorf("probe limit must be an integer: %w", err)
+			}
+			if n < 0 {
+				return fmt.Errorf("probe limit must not be negative")
+			}
+			c.ProbeLimit = n
+
+		default:
+			return fmt.Errorf("unknown configuration setting: %q", key)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("%s", publisher.SanitizeMessage(err.Error()))
+	}
+	atomic.StoreInt32(&a.dirty, 1)
+	return nil
 }
 
 // ToggleSource flips the enabled state of the specified source via SourceService.

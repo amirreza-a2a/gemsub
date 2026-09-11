@@ -2944,3 +2944,930 @@ func TestAdapter_SourceItemViewModel_TelemetrySemantics(t *testing.T) {
 		t.Errorf("expected StatusMsg=\"\" when unmeasured, got %q", s.StatusMsg)
 	}
 }
+
+func TestAdapter_UpdateSetting_AllCategoriesAndValidation(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	bus := events.New()
+	defer bus.Close()
+
+	initialCfg := config.Config{
+		FetchIntervalRaw: "10m",
+		Sources: []config.SourceItem{
+			{ID: "src-1", URL: "https://example.com/feed1", Name: "Source 1", Enabled: true},
+		},
+		Test: config.TestConfig{
+			TimeoutRaw:            "10s",
+			Concurrency:           5,
+			MaxRetriesRaw:         new(int),
+			RetryBackoffRaw:       "1s",
+			HealthURL:             "https://www.gstatic.com/generate_204",
+			DialTimeoutRaw:        "4s",
+			MaxInconclusiveCycles: 2,
+			RateLimitRPS:          0,
+			Gemini: config.GeminiConfig{
+				URL:          "https://gemini.google.com/",
+				BlockPhrases: []string{"blocked"},
+			},
+		},
+		Serve: config.ServeConfig{
+			Listen: "127.0.0.1:8765",
+			Path:   "/sub",
+			Format: "base64",
+		},
+		Publishing: config.PublishingConfig{
+			Enabled:    true,
+			Repository: "./test-repo",
+			Branch:     "main",
+			RemoteURL:  "https://github.com/org/repo.git",
+		},
+		StateFile:  "./gemsub_state.json",
+		Headless:   false,
+		ProbeLimit: 0,
+		FlagMode:   "auto",
+	}
+	*initialCfg.Test.MaxRetriesRaw = 2
+
+	cfgSvc, err := config.NewService(cfgPath, &initialCfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+	srcSvc := source.NewService(cfgSvc)
+	pubSvc := publisher.NewService(cfgSvc, nil, bus)
+
+	ad, _, _, _ := setupTestAdapter(t)
+	ad.SetServices(cfgSvc, srcSvc, pubSvc, nil)
+
+	// 1. General Category
+	t.Run("General_Settings", func(t *testing.T) {
+		// Valid serve.listen
+		if err := ad.UpdateSetting("serve.listen", "127.0.0.1:9090"); err != nil {
+			t.Fatalf("UpdateSetting(serve.listen): %v", err)
+		}
+		if cfgSvc.Get().Serve.Listen != "127.0.0.1:9090" {
+			t.Errorf("expected 127.0.0.1:9090, got %s", cfgSvc.Get().Serve.Listen)
+		}
+		// Invalid serve.listen (empty)
+		if err := ad.UpdateSetting("serve.listen", "   "); err == nil {
+			t.Errorf("expected error on empty serve.listen, got nil")
+		}
+
+		// Valid serve.path
+		if err := ad.UpdateSetting("serve.path", "/custom_feed"); err != nil {
+			t.Fatalf("UpdateSetting(serve.path): %v", err)
+		}
+		if cfgSvc.Get().Serve.Path != "/custom_feed" {
+			t.Errorf("expected /custom_feed, got %s", cfgSvc.Get().Serve.Path)
+		}
+		// Invalid serve.path (must start with /)
+		if err := ad.UpdateSetting("serve.path", "no_slash"); err == nil {
+			t.Errorf("expected error on serve.path without leading slash, got nil")
+		}
+
+		// Valid serve.format (enum)
+		if err := ad.UpdateSetting("serve.format", "raw"); err != nil {
+			t.Fatalf("UpdateSetting(serve.format): %v", err)
+		}
+		if cfgSvc.Get().Serve.Format != "raw" {
+			t.Errorf("expected raw, got %s", cfgSvc.Get().Serve.Format)
+		}
+		// Invalid serve.format
+		if err := ad.UpdateSetting("serve.format", "xml"); err == nil {
+			t.Errorf("expected error on invalid serve.format, got nil")
+		}
+
+		// Valid flag_mode (enum)
+		if err := ad.UpdateSetting("flag_mode", "unicode"); err != nil {
+			t.Fatalf("UpdateSetting(flag_mode): %v", err)
+		}
+		if cfgSvc.Get().FlagMode != "unicode" {
+			t.Errorf("expected unicode, got %s", cfgSvc.Get().FlagMode)
+		}
+		// Invalid flag_mode
+		if err := ad.UpdateSetting("flag_mode", "invalid_mode"); err == nil {
+			t.Errorf("expected error on invalid flag_mode, got nil")
+		}
+
+		// Valid state_file
+		if err := ad.UpdateSetting("state_file", "./new_state.json"); err != nil {
+			t.Fatalf("UpdateSetting(state_file): %v", err)
+		}
+		if cfgSvc.Get().StateFile != "./new_state.json" {
+			t.Errorf("expected ./new_state.json, got %s", cfgSvc.Get().StateFile)
+		}
+		// Invalid state_file (empty)
+		if err := ad.UpdateSetting("state_file", ""); err == nil {
+			t.Errorf("expected error on empty state_file, got nil")
+		}
+
+		// Valid headless (bool toggle)
+		if err := ad.UpdateSetting("headless", "true"); err != nil {
+			t.Fatalf("UpdateSetting(headless): %v", err)
+		}
+		if cfgSvc.Get().Headless != true {
+			t.Errorf("expected headless=true, got false")
+		}
+		// Invalid headless
+		if err := ad.UpdateSetting("headless", "notabool"); err == nil {
+			t.Errorf("expected error on invalid bool, got nil")
+		}
+	})
+
+	// 2. Testing Category
+	t.Run("Testing_Settings", func(t *testing.T) {
+		// Valid timeout
+		if err := ad.UpdateSetting("test.timeout", "20s"); err != nil {
+			t.Fatalf("UpdateSetting(test.timeout): %v", err)
+		}
+		if cfgSvc.Get().Test.TimeoutRaw != "20s" || cfgSvc.Get().Test.Timeout != 20*time.Second {
+			t.Errorf("unexpected timeout: %v", cfgSvc.Get().Test.TimeoutRaw)
+		}
+		// Invalid timeout
+		if err := ad.UpdateSetting("test.timeout", "notaduration"); err == nil {
+			t.Errorf("expected error on invalid duration, got nil")
+		}
+		if err := ad.UpdateSetting("test.timeout", "-5s"); err == nil {
+			t.Errorf("expected error on negative duration, got nil")
+		}
+
+		// Valid concurrency
+		if err := ad.UpdateSetting("test.concurrency", "35"); err != nil {
+			t.Fatalf("UpdateSetting(test.concurrency): %v", err)
+		}
+		if cfgSvc.Get().Test.Concurrency != 35 {
+			t.Errorf("expected 35, got %d", cfgSvc.Get().Test.Concurrency)
+		}
+		// Invalid concurrency
+		if err := ad.UpdateSetting("test.concurrency", "0"); err == nil {
+			t.Errorf("expected error on concurrency 0, got nil")
+		}
+		if err := ad.UpdateSetting("test.concurrency", "-5"); err == nil {
+			t.Errorf("expected error on concurrency -5, got nil")
+		}
+
+		// Valid max_retries
+		if err := ad.UpdateSetting("test.max_retries", "0"); err != nil {
+			t.Fatalf("UpdateSetting(test.max_retries): %v", err)
+		}
+		if cfgSvc.Get().Test.MaxRetries != 0 {
+			t.Errorf("expected 0, got %d", cfgSvc.Get().Test.MaxRetries)
+		}
+		// Invalid max_retries
+		if err := ad.UpdateSetting("test.max_retries", "-1"); err == nil {
+			t.Errorf("expected error on negative max_retries, got nil")
+		}
+
+		// Valid retry_backoff
+		if err := ad.UpdateSetting("test.retry_backoff", "2500ms"); err != nil {
+			t.Fatalf("UpdateSetting(test.retry_backoff): %v", err)
+		}
+		if cfgSvc.Get().Test.RetryBackoff != 2500*time.Millisecond {
+			t.Errorf("unexpected retry backoff: %v", cfgSvc.Get().Test.RetryBackoff)
+		}
+		// Invalid retry_backoff
+		if err := ad.UpdateSetting("test.retry_backoff", "0s"); err == nil {
+			t.Errorf("expected error on 0s retry_backoff, got nil")
+		}
+
+		// Valid health_url
+		if err := ad.UpdateSetting("test.health_url", "https://custom.health.check/204"); err != nil {
+			t.Fatalf("UpdateSetting(test.health_url): %v", err)
+		}
+		if cfgSvc.Get().Test.HealthURL != "https://custom.health.check/204" {
+			t.Errorf("unexpected health URL: %s", cfgSvc.Get().Test.HealthURL)
+		}
+		// Invalid health_url
+		if err := ad.UpdateSetting("test.health_url", "ftp://unsupported.com"); err == nil {
+			t.Errorf("expected error on unsupported scheme, got nil")
+		}
+
+		// Valid dial_timeout
+		if err := ad.UpdateSetting("test.dial_timeout", "5s"); err != nil {
+			t.Fatalf("UpdateSetting(test.dial_timeout): %v", err)
+		}
+		if cfgSvc.Get().Test.DialTimeout != 5*time.Second {
+			t.Errorf("unexpected dial timeout: %v", cfgSvc.Get().Test.DialTimeout)
+		}
+
+		// Valid max_inconclusive_cycles
+		if err := ad.UpdateSetting("test.max_inconclusive_cycles", "4"); err != nil {
+			t.Fatalf("UpdateSetting(test.max_inconclusive_cycles): %v", err)
+		}
+		if cfgSvc.Get().Test.MaxInconclusiveCycles != 4 {
+			t.Errorf("expected 4, got %d", cfgSvc.Get().Test.MaxInconclusiveCycles)
+		}
+		// Invalid max_inconclusive_cycles
+		if err := ad.UpdateSetting("test.max_inconclusive_cycles", "0"); err == nil {
+			t.Errorf("expected error on 0 inconclusive cycles, got nil")
+		}
+
+		// Valid rate_limit_rps
+		if err := ad.UpdateSetting("test.rate_limit_rps", "25"); err != nil {
+			t.Fatalf("UpdateSetting(test.rate_limit_rps): %v", err)
+		}
+		if cfgSvc.Get().Test.RateLimitRPS != 25 {
+			t.Errorf("expected 25, got %d", cfgSvc.Get().Test.RateLimitRPS)
+		}
+		// Invalid rate_limit_rps
+		if err := ad.UpdateSetting("test.rate_limit_rps", "-2"); err == nil {
+			t.Errorf("expected error on negative rate limit, got nil")
+		}
+	})
+
+	// 3. Gemini Category
+	t.Run("Gemini_Settings", func(t *testing.T) {
+		// Valid Gemini URL
+		if err := ad.UpdateSetting("test.gemini.url", "https://gemini.custom.dev/"); err != nil {
+			t.Fatalf("UpdateSetting(test.gemini.url): %v", err)
+		}
+		if cfgSvc.Get().Test.Gemini.URL != "https://gemini.custom.dev/" {
+			t.Errorf("unexpected gemini url: %s", cfgSvc.Get().Test.Gemini.URL)
+		}
+		// Invalid Gemini URL
+		if err := ad.UpdateSetting("test.gemini.url", ""); err == nil {
+			t.Errorf("expected error on empty gemini url, got nil")
+		}
+
+		// Valid Block Phrases
+		if err := ad.UpdateSetting("test.gemini.block_phrases", "denied, access blocked, forbidden"); err != nil {
+			t.Fatalf("UpdateSetting(test.gemini.block_phrases): %v", err)
+		}
+		phrases := cfgSvc.Get().Test.Gemini.BlockPhrases
+		if len(phrases) != 3 || phrases[0] != "denied" || phrases[1] != "access blocked" || phrases[2] != "forbidden" {
+			t.Errorf("unexpected block phrases: %+v", phrases)
+		}
+		// Invalid Block Phrases (empty)
+		if err := ad.UpdateSetting("test.gemini.block_phrases", "  ,  ,  "); err == nil {
+			t.Errorf("expected error on empty block phrases, got nil")
+		}
+	})
+
+	// 4. Scheduler Category
+	t.Run("Scheduler_Settings", func(t *testing.T) {
+		// Valid fetch_interval
+		if err := ad.UpdateSetting("fetch_interval", "30m"); err != nil {
+			t.Fatalf("UpdateSetting(fetch_interval): %v", err)
+		}
+		if cfgSvc.Get().FetchIntervalRaw != "30m" || cfgSvc.Get().FetchInterval != 30*time.Minute {
+			t.Errorf("unexpected fetch interval: %v", cfgSvc.Get().FetchIntervalRaw)
+		}
+		// Invalid fetch_interval (< 1m)
+		if err := ad.UpdateSetting("fetch_interval", "45s"); err == nil {
+			t.Errorf("expected error on fetch interval < 1m, got nil")
+		}
+
+		// Valid probe_limit
+		if err := ad.UpdateSetting("probe_limit", "50"); err != nil {
+			t.Fatalf("UpdateSetting(probe_limit): %v", err)
+		}
+		if cfgSvc.Get().ProbeLimit != 50 {
+			t.Errorf("expected 50, got %d", cfgSvc.Get().ProbeLimit)
+		}
+		// Invalid probe_limit
+		if err := ad.UpdateSetting("probe_limit", "-5"); err == nil {
+			t.Errorf("expected error on negative probe limit, got nil")
+		}
+	})
+
+	// 5. Publishing Category
+	t.Run("Publishing_Settings", func(t *testing.T) {
+		// Valid publishing.branch
+		if err := ad.UpdateSetting("publishing.branch", "production"); err != nil {
+			t.Fatalf("UpdateSetting(publishing.branch): %v", err)
+		}
+		if cfgSvc.Get().Publishing.Branch != "production" {
+			t.Errorf("expected production, got %s", cfgSvc.Get().Publishing.Branch)
+		}
+
+		// Valid publishing.repository
+		if err := ad.UpdateSetting("publishing.repository", "./prod-repo"); err != nil {
+			t.Fatalf("UpdateSetting(publishing.repository): %v", err)
+		}
+		if cfgSvc.Get().Publishing.Repository != "./prod-repo" {
+			t.Errorf("expected ./prod-repo, got %s", cfgSvc.Get().Publishing.Repository)
+		}
+
+		// Valid publishing.remote_url
+		if err := ad.UpdateSetting("publishing.remote_url", "https://github.com/org/new-repo.git"); err != nil {
+			t.Fatalf("UpdateSetting(publishing.remote_url): %v", err)
+		}
+		if cfgSvc.Get().Publishing.RemoteURL != "https://github.com/org/new-repo.git" {
+			t.Errorf("unexpected remote url: %s", cfgSvc.Get().Publishing.RemoteURL)
+		}
+
+		// Valid publishing.enabled (toggle to false)
+		if err := ad.UpdateSetting("publishing.enabled", "false"); err != nil {
+			t.Fatalf("UpdateSetting(publishing.enabled): %v", err)
+		}
+		if cfgSvc.Get().Publishing.Enabled != false {
+			t.Errorf("expected enabled=false, got true")
+		}
+	})
+}
+
+func TestAdapter_UpdateSetting_SecretPreservation(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	bus := events.New()
+	defer bus.Close()
+
+	initialCfg := config.Config{
+		FetchIntervalRaw: "10m",
+		Sources: []config.SourceItem{
+			{ID: "src-1", URL: "https://user:pass123@example.com/feed1", Name: "Source 1", Enabled: true},
+		},
+		Test: config.TestConfig{
+			TimeoutRaw:  "10s",
+			Concurrency: 5,
+			Gemini: config.GeminiConfig{
+				URL:          "https://apikey:secretgemini@gemini.dev/v1",
+				BlockPhrases: []string{"blocked"},
+			},
+		},
+		Publishing: config.PublishingConfig{
+			Enabled:    true,
+			Repository: "./test-repo",
+			Branch:     "main",
+			RemoteURL:  "https://gituser:ghp_secrettoken999@github.com/org/repo.git",
+		},
+	}
+
+	cfgSvc, err := config.NewService(cfgPath, &initialCfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+	srcSvc := source.NewService(cfgSvc)
+	pubSvc := publisher.NewService(cfgSvc, nil, bus)
+
+	ad, _, _, _ := setupTestAdapter(t)
+	ad.SetServices(cfgSvc, srcSvc, pubSvc, nil)
+
+	// 1. Verify ConfigCenter ViewModel exposes ONLY sanitized URLs
+	vm := ad.ConfigCenter()
+	pubCat := vm.Categories[viewmodel.CategoryPublishing]
+	for _, item := range pubCat.Items {
+		if item.Key == "publishing.remote_url" {
+			if strings.Contains(item.Value, "ghp_secrettoken999") || strings.Contains(item.RawValue, "ghp_secrettoken999") {
+				t.Fatalf("credentials leaked in ConfigCenter RemoteURL item: %+v", item)
+			}
+			if !strings.Contains(item.Value, "***@") {
+				t.Errorf("expected sanitized URL with '***@', got %s", item.Value)
+			}
+		}
+	}
+
+	// 2. Editing unrelated setting (e.g. publishing.branch) preserves RemoteURL credentials
+	if err := ad.UpdateSetting("publishing.branch", "feature-x"); err != nil {
+		t.Fatalf("UpdateSetting(publishing.branch): %v", err)
+	}
+	currentPub := cfgSvc.Get().Publishing
+	if currentPub.RemoteURL != "https://gituser:ghp_secrettoken999@github.com/org/repo.git" {
+		t.Errorf("RemoteURL credentials lost on editing branch: %s", currentPub.RemoteURL)
+	}
+
+	// 3. Submitting sanitized URL back to publishing.remote_url preserves original credentials
+	sanitizedPubURL := publisher.SanitizeURL(currentPub.RemoteURL)
+	if err := ad.UpdateSetting("publishing.remote_url", sanitizedPubURL); err != nil {
+		t.Fatalf("UpdateSetting(publishing.remote_url with sanitized): %v", err)
+	}
+	if cfgSvc.Get().Publishing.RemoteURL != "https://gituser:ghp_secrettoken999@github.com/org/repo.git" {
+		t.Errorf("RemoteURL credentials erased when re-submitting sanitized URL: %s", cfgSvc.Get().Publishing.RemoteURL)
+	}
+
+	// 4. Gemini: editing block phrases preserves Gemini URL credentials
+	if err := ad.UpdateSetting("test.gemini.block_phrases", "blocked, unavailable"); err != nil {
+		t.Fatalf("UpdateSetting(block_phrases): %v", err)
+	}
+	currentGemini := cfgSvc.Get().Test.Gemini
+	if currentGemini.URL != "https://apikey:secretgemini@gemini.dev/v1" {
+		t.Errorf("Gemini URL credentials lost on editing block phrases: %s", currentGemini.URL)
+	}
+
+	// 5. Submitting sanitized URL to Gemini preserves credentials
+	sanitizedGeminiURL := publisher.SanitizeURL(currentGemini.URL)
+	if err := ad.UpdateSetting("test.gemini.url", sanitizedGeminiURL); err != nil {
+		t.Fatalf("UpdateSetting(test.gemini.url with sanitized): %v", err)
+	}
+	if cfgSvc.Get().Test.Gemini.URL != "https://apikey:secretgemini@gemini.dev/v1" {
+		t.Errorf("Gemini URL credentials erased when re-submitting sanitized URL: %s", cfgSvc.Get().Test.Gemini.URL)
+	}
+
+	// 6. Source items preserved completely
+	if len(cfgSvc.Get().Sources) != 1 || cfgSvc.Get().Sources[0].URL != "https://user:pass123@example.com/feed1" {
+		t.Errorf("Sources corrupted during settings edit: %+v", cfgSvc.Get().Sources)
+	}
+}
+
+func TestAdapter_ConfigCenter_RestartRequiredAndPendingFlags(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	bus := events.New()
+	defer bus.Close()
+
+	initialCfg := config.Config{
+		FetchIntervalRaw: "10m",
+		Sources: []config.SourceItem{
+			{ID: "src-1", URL: "https://example.com/feed1", Name: "Source 1", Enabled: true},
+		},
+		Serve: config.ServeConfig{
+			Listen: "127.0.0.1:8765",
+			Path:   "/sub",
+			Format: "base64",
+		},
+		StateFile: "./gemsub_state.json",
+		Headless:  false,
+		Test: config.TestConfig{
+			TimeoutRaw:  "10s",
+			Concurrency: 5,
+			Gemini: config.GeminiConfig{
+				BlockPhrases: []string{"blocked"},
+			},
+		},
+	}
+
+	cfgSvc, err := config.NewService(cfgPath, &initialCfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+
+	ad, _, _, _ := setupTestAdapter(t)
+	ad.SetServices(cfgSvc, nil, nil, nil)
+
+	// Check initial ConfigCenter: restart-required flags should be set, but pending should be false
+	vm := ad.ConfigCenter()
+	genCat := vm.Categories[viewmodel.CategoryGeneral]
+	for _, item := range genCat.Items {
+		switch item.Key {
+		case "serve.listen", "serve.path", "state_file", "headless":
+			if !item.RestartRequired {
+				t.Errorf("field %s expected RestartRequired=true, got false", item.Key)
+			}
+			if item.PendingRestart {
+				t.Errorf("field %s expected PendingRestart=false before edit, got true", item.Key)
+			}
+		case "serve.format", "flag_mode":
+			if item.RestartRequired {
+				t.Errorf("field %s expected RestartRequired=false, got true", item.Key)
+			}
+		}
+	}
+
+	// Mutate serve.listen
+	if err := ad.UpdateSetting("serve.listen", "127.0.0.1:9999"); err != nil {
+		t.Fatalf("UpdateSetting(serve.listen): %v", err)
+	}
+
+	// Now ConfigCenter should have PendingRestart=true on serve.listen
+	vm = ad.ConfigCenter()
+	genCat = vm.Categories[viewmodel.CategoryGeneral]
+	found := false
+	for _, item := range genCat.Items {
+		if item.Key == "serve.listen" {
+			found = true
+			if !item.PendingRestart {
+				t.Errorf("serve.listen expected PendingRestart=true after edit, got false")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("serve.listen not found in ConfigCenter")
+	}
+}
+
+func TestAdapter_UpdateSetting_RemoteURL_CredentialPolicy(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	bus := events.New()
+	defer bus.Close()
+
+	secretToken := "secret_ghp_token_xyz987"
+	originalURL := "https://gituser:" + secretToken + "@github.com/org/repo.git"
+
+	initialCfg := config.Config{
+		FetchIntervalRaw: "10m",
+		Sources: []config.SourceItem{
+			{ID: "src-1", URL: "https://example.com/feed1", Name: "Source 1", Enabled: true},
+		},
+		Test: config.TestConfig{
+			TimeoutRaw:  "10s",
+			Concurrency: 5,
+			HealthURL:   "https://healthuser:secretpass@health.example.com/check",
+			Gemini: config.GeminiConfig{
+				URL:          "https://geminiuser:secretgeminikey@gemini.dev/v1",
+				BlockPhrases: []string{"blocked"},
+			},
+		},
+		Publishing: config.PublishingConfig{
+			Enabled:    true,
+			Repository: "./test-repo",
+			Branch:     "main",
+			RemoteURL:  originalURL,
+		},
+	}
+
+	cfgSvc, err := config.NewService(cfgPath, &initialCfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+	pubSvc := publisher.NewService(cfgSvc, nil, bus)
+	ad, _, _, _ := setupTestAdapter(t)
+	ad.SetServices(cfgSvc, nil, pubSvc, nil)
+
+	// 1. Existing credential + unchanged masked URL -> credential preserved
+	maskedURL := publisher.SanitizeURL(originalURL) // "https://***@github.com/org/repo.git"
+	if err := ad.UpdateSetting("publishing.remote_url", maskedURL); err != nil {
+		t.Fatalf("UpdateSetting(publishing.remote_url, masked): %v", err)
+	}
+	if got := cfgSvc.Get().Publishing.RemoteURL; got != originalURL {
+		t.Errorf("expected unchanged masked URL to preserve credentials %q, got %q", originalURL, got)
+	}
+
+	// 2. Existing credential + changed path -> credential preserved
+	changedPathMasked := "https://***@github.com/org/another-repo.git"
+	if err := ad.UpdateSetting("publishing.remote_url", changedPathMasked); err != nil {
+		t.Fatalf("UpdateSetting(publishing.remote_url, changed path): %v", err)
+	}
+	expectedPathURL := "https://gituser:" + secretToken + "@github.com/org/another-repo.git"
+	if got := cfgSvc.Get().Publishing.RemoteURL; got != expectedPathURL {
+		t.Errorf("expected changed path to preserve credentials %q, got %q", expectedPathURL, got)
+	}
+
+	// Also test changed path with NO credentials provided in input:
+	changedPathNoUser := "https://github.com/org/third-repo.git"
+	if err := ad.UpdateSetting("publishing.remote_url", changedPathNoUser); err != nil {
+		t.Fatalf("UpdateSetting(publishing.remote_url, no user): %v", err)
+	}
+	expectedNoUserPreserved := "https://gituser:" + secretToken + "@github.com/org/third-repo.git"
+	if got := cfgSvc.Get().Publishing.RemoteURL; got != expectedNoUserPreserved {
+		t.Errorf("expected omission of credentials to preserve credentials %q, got %q", expectedNoUserPreserved, got)
+	}
+
+	// 3. Existing credential + changed host -> credential preserved
+	changedHostMasked := "https://***@gitlab.com/org/custom-repo.git"
+	if err := ad.UpdateSetting("publishing.remote_url", changedHostMasked); err != nil {
+		t.Fatalf("UpdateSetting(publishing.remote_url, changed host): %v", err)
+	}
+	expectedHostURL := "https://gituser:" + secretToken + "@gitlab.com/org/custom-repo.git"
+	if got := cfgSvc.Get().Publishing.RemoteURL; got != expectedHostURL {
+		t.Errorf("expected changed host to preserve credentials %q, got %q", expectedHostURL, got)
+	}
+
+	// 4. Submitting a URL with explicit userinfo is rejected per credential policy
+	newExplicitURL := "https://newuser:newtoken456@github.com/neworg/newrepo.git"
+	beforeExplicit := cfgSvc.Get().Publishing.RemoteURL
+	errExplicit := ad.UpdateSetting("publishing.remote_url", newExplicitURL)
+	if errExplicit == nil {
+		t.Fatalf("expected explicit userinfo to be rejected, got nil error")
+	}
+	if !strings.Contains(errExplicit.Error(), "credentials must be managed separately") {
+		t.Errorf("expected error 'credentials must be managed separately', got: %v", errExplicit)
+	}
+	// 5. Rejected credential input does not leak credential into error message or config
+	if strings.Contains(errExplicit.Error(), "newtoken456") || strings.Contains(errExplicit.Error(), "newuser") {
+		t.Fatalf("credential leaked in error message: %v", errExplicit)
+	}
+	if got := cfgSvc.Get().Publishing.RemoteURL; got != beforeExplicit {
+		t.Errorf("config corrupted after rejected credential input: expected %q, got %q", beforeExplicit, got)
+	}
+
+	// Also test explicit credentials on test.gemini.url and test.health_url are rejected without leakage
+	errGemini := ad.UpdateSetting("test.gemini.url", "https://explicituser:secretpass@gemini.dev/v1")
+	if errGemini == nil || !strings.Contains(errGemini.Error(), "credentials must be managed separately") {
+		t.Errorf("expected test.gemini.url explicit userinfo to be rejected, got: %v", errGemini)
+	}
+	if strings.Contains(fmt.Sprint(errGemini), "secretpass") {
+		t.Fatalf("secret leaked in Gemini error message: %v", errGemini)
+	}
+
+	errHealth := ad.UpdateSetting("test.health_url", "https://healthuser:secretpass@health.example.com/v1")
+	if errHealth == nil || !strings.Contains(errHealth.Error(), "credentials must be managed separately") {
+		t.Errorf("expected test.health_url explicit userinfo to be rejected, got: %v", errHealth)
+	}
+	if strings.Contains(fmt.Sprint(errHealth), "secretpass") {
+		t.Fatalf("secret leaked in Health URL error message: %v", errHealth)
+	}
+
+	// 6. No credentials starting point + changed URL -> new URL saved (non-secret URLs remain normally editable)
+	// First change to a URL with no credentials directly via config service
+	noCredsURL := "https://github.com/public/repo.git"
+	_ = cfgSvc.Update(func(c *config.Config) error {
+		c.Publishing.RemoteURL = noCredsURL
+		return nil
+	})
+	changedNoCredsURL := "https://github.com/public/another-repo.git"
+	if err := ad.UpdateSetting("publishing.remote_url", changedNoCredsURL); err != nil {
+		t.Fatalf("UpdateSetting(publishing.remote_url, from no creds): %v", err)
+	}
+	if got := cfgSvc.Get().Publishing.RemoteURL; got != changedNoCredsURL {
+		t.Errorf("expected %q, got %q", changedNoCredsURL, got)
+	}
+
+	// 6. Invalid URL -> rejected, config untouched
+	beforeInvalid := cfgSvc.Get().Publishing.RemoteURL
+	if err := ad.UpdateSetting("publishing.remote_url", "http://[invalid:host:port"); err == nil {
+		t.Errorf("expected invalid URL to be rejected, got nil error")
+	}
+	if got := cfgSvc.Get().Publishing.RemoteURL; got != beforeInvalid {
+		t.Errorf("config corrupted after invalid URL: expected %q, got %q", beforeInvalid, got)
+	}
+
+	// 7. Empty URL -> rejected, config untouched
+	if err := ad.UpdateSetting("publishing.remote_url", ""); err == nil {
+		t.Errorf("expected empty URL to be rejected, got nil error")
+	}
+	if err := ad.UpdateSetting("publishing.remote_url", "   \t\n  "); err == nil {
+		t.Errorf("expected whitespace URL to be rejected, got nil error")
+	}
+	if got := cfgSvc.Get().Publishing.RemoteURL; got != beforeInvalid {
+		t.Errorf("config corrupted after empty URL: expected %q, got %q", beforeInvalid, got)
+	}
+
+	// 8. Credential-preserving semantics consistency across test.gemini.url and test.health_url
+	// Gemini:
+	if err := ad.UpdateSetting("test.gemini.url", "https://***@gemini.dev/v2"); err != nil {
+		t.Fatalf("UpdateSetting(test.gemini.url): %v", err)
+	}
+	expectedGemini := "https://geminiuser:secretgeminikey@gemini.dev/v2"
+	if got := cfgSvc.Get().Test.Gemini.URL; got != expectedGemini {
+		t.Errorf("expected Gemini credentials preserved %q, got %q", expectedGemini, got)
+	}
+	// Health URL:
+	if err := ad.UpdateSetting("test.health_url", "https://***@health.example.com/v2"); err != nil {
+		t.Fatalf("UpdateSetting(test.health_url): %v", err)
+	}
+	expectedHealth := "https://healthuser:secretpass@health.example.com/v2"
+	if got := cfgSvc.Get().Test.HealthURL; got != expectedHealth {
+		t.Errorf("expected Health URL credentials preserved %q, got %q", expectedHealth, got)
+	}
+
+	// 9. No credential leakage in ViewModel / render / error / status
+	vm := ad.ConfigCenter()
+	for catIdx, cat := range vm.Categories {
+		for _, item := range cat.Items {
+			for _, secret := range []string{secretToken, "newtoken456", "secretpass", "secretgeminikey"} {
+				if strings.Contains(item.Value, secret) {
+					t.Errorf("secret %q leaked in Category %d item.Value (key=%s): %s", secret, catIdx, item.Key, item.Value)
+				}
+				if strings.Contains(item.EditorValue, secret) {
+					t.Errorf("secret %q leaked in Category %d item.EditorValue (key=%s): %s", secret, catIdx, item.Key, item.EditorValue)
+				}
+				if strings.Contains(item.RawValue, secret) {
+					t.Errorf("secret %q leaked in Category %d item.RawValue (key=%s): %s", secret, catIdx, item.Key, item.RawValue)
+				}
+			}
+			if item.HasSecret && item.RawValue != "" {
+				t.Errorf("secret-bearing item %s must have empty RawValue, got %q", item.Key, item.RawValue)
+			}
+		}
+	}
+}
+
+func TestAdapter_UpdateSetting_CrossFieldPreservation(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	bus := events.New()
+	defer bus.Close()
+
+	initialCfg := config.Config{
+		FetchIntervalRaw: "15m",
+		ProbeLimit:       42,
+		StateFile:        "./state_custom.json",
+		Headless:         false,
+		FlagMode:         "unicode",
+		Sources: []config.SourceItem{
+			{ID: "src-1", URL: "https://example.com/feed1", Name: "Source 1", Enabled: true},
+		},
+		Serve: config.ServeConfig{
+			Listen: "127.0.0.1:9090",
+			Path:   "/custom-sub",
+			Format: "raw",
+		},
+		Test: config.TestConfig{
+			TimeoutRaw:            "15s",
+			Concurrency:           8,
+			RetryBackoffRaw:       "2s",
+			HealthURL:             "https://health.example.com/check",
+			DialTimeoutRaw:        "3s",
+			MaxInconclusiveCycles: 4,
+			RateLimitRPS:          20,
+			Gemini: config.GeminiConfig{
+				URL:          "https://gemini.example.com/v1",
+				BlockPhrases: []string{"phrase1", "phrase2"},
+			},
+		},
+		Publishing: config.PublishingConfig{
+			Enabled:    true,
+			Repository: "./my-repo",
+			Branch:     "dev",
+			RemoteURL:  "https://github.com/my/repo.git",
+		},
+	}
+
+	cfgSvc, err := config.NewService(cfgPath, &initialCfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+	pubSvc := publisher.NewService(cfgSvc, nil, bus)
+	srcSvc := source.NewService(cfgSvc)
+
+	ad, _, _, _ := setupTestAdapter(t)
+	ad.SetServices(cfgSvc, srcSvc, pubSvc, nil)
+
+	// Step 1: Mutate Serve setting (serve.listen)
+	if err := ad.UpdateSetting("serve.listen", "127.0.0.1:8080"); err != nil {
+		t.Fatalf("UpdateSetting(serve.listen): %v", err)
+	}
+	cfg1 := cfgSvc.Get()
+	if cfg1.Serve.Listen != "127.0.0.1:8080" {
+		t.Errorf("serve.listen not updated: got %s", cfg1.Serve.Listen)
+	}
+	// Verify siblings
+	if cfg1.Serve.Path != "/custom-sub" || cfg1.Serve.Format != "raw" {
+		t.Errorf("serve siblings modified: Path=%s Format=%s", cfg1.Serve.Path, cfg1.Serve.Format)
+	}
+	// Verify other categories preserved
+	if cfg1.Test.Concurrency != 8 || cfg1.Test.TimeoutRaw != "15s" || cfg1.Test.HealthURL != "https://health.example.com/check" {
+		t.Errorf("test category modified: %+v", cfg1.Test)
+	}
+	if cfg1.Test.Gemini.URL != "https://gemini.example.com/v1" || len(cfg1.Test.Gemini.BlockPhrases) != 2 {
+		t.Errorf("gemini category modified: %+v", cfg1.Test.Gemini)
+	}
+	if cfg1.FetchIntervalRaw != "15m" || cfg1.ProbeLimit != 42 {
+		t.Errorf("scheduler category modified: FetchInterval=%s ProbeLimit=%d", cfg1.FetchIntervalRaw, cfg1.ProbeLimit)
+	}
+	if cfg1.Publishing.Repository != "./my-repo" || cfg1.Publishing.Branch != "dev" || cfg1.Publishing.RemoteURL != "https://github.com/my/repo.git" || !cfg1.Publishing.Enabled {
+		t.Errorf("publishing category modified: %+v", cfg1.Publishing)
+	}
+	if cfg1.StateFile != "./state_custom.json" || cfg1.Headless != false || cfg1.FlagMode != "unicode" {
+		t.Errorf("general category modified: StateFile=%s Headless=%v FlagMode=%s", cfg1.StateFile, cfg1.Headless, cfg1.FlagMode)
+	}
+
+	// Step 2: Mutate Testing setting (test.concurrency)
+	if err := ad.UpdateSetting("test.concurrency", "16"); err != nil {
+		t.Fatalf("UpdateSetting(test.concurrency): %v", err)
+	}
+	cfg2 := cfgSvc.Get()
+	if cfg2.Test.Concurrency != 16 {
+		t.Errorf("test.concurrency not updated: got %d", cfg2.Test.Concurrency)
+	}
+	// Verify testing siblings
+	if cfg2.Test.TimeoutRaw != "15s" || cfg2.Test.RetryBackoffRaw != "2s" || cfg2.Test.HealthURL != "https://health.example.com/check" ||
+		cfg2.Test.DialTimeoutRaw != "3s" || cfg2.Test.MaxInconclusiveCycles != 4 || cfg2.Test.RateLimitRPS != 20 {
+		t.Errorf("testing siblings modified: %+v", cfg2.Test)
+	}
+	// Verify other categories preserved
+	if cfg2.Serve.Listen != "127.0.0.1:8080" || cfg2.Serve.Path != "/custom-sub" || cfg2.Serve.Format != "raw" {
+		t.Errorf("serve category modified during test edit: %+v", cfg2.Serve)
+	}
+	if cfg2.Publishing.Branch != "dev" || cfg2.Publishing.Repository != "./my-repo" {
+		t.Errorf("publishing modified during test edit: %+v", cfg2.Publishing)
+	}
+	if cfg2.FetchIntervalRaw != "15m" || cfg2.ProbeLimit != 42 {
+		t.Errorf("scheduler modified during test edit: %+v", cfg2)
+	}
+
+	// Step 3: Mutate Gemini setting (test.gemini.block_phrases)
+	if err := ad.UpdateSetting("test.gemini.block_phrases", "alpha, beta, gamma"); err != nil {
+		t.Fatalf("UpdateSetting(test.gemini.block_phrases): %v", err)
+	}
+	cfg3 := cfgSvc.Get()
+	if len(cfg3.Test.Gemini.BlockPhrases) != 3 || cfg3.Test.Gemini.BlockPhrases[0] != "alpha" {
+		t.Errorf("gemini block phrases not updated: %+v", cfg3.Test.Gemini.BlockPhrases)
+	}
+	if cfg3.Test.Gemini.URL != "https://gemini.example.com/v1" {
+		t.Errorf("gemini.url changed: %s", cfg3.Test.Gemini.URL)
+	}
+	if cfg3.Test.Concurrency != 16 || cfg3.Serve.Listen != "127.0.0.1:8080" || cfg3.Publishing.Branch != "dev" {
+		t.Errorf("other categories modified during gemini edit")
+	}
+
+	// Step 4: Mutate Scheduler setting (fetch_interval)
+	if err := ad.UpdateSetting("fetch_interval", "30m"); err != nil {
+		t.Fatalf("UpdateSetting(fetch_interval): %v", err)
+	}
+	cfg4 := cfgSvc.Get()
+	if cfg4.FetchIntervalRaw != "30m" {
+		t.Errorf("fetch_interval not updated: got %s", cfg4.FetchIntervalRaw)
+	}
+	if cfg4.ProbeLimit != 42 {
+		t.Errorf("probe_limit modified during fetch_interval edit: got %d", cfg4.ProbeLimit)
+	}
+	if cfg4.Test.Concurrency != 16 || cfg4.Serve.Listen != "127.0.0.1:8080" || cfg4.Publishing.Branch != "dev" {
+		t.Errorf("other categories modified during scheduler edit")
+	}
+
+	// Step 5: Mutate Publishing setting (publishing.branch)
+	if err := ad.UpdateSetting("publishing.branch", "release-v2"); err != nil {
+		t.Fatalf("UpdateSetting(publishing.branch): %v", err)
+	}
+	cfg5 := cfgSvc.Get()
+	if cfg5.Publishing.Branch != "release-v2" {
+		t.Errorf("publishing.branch not updated: got %s", cfg5.Publishing.Branch)
+	}
+	if cfg5.Publishing.Repository != "./my-repo" || cfg5.Publishing.RemoteURL != "https://github.com/my/repo.git" || !cfg5.Publishing.Enabled {
+		t.Errorf("publishing siblings modified: %+v", cfg5.Publishing)
+	}
+	if cfg5.Serve.Listen != "127.0.0.1:8080" || cfg5.Test.Concurrency != 16 || cfg5.FetchIntervalRaw != "30m" {
+		t.Errorf("other categories modified during publishing edit")
+	}
+}
+
+func TestAdapter_UpdateSetting_LegacyGeminiSynchronization(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	bus := events.New()
+	defer bus.Close()
+
+	initialCfg := config.Config{
+		FetchIntervalRaw: "10m",
+		Sources: []config.SourceItem{
+			{ID: "src-1", URL: "https://example.com/feed1", Name: "Source 1", Enabled: true},
+		},
+		Test: config.TestConfig{
+			TimeoutRaw:  "10s",
+			Concurrency: 5,
+			Gemini: config.GeminiConfig{
+				URL:          "https://initial-gemini.com/v1",
+				BlockPhrases: []string{"initial-phrase"},
+			},
+		},
+	}
+
+	cfgSvc, err := config.NewService(cfgPath, &initialCfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+	ad, _, _, _ := setupTestAdapter(t)
+	ad.SetServices(cfgSvc, nil, nil, nil)
+
+	// Verify initial synchronization
+	if cfgSvc.Get().Test.Gemini.URL != "https://initial-gemini.com/v1" || cfgSvc.Get().Test.TargetURL != "https://initial-gemini.com/v1" {
+		t.Fatalf("initial URL sync failed: Gemini=%q TargetURL=%q", cfgSvc.Get().Test.Gemini.URL, cfgSvc.Get().Test.TargetURL)
+	}
+
+	// 1. Update test.gemini.url
+	newGeminiURL := "https://updated-gemini.dev/v2"
+	if err := ad.UpdateSetting("test.gemini.url", newGeminiURL); err != nil {
+		t.Fatalf("UpdateSetting(test.gemini.url): %v", err)
+	}
+
+	// Verify in-memory synchronization
+	inMem := cfgSvc.Get()
+	if inMem.Test.Gemini.URL != newGeminiURL {
+		t.Errorf("in-memory Test.Gemini.URL = %q, want %q", inMem.Test.Gemini.URL, newGeminiURL)
+	}
+	if inMem.Test.TargetURL != newGeminiURL {
+		t.Errorf("in-memory Test.TargetURL = %q, want %q", inMem.Test.TargetURL, newGeminiURL)
+	}
+
+	// Verify real on-disk persistence and re-loading
+	reloaded, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load(%s): %v", cfgPath, err)
+	}
+	if reloaded.Test.Gemini.URL != newGeminiURL {
+		t.Errorf("reloaded Test.Gemini.URL = %q, want %q", reloaded.Test.Gemini.URL, newGeminiURL)
+	}
+	if reloaded.Test.TargetURL != newGeminiURL {
+		t.Errorf("reloaded Test.TargetURL = %q, want %q", reloaded.Test.TargetURL, newGeminiURL)
+	}
+
+	// 2. Update test.gemini.block_phrases
+	newPhrasesInput := "blocked_phrase_1, blocked_phrase_2, blocked_phrase_3"
+	if err := ad.UpdateSetting("test.gemini.block_phrases", newPhrasesInput); err != nil {
+		t.Fatalf("UpdateSetting(test.gemini.block_phrases): %v", err)
+	}
+
+	expectedPhrases := []string{"blocked_phrase_1", "blocked_phrase_2", "blocked_phrase_3"}
+
+	// Verify in-memory synchronization
+	inMem2 := cfgSvc.Get()
+	if len(inMem2.Test.Gemini.BlockPhrases) != len(expectedPhrases) {
+		t.Fatalf("in-memory Gemini.BlockPhrases len = %d, want %d", len(inMem2.Test.Gemini.BlockPhrases), len(expectedPhrases))
+	}
+	for i, phrase := range expectedPhrases {
+		if inMem2.Test.Gemini.BlockPhrases[i] != phrase {
+			t.Errorf("in-memory Gemini.BlockPhrases[%d] = %q, want %q", i, inMem2.Test.Gemini.BlockPhrases[i], phrase)
+		}
+		if inMem2.Test.BlockPhrases[i] != phrase {
+			t.Errorf("in-memory Test.BlockPhrases[%d] = %q, want %q", i, inMem2.Test.BlockPhrases[i], phrase)
+		}
+	}
+
+	// Verify real on-disk persistence and re-loading
+	reloaded2, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load(%s) second reload: %v", cfgPath, err)
+	}
+	if len(reloaded2.Test.Gemini.BlockPhrases) != len(expectedPhrases) {
+		t.Fatalf("reloaded Gemini.BlockPhrases len = %d, want %d", len(reloaded2.Test.Gemini.BlockPhrases), len(expectedPhrases))
+	}
+	for i, phrase := range expectedPhrases {
+		if reloaded2.Test.Gemini.BlockPhrases[i] != phrase {
+			t.Errorf("reloaded Gemini.BlockPhrases[%d] = %q, want %q", i, reloaded2.Test.Gemini.BlockPhrases[i], phrase)
+		}
+		if reloaded2.Test.BlockPhrases[i] != phrase {
+			t.Errorf("reloaded Test.BlockPhrases[%d] = %q, want %q", i, reloaded2.Test.BlockPhrases[i], phrase)
+		}
+	}
+}

@@ -35,11 +35,34 @@ func (c ConfigCategory) Name() string {
 	}
 }
 
-// ConfigItemViewModel represents a single read-only key/value setting row
+// SettingType defines the value type and editing behavior for a configuration item.
+type SettingType int
+
+const (
+	SettingTypeReadOnly SettingType = iota
+	SettingTypeString
+	SettingTypeBool
+	SettingTypeInt
+	SettingTypeDuration
+	SettingTypeEnum
+	SettingTypeURL
+)
+
+// ConfigItemViewModel represents a single key/value setting row
 // within a category in the Config Center.
 type ConfigItemViewModel struct {
-	Label string // Display label, e.g. "Listen Address"
-	Value string // Formatted display value, e.g. ":8080"
+	Key             string      // Canonical setting key (e.g. "serve.listen", "test.concurrency")
+	Label           string      // Display label, e.g. "Listen Address"
+	Value           string      // Formatted display value, e.g. ":8080"
+	EditorValue     string      // Safe initial value for editor modal (credentials masked or omitted)
+	RawValue        string      // Exact unformatted value for non-secret fields (empty for secret-bearing)
+	HasSecret       bool        // True if setting contains sensitive credentials masked from presentation
+	Type            SettingType // Value type for editing behavior
+	Editable        bool        // True if setting is user-editable
+	RestartRequired bool        // True if changing this setting requires application restart
+	PendingRestart  bool        // True if setting changed since startup and requires restart
+	EnumOptions     []string    // Allowed values if Type is SettingTypeEnum
+	Description     string      // Optional constraint or description hint
 }
 
 // SourceItemViewModel represents a single subscription source item in the Config Center.
