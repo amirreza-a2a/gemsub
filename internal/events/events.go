@@ -3,9 +3,13 @@ package events
 import (
 	"time"
 
+	"gemsub/internal/config"
 	"gemsub/internal/parser"
 	"gemsub/internal/store"
 )
+
+// ConfigUpdated is emitted when configuration has been successfully updated and persisted.
+type ConfigUpdated = config.ConfigUpdated
 
 // ProgressMetrics contains real-time counts during probe execution and cycle lifecycle.
 type ProgressMetrics struct {
