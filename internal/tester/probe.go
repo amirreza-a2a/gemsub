@@ -237,9 +237,8 @@ func executeAttempt(ctx context.Context, cand parser.Candidate, cfg *config.Test
 }
 
 // buildDialer spins up a minimal Box containing just this one
-// outbound (plus a direct outbound for anything the protocol itself
-// needs internally, e.g. DNS) and returns a DialContext-shaped func
-// bound to it, plus a cleanup func that tears the Box down.
+// outbound and returns a DialContext-shaped func bound to it,
+// plus a cleanup func that tears the Box down.
 func buildDialer(ctx context.Context, cand parser.Candidate, dialTimeout time.Duration) (func(context.Context, string, string) (net.Conn, error), func(), error) {
 	boxCtx := include.Context(ctx)
 
@@ -248,7 +247,7 @@ func buildDialer(ctx context.Context, cand parser.Candidate, dialTimeout time.Du
 		Options: option.Options{
 			Log:       &option.LogOptions{Disabled: true},
 			Route:     &option.RouteOptions{AutoDetectInterface: false},
-			Outbounds: []option.Outbound{cand.Outbound, {Type: "direct", Tag: "direct"}},
+			Outbounds: []option.Outbound{cand.Outbound},
 		},
 	})
 	if err != nil {

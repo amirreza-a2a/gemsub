@@ -429,3 +429,31 @@ func TestProbeWithExecutor_PropagatesExplicitTransportEvidence(t *testing.T) {
 		t.Errorf("expected resFailure.TransportLatency == 15ms, got %v", resFailure.TransportLatency)
 	}
 }
+
+// TestBuildDialer_AndroidTermux_NoDirectOutbound verifies that buildDialer initializes and starts
+// the Box with only the candidate outbound, avoiding the sing-box v1.14.0 direct outbound
+// nil InterfaceMonitor panic on Android/Termux environments.
+func TestBuildDialer_AndroidTermux_NoDirectOutbound(t *testing.T) {
+	cand, err := parser.Parse("vless://b831381d-6324-4d53-ad4f-8cda48b30811@127.0.0.1:443?security=none&type=tcp#test-node")
+	if err != nil {
+		t.Fatalf("failed to parse candidate: %v", err)
+	}
+
+	dialFn, closeFn, err := buildDialer(context.Background(), cand, 2*time.Second)
+	if err != nil {
+		t.Fatalf("buildDialer failed: %v", err)
+	}
+	defer closeFn()
+
+	if dialFn == nil {
+		t.Fatal("expected non-nil dialFn")
+	}
+
+	// Dialing will fail with connection refused to 127.0.0.1:443, but MUST NOT panic
+	_, dialErr := dialFn(context.Background(), "tcp", "127.0.0.1:443")
+	if dialErr == nil {
+		t.Log("connected to mock port")
+	} else {
+		t.Logf("dialer reached network stack cleanly without panic (dialErr=%v)", dialErr)
+	}
+}
