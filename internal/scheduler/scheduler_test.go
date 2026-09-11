@@ -53,7 +53,7 @@ func TestScheduler_PublishOnSuccessfulCycle(t *testing.T) {
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
 
 	cfg := &config.Config{
-		Sources:          []string{sourceSrv.URL},
+		Sources:          config.NewSources(sourceSrv.URL),
 		FetchIntervalRaw: "1h",
 		Test: config.TestConfig{
 			TargetURL:    targetSrv.URL,
@@ -126,7 +126,7 @@ func TestScheduler_CancelledCycleDoesNotPublish(t *testing.T) {
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
 
 	cfg := &config.Config{
-		Sources:          []string{sourceSrv.URL},
+		Sources:          config.NewSources(sourceSrv.URL),
 		FetchIntervalRaw: "1h",
 		Test: config.TestConfig{
 			TargetURL:    "https://gemini.google.com/",
@@ -191,7 +191,7 @@ func TestScheduler_FetchFailurePreservesStoreAndSkipsPublishing(t *testing.T) {
 	st.FinishCycle()
 
 	cfg := &config.Config{
-		Sources:          []string{sourceSrv.URL},
+		Sources:          config.NewSources(sourceSrv.URL),
 		FetchIntervalRaw: "1h",
 		Test: config.TestConfig{
 			TargetURL:    "https://gemini.google.com/",
@@ -269,7 +269,7 @@ func TestScheduler_EmitsLifecycleAndProgressEvents(t *testing.T) {
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
 
 	cfg := &config.Config{
-		Sources:          []string{sourceSrv.URL},
+		Sources:          config.NewSources(sourceSrv.URL),
 		FetchIntervalRaw: "1h",
 		Test: config.TestConfig{
 			TargetURL:    targetSrv.URL,
@@ -288,6 +288,13 @@ func TestScheduler_EmitsLifecycleAndProgressEvents(t *testing.T) {
 	defer bus.Unsubscribe(subCh)
 
 	sched := scheduler.New(cfg, st, bus)
+	sched.SetRunnerForTest(func(ctx context.Context, cand parser.Candidate, tc *config.TestConfig, limiter *rate.Limiter) store.Result {
+		return store.Result{
+			Link:     cand.Link,
+			Status:   store.StatusPassed,
+			TestedAt: time.Now(),
+		}
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -396,7 +403,7 @@ func TestScheduler_CancelledCycleEmitsCycleFinishedWithCancelledTrue(t *testing.
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
 
 	cfg := &config.Config{
-		Sources:          []string{sourceSrv.URL},
+		Sources:          config.NewSources(sourceSrv.URL),
 		FetchIntervalRaw: "1h",
 		Test: config.TestConfig{
 			TargetURL:    "https://gemini.google.com/",
@@ -453,7 +460,7 @@ func setupTestSchedulerWithSources(t *testing.T, sourceURLs []string, probeLimit
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
 
 	cfg := &config.Config{
-		Sources:          sourceURLs,
+		Sources:          config.NewSources(sourceURLs...),
 		FetchIntervalRaw: "1h",
 		ProbeLimit:       probeLimit,
 		Test: config.TestConfig{

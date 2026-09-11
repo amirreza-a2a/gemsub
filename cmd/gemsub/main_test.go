@@ -268,7 +268,7 @@ func TestProductionRuntime_ConfigUpdated_ReachesAdapter(t *testing.T) {
 	stateFile := filepath.Join(tmpDir, "state.json")
 
 	baseCfg := &config.Config{
-		Sources:          []string{"https://example.com/sub"},
+		Sources:          config.NewSources("https://example.com/sub"),
 		StateFile:        stateFile,
 		FetchIntervalRaw: "1h",
 		FlagMode:         "auto",

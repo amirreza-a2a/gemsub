@@ -78,7 +78,7 @@ func TestRequiresRestart_HotReloadableFieldsDoNotRequireRestart(t *testing.T) {
 		{
 			name: "sources",
 			mutate: func(c *config.Config) {
-				c.Sources = append(c.Sources, "https://new-source.com/sub")
+				c.Sources = append(c.Sources, config.NewSource("https://new-source.com/sub"))
 			},
 		},
 		{

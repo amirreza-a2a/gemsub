@@ -97,7 +97,7 @@ func TestScheduler_TwoStageMixedPoolIntegration(t *testing.T) {
 	}
 
 	cfg := &config.Config{
-		Sources:          []string{sourceSrv.URL},
+		Sources:          config.NewSources(sourceSrv.URL),
 		FetchIntervalRaw: "1h",
 		Test: config.TestConfig{
 			TargetURL:    "https://gemini.google.com/",

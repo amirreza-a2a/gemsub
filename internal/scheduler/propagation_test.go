@@ -36,7 +36,7 @@ func TestScheduler_ConfigUpdated_DynamicFetchIntervalAndProbeLimit(t *testing.T)
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
 
 	cfg := &config.Config{
-		Sources:          []string{sourceSrv.URL},
+		Sources:          config.NewSources(sourceSrv.URL),
 		FetchIntervalRaw: "1h",
 		ProbeLimit:       2,
 		Test: config.TestConfig{
@@ -137,7 +137,7 @@ func TestScheduler_ConfigUpdated_DynamicSourceListUpdate(t *testing.T) {
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
 
 	cfg := &config.Config{
-		Sources:          []string{srv1.URL},
+		Sources:          config.NewSources(srv1.URL),
 		FetchIntervalRaw: "1h",
 		Test: config.TestConfig{
 			TargetURL:    "https://example.com",
@@ -173,7 +173,7 @@ func TestScheduler_ConfigUpdated_DynamicSourceListUpdate(t *testing.T) {
 
 	// Update sources to include both srv1 and srv2
 	newCfg := sched.Config()
-	newCfg.Sources = []string{srv1.URL, srv2.URL}
+	newCfg.Sources = config.NewSources(srv1.URL, srv2.URL)
 	sched.UpdateConfig(newCfg)
 
 	// 2nd cycle: both srv1 and srv2
@@ -195,7 +195,7 @@ func TestScheduler_InFlightCycleContinuesDuringConfigUpdate(t *testing.T) {
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
 
 	cfg := &config.Config{
-		Sources:          []string{sourceSrv.URL},
+		Sources:          config.NewSources(sourceSrv.URL),
 		FetchIntervalRaw: "1h",
 		Test: config.TestConfig{
 			TargetURL:    "https://example.com",
@@ -282,7 +282,7 @@ func TestScheduler_ConcurrentConfigUpdatesAndCycles(t *testing.T) {
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
 
 	cfg := &config.Config{
-		Sources:          []string{sourceSrv.URL},
+		Sources:          config.NewSources(sourceSrv.URL),
 		FetchIntervalRaw: "1h",
 		Test: config.TestConfig{
 			TargetURL:    "https://example.com",
@@ -391,7 +391,7 @@ func TestScheduler_Run_CanonicalIntervalResetViaIntervalCh(t *testing.T) {
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
 
 	cfg := &config.Config{
-		Sources:          []string{sourceSrv.URL},
+		Sources:          config.NewSources(sourceSrv.URL),
 		FetchIntervalRaw: "10m",
 		FetchInterval:    10 * time.Minute,
 		Test: config.TestConfig{
@@ -455,5 +455,157 @@ func TestScheduler_Run_CanonicalIntervalResetViaIntervalCh(t *testing.T) {
 
 	if count := atomic.LoadInt64(&cycleCount); count < 2 {
 		t.Fatalf("expected at least 2 cycles within 2s after interval reset to 50ms, got %d", count)
+	}
+}
+
+func TestScheduler_ExcludesDisabledSourcesFromFetch(t *testing.T) {
+	var srv1Hits, srv2Hits int64
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&srv1Hits, 1)
+		_, _ = w.Write([]byte("vless://node1@127.0.0.1:443?type=tcp&security=none#node1\n"))
+	}))
+	defer srv1.Close()
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&srv2Hits, 1)
+		_, _ = w.Write([]byte("vless://node2@127.0.0.1:443?type=tcp&security=none#node2\n"))
+	}))
+	defer srv2.Close()
+
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+
+	src1 := config.NewSource(srv1.URL, "Server 1")
+	src2 := config.NewSource(srv2.URL, "Server 2")
+	src2.Enabled = false // disabled initially
+
+	cfg := &config.Config{
+		Sources:          []config.SourceItem{src1, src2},
+		FetchIntervalRaw: "1h",
+		Test: config.TestConfig{
+			TargetURL:    "https://example.com",
+			BlockPhrases: []string{"blocked"},
+			TimeoutRaw:   "5s",
+			Concurrency:  1,
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg.Validate: %v", err)
+	}
+
+	sched := scheduler.New(cfg, st)
+	ctx := context.Background()
+
+	var runner = func(ctx context.Context, cand parser.Candidate, tc *config.TestConfig, limiter *rate.Limiter) store.Result {
+		return store.Result{Link: cand.Link, Status: store.StatusPassed, TestedAt: time.Now()}
+	}
+
+	// 1st cycle: only src1 enabled
+	sched.RunCycleForTest(ctx, runner)
+	if atomic.LoadInt64(&srv1Hits) != 1 {
+		t.Errorf("expected 1 hit on enabled srv1, got %d", atomic.LoadInt64(&srv1Hits))
+	}
+	if atomic.LoadInt64(&srv2Hits) != 0 {
+		t.Errorf("expected 0 hits on disabled srv2, got %d", atomic.LoadInt64(&srv2Hits))
+	}
+
+	// 2nd cycle: enable src2
+	updatedCfg := sched.Config()
+	updatedCfg.Sources[1].Enabled = true
+	sched.UpdateConfig(updatedCfg)
+
+	sched.RunCycleForTest(ctx, runner)
+	if atomic.LoadInt64(&srv1Hits) != 2 {
+		t.Errorf("expected 2 total hits on srv1, got %d", atomic.LoadInt64(&srv1Hits))
+	}
+	if atomic.LoadInt64(&srv2Hits) != 1 {
+		t.Errorf("expected 1 hit on newly enabled srv2, got %d", atomic.LoadInt64(&srv2Hits))
+	}
+
+	// 3rd cycle: disable both sources -> cycle skipped cleanly without errors
+	updatedCfg = sched.Config()
+	updatedCfg.Sources[0].Enabled = false
+	updatedCfg.Sources[1].Enabled = false
+	sched.UpdateConfig(updatedCfg)
+
+	sched.RunCycleForTest(ctx, runner)
+	if atomic.LoadInt64(&srv1Hits) != 2 {
+		t.Errorf("expected no additional hits on srv1 after disabling all sources, got %d", atomic.LoadInt64(&srv1Hits))
+	}
+	if atomic.LoadInt64(&srv2Hits) != 1 {
+		t.Errorf("expected no additional hits on srv2 after disabling all sources, got %d", atomic.LoadInt64(&srv2Hits))
+	}
+}
+
+func TestScheduler_DisabledSourceCandidatesAgeOutNormally(t *testing.T) {
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("vless://node1@127.0.0.1:443?type=tcp&security=none#node1\n"))
+	}))
+	defer srv1.Close()
+
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("vless://node2@127.0.0.1:443?type=tcp&security=none#node2\n"))
+	}))
+	defer srv2.Close()
+
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2) // MaxAbsentCycles = 2
+
+	cfg := &config.Config{
+		Sources: []config.SourceItem{
+			config.NewSource(srv1.URL, "Server 1"),
+			config.NewSource(srv2.URL, "Server 2"),
+		},
+		FetchIntervalRaw: "1h",
+		Test: config.TestConfig{
+			TargetURL:    "https://example.com",
+			BlockPhrases: []string{"blocked"},
+			TimeoutRaw:   "5s",
+			Concurrency:  1,
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg.Validate: %v", err)
+	}
+
+	sched := scheduler.New(cfg, st)
+	ctx := context.Background()
+
+	var runner = func(ctx context.Context, cand parser.Candidate, tc *config.TestConfig, limiter *rate.Limiter) store.Result {
+		return store.Result{Link: cand.Link, Status: store.StatusPassed, TestedAt: time.Now()}
+	}
+
+	// Cycle 1: both sources enabled -> both candidates in Store
+	sched.RunCycleForTest(ctx, runner)
+	if st.Stats().Total != 2 {
+		t.Fatalf("expected 2 candidates in store after cycle 1, got %d", st.Stats().Total)
+	}
+
+	// Disable srv2 while srv1 remains enabled
+	updatedCfg := sched.Config()
+	updatedCfg.Sources[1].Enabled = false
+	sched.UpdateConfig(updatedCfg)
+
+	// Cycle 2: node2 absent (AbsentCycles = 1) -> still retained in store
+	sched.RunCycleForTest(ctx, runner)
+	if st.Stats().Total != 2 {
+		t.Fatalf("expected 2 candidates in store after absent cycle 1, got %d", st.Stats().Total)
+	}
+
+	// Cycle 3: node2 absent (AbsentCycles = 2) -> still retained (MaxAbsentCycles=2)
+	sched.RunCycleForTest(ctx, runner)
+	if st.Stats().Total != 2 {
+		t.Fatalf("expected 2 candidates in store after absent cycle 2, got %d", st.Stats().Total)
+	}
+
+	// Cycle 4: node2 absent (AbsentCycles = 3 > 2) -> evicted from Store!
+	sched.RunCycleForTest(ctx, runner)
+	if st.Stats().Total != 1 {
+		t.Fatalf("expected node2 to be evicted after exceeding MaxAbsentCycles, got %d candidates", st.Stats().Total)
+	}
+
+	passing := st.Passing()
+	if len(passing) != 1 || passing[0] != "vless://node1@127.0.0.1:443?type=tcp&security=none#node1" {
+		t.Fatalf("expected only node1 to remain in store, got %+v", passing)
 	}
 }

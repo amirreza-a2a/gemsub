@@ -21,6 +21,7 @@ import (
 	"gemsub/internal/events"
 	"gemsub/internal/logging"
 	"gemsub/internal/scheduler"
+	"gemsub/internal/source"
 	"gemsub/internal/store"
 	"gemsub/internal/subserver"
 	"gemsub/internal/tui"
@@ -155,6 +156,7 @@ func runLifecycle(ctx context.Context, cfg *config.Config, logWriter io.Writer, 
 // Runtime encapsulates application infrastructure and optional presentation components.
 type Runtime struct {
 	ConfigSvc   *config.Service
+	SourceSvc   *source.Service
 	RingHandler *logging.RingLogHandler
 	Store       *store.Store
 	Bus         *events.EventBus
@@ -183,13 +185,16 @@ func setupRuntime(cfg *config.Config, logWriter io.Writer, configSvc ...*config.
 	bus := events.New()
 
 	var svc *config.Service
+	var srcSvc *source.Service
 	if len(configSvc) > 0 && configSvc[0] != nil {
 		svc = configSvc[0]
 		svc.SetEventPublisher(bus)
+		srcSvc = source.NewService(svc)
 	}
 
 	rt := &Runtime{
 		ConfigSvc:   svc,
+		SourceSvc:   srcSvc,
 		RingHandler: ringHandler,
 		Store:       st,
 		Bus:         bus,

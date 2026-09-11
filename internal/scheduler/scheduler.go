@@ -158,6 +158,16 @@ func (s *Scheduler) UpdateConfig(newCfg config.Config) {
 // Run blocks until ctx is cancelled, running one cycle immediately
 // and then one per FetchInterval (or whenever Trigger fires).
 func (s *Scheduler) Run(ctx context.Context) {
+	s.mu.RLock()
+	bus := s.bus
+	s.mu.RUnlock()
+
+	var configSub <-chan any
+	if bus != nil {
+		configSub = bus.Subscribe()
+		defer bus.Unsubscribe(configSub)
+	}
+
 	s.runCycle(ctx)
 
 	s.mu.RLock()
@@ -166,12 +176,6 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
-	var configSub <-chan any
-	if s.bus != nil {
-		configSub = s.bus.Subscribe()
-		defer s.bus.Unsubscribe(configSub)
-	}
 
 	for {
 		select {
@@ -220,11 +224,34 @@ func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeR
 	})
 
 	s.mu.RLock()
-	sources := append([]string(nil), s.cfg.Sources...)
+	sources := s.cfg.EnabledSourceURLs()
 	probeLimit := s.cfg.ProbeLimit
 	testCfg := *s.cfg.Test.Clone()
 	pub := s.pub
 	s.mu.RUnlock()
+
+	// Invariant:
+	// - When at least one source remains enabled, disabled-source candidates are
+	//   omitted from the fetched link set and naturally age out via Store.MaxAbsentCycles.
+	// - When ALL configured sources are disabled, the scheduler intentionally skips
+	//   StartCycle() and probing, preserving current Store state to prevent an accidental
+	//   wiping of all candidates during complete source suspension.
+	if len(sources) == 0 {
+		slog.Warn("scheduler: no enabled sources; skipping cycle")
+		s.bus.Publish(events.CycleFinished{
+			ProgressMetrics: events.ProgressMetrics{
+				Total:        0,
+				Completed:    0,
+				Passed:       0,
+				Failed:       0,
+				Inconclusive: 0,
+			},
+			Duration:  time.Since(cycleStart),
+			Cancelled: ctx.Err() != nil,
+			Servable:  s.st.Stats().Servable,
+		})
+		return
+	}
 
 	links, fetchErrs := source.FetchAll(ctx, sources)
 	for _, e := range fetchErrs {

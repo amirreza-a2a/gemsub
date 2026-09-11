@@ -49,7 +49,7 @@ type PublishingConfig struct {
 }
 
 type Config struct {
-	Sources          []string         `json:"sources"`
+	Sources          []SourceItem     `json:"sources"`
 	FetchIntervalRaw string           `json:"fetch_interval"`
 	Test             TestConfig       `json:"test"`
 	Serve            ServeConfig      `json:"serve"`
@@ -87,6 +87,37 @@ func Load(path string) (*Config, error) {
 func (c *Config) Validate() error {
 	if len(c.Sources) == 0 {
 		return fmt.Errorf("sources must not be empty")
+	}
+
+	seenIDs := make(map[string]struct{}, len(c.Sources))
+	seenURLs := make(map[string]struct{}, len(c.Sources))
+	for i := range c.Sources {
+		s := &c.Sources[i]
+		normURL, err := NormalizeURL(s.URL)
+		if err != nil {
+			return fmt.Errorf("sources[%d]: %w", i, err)
+		}
+		s.URL = normURL
+
+		if s.ID == "" {
+			s.ID = GenerateSourceID(s.URL)
+		}
+		if _, exists := seenIDs[s.ID]; exists {
+			return fmt.Errorf("sources[%d]: duplicate source ID %q", i, s.ID)
+		}
+		seenIDs[s.ID] = struct{}{}
+
+		if _, exists := seenURLs[s.URL]; exists {
+			return fmt.Errorf("sources[%d]: duplicate source URL %q", i, s.URL)
+		}
+		seenURLs[s.URL] = struct{}{}
+
+		if s.Name == "" {
+			s.Name = DefaultSourceName(s.URL)
+		}
+		if s.AddedAt.IsZero() {
+			s.AddedAt = time.Now().UTC()
+		}
 	}
 
 	fetchInterval, err := time.ParseDuration(c.FetchIntervalRaw)
@@ -260,7 +291,7 @@ func (c *Config) Clone() *Config {
 	}
 	cp := *c
 	if c.Sources != nil {
-		cp.Sources = append([]string(nil), c.Sources...)
+		cp.Sources = append([]SourceItem(nil), c.Sources...)
 	}
 	cp.Test = *c.Test.Clone()
 	return &cp

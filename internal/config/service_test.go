@@ -15,7 +15,7 @@ import (
 func validTestConfig() *config.Config {
 	maxRetries := 2
 	return &config.Config{
-		Sources:          []string{"https://example.com/source1", "https://example.com/source2"},
+		Sources:          config.NewSources("https://example.com/source1", "https://example.com/source2"),
 		FetchIntervalRaw: "2h",
 		Test: config.TestConfig{
 			Gemini: config.GeminiConfig{
@@ -56,8 +56,8 @@ func TestConfig_Clone(t *testing.T) {
 	}
 
 	// 1. Mutate Sources on clone
-	clone.Sources[0] = "https://mutated.com"
-	if orig.Sources[0] == "https://mutated.com" {
+	clone.Sources[0].URL = "https://mutated.com"
+	if orig.Sources[0].URL == "https://mutated.com" {
 		t.Error("mutating clone.Sources affected orig.Sources")
 	}
 
@@ -145,11 +145,11 @@ func TestService_Get_Immutability(t *testing.T) {
 	}
 
 	snapshot := svc.Get()
-	snapshot.Sources[0] = "https://mutated.com"
+	snapshot.Sources[0].URL = "https://mutated.com"
 	*snapshot.Test.MaxRetriesRaw = 42
 
 	fresh := svc.Get()
-	if fresh.Sources[0] == "https://mutated.com" {
+	if fresh.Sources[0].URL == "https://mutated.com" {
 		t.Error("modifying Get() returned snapshot mutated internal Service state")
 	}
 	if *fresh.Test.MaxRetriesRaw == 42 {
@@ -190,7 +190,7 @@ func TestService_Update_Success(t *testing.T) {
 
 	err = svc.Update(func(c *config.Config) error {
 		c.FetchIntervalRaw = "4h"
-		c.Sources = append(c.Sources, "https://example.com/extra")
+		c.Sources = append(c.Sources, config.NewSource("https://example.com/extra"))
 		return nil
 	})
 	if err != nil {
