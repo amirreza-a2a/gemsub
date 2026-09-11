@@ -47,30 +47,34 @@ func main() {
 		return
 	}
 
-	cfg, err := config.Load(*configPath)
+	configSvc, err := config.NewService(*configPath, nil, nil)
 	if err != nil {
 		slog.Error("config load failed", "err", err)
 		os.Exit(1)
 	}
+
+	baseCfg := configSvc.Get()
+	runtimeCfg := baseCfg.Clone()
+
 	if *headless {
-		cfg.Headless = true
+		runtimeCfg.Headless = true
 	}
 	if *probeLimit > 0 {
-		cfg.ProbeLimit = *probeLimit
+		runtimeCfg.ProbeLimit = *probeLimit
 	}
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "publish" {
-			cfg.Publishing.Enabled = *publish
+			runtimeCfg.Publishing.Enabled = *publish
 			if *publish {
-				if err := cfg.Validate(); err != nil {
+				if err := runtimeCfg.Validate(); err != nil {
 					slog.Error("config validation failed", "err", err)
 					os.Exit(1)
 				}
 			}
 		}
 		if f.Name == "flag-mode" {
-			cfg.FlagMode = *flagMode
-			if err := cfg.Validate(); err != nil {
+			runtimeCfg.FlagMode = *flagMode
+			if err := runtimeCfg.Validate(); err != nil {
 				slog.Error("config validation failed", "err", err)
 				os.Exit(1)
 			}
@@ -88,7 +92,7 @@ func main() {
 		cancel()
 	}()
 
-	if err := runLifecycle(ctx, cfg, os.Stderr); err != nil {
+	if err := runLifecycle(ctx, runtimeCfg, os.Stderr, configSvc); err != nil {
 		slog.Error("application error", "err", err)
 	}
 }
@@ -98,8 +102,8 @@ func main() {
 // 2. Starts scheduler and subserver workers
 // 3. Runs headless wait or Bubble Tea event loop
 // 4. Coordinates graceful shutdown: cancellation, worker drain, terminal release, Store.Save()
-func runLifecycle(ctx context.Context, cfg *config.Config, logWriter io.Writer) error {
-	rt, cleanup := setupRuntime(cfg, logWriter)
+func runLifecycle(ctx context.Context, cfg *config.Config, logWriter io.Writer, configSvc ...*config.Service) error {
+	rt, cleanup := setupRuntime(cfg, logWriter, configSvc...)
 	defer cleanup()
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -117,6 +121,7 @@ func runLifecycle(ctx context.Context, cfg *config.Config, logWriter io.Writer) 
 
 	// Step 6: Start HTTP subserver
 	srv := subserver.New(&cfg.Serve, rt.Store)
+	srv.SetEventBus(rt.Bus)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -149,6 +154,7 @@ func runLifecycle(ctx context.Context, cfg *config.Config, logWriter io.Writer) 
 
 // Runtime encapsulates application infrastructure and optional presentation components.
 type Runtime struct {
+	ConfigSvc   *config.Service
 	RingHandler *logging.RingLogHandler
 	Store       *store.Store
 	Bus         *events.EventBus
@@ -159,7 +165,7 @@ type Runtime struct {
 
 // setupRuntime instantiates application components in the strict startup sequence.
 // In headless mode, it guarantees zero TUI runtime components are created.
-func setupRuntime(cfg *config.Config, logWriter io.Writer) (*Runtime, func()) {
+func setupRuntime(cfg *config.Config, logWriter io.Writer, configSvc ...*config.Service) (*Runtime, func()) {
 	if logWriter == nil {
 		logWriter = os.Stderr
 	}
@@ -176,7 +182,14 @@ func setupRuntime(cfg *config.Config, logWriter io.Writer) (*Runtime, func()) {
 	// Step 3: Instantiate EventBus
 	bus := events.New()
 
+	var svc *config.Service
+	if len(configSvc) > 0 && configSvc[0] != nil {
+		svc = configSvc[0]
+		svc.SetEventPublisher(bus)
+	}
+
 	rt := &Runtime{
+		ConfigSvc:   svc,
 		RingHandler: ringHandler,
 		Store:       st,
 		Bus:         bus,

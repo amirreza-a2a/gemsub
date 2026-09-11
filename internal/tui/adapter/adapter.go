@@ -183,6 +183,16 @@ func (a *Adapter) handleEvent(evt any) {
 			a.lastCompletedCycleCount = a.st.CycleCount()
 		}
 		atomic.StoreInt32(&a.dirty, 1)
+
+	case events.ConfigUpdated:
+		newMode := country.Mode(e.New.FlagMode)
+		if newMode == "" {
+			newMode = country.ModeAuto
+		}
+		if newMode != a.flagMode {
+			a.flagMode = newMode
+			atomic.StoreInt32(&a.dirty, 1)
+		}
 	}
 }
 

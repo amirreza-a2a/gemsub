@@ -21,12 +21,16 @@ import (
 )
 
 type Scheduler struct {
-	cfg         *config.Config
+	mu          sync.RWMutex
+	cfg         config.Config
 	st          *store.Store
 	pub         *publisher.Publisher
 	bus         *events.EventBus
 	rotatorOnce sync.Once
 	rotator     *candidateRotator
+
+	intervalCh chan time.Duration
+	runner     tester.ProbeRunner
 
 	// Trigger lets anything (TUI, signal handler, ...) request an
 	// immediate cycle instead of waiting for the interval. Buffered
@@ -35,9 +39,13 @@ type Scheduler struct {
 }
 
 func New(cfg *config.Config, st *store.Store, bus ...*events.EventBus) *Scheduler {
+	var c config.Config
+	if cfg != nil {
+		c = *cfg.Clone()
+	}
 	var pub *publisher.Publisher
-	if cfg.Publishing.Enabled {
-		pub = publisher.New(&cfg.Publishing, st)
+	if c.Publishing.Enabled {
+		pub = publisher.New(&c.Publishing, st)
 	}
 	var b *events.EventBus
 	if len(bus) > 0 && bus[0] != nil {
@@ -46,12 +54,13 @@ func New(cfg *config.Config, st *store.Store, bus ...*events.EventBus) *Schedule
 		b = events.New()
 	}
 	return &Scheduler{
-		cfg:     cfg,
-		st:      st,
-		pub:     pub,
-		bus:     b,
-		rotator: newCandidateRotator(),
-		Trigger: make(chan struct{}, 1),
+		cfg:        c,
+		st:         st,
+		pub:        pub,
+		bus:        b,
+		rotator:    newCandidateRotator(),
+		intervalCh: make(chan time.Duration, 1),
+		Trigger:    make(chan struct{}, 1),
 	}
 }
 
@@ -71,12 +80,79 @@ func (s *Scheduler) EventBus() *events.EventBus {
 
 // SetEventBus replaces the event bus (e.g. for testing).
 func (s *Scheduler) SetEventBus(bus *events.EventBus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.bus = bus
 }
 
 // SetPublisher allows configuring a custom publisher (e.g. for testing).
 func (s *Scheduler) SetPublisher(pub *publisher.Publisher) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.pub = pub
+}
+
+// Config returns a copy of the scheduler's current runtime configuration.
+func (s *Scheduler) Config() config.Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return *s.cfg.Clone()
+}
+
+// FetchInterval returns the current active cycle interval.
+func (s *Scheduler) FetchInterval() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.FetchInterval
+}
+
+// ProbeLimit returns the current active candidate probe limit.
+func (s *Scheduler) ProbeLimit() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.ProbeLimit
+}
+
+// UpdateConfig updates the scheduler runtime configuration under lock,
+// updating child publishers and notifying running timers if FetchInterval changed.
+func (s *Scheduler) UpdateConfig(newCfg config.Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	oldInterval := s.cfg.FetchInterval
+	cloned := newCfg.Clone()
+	if cloned != nil {
+		s.cfg = *cloned
+	}
+
+	// Update or instantiate/teardown publisher based on updated publishing configuration
+	if s.cfg.Publishing.Enabled {
+		if s.pub == nil {
+			s.pub = publisher.New(&s.cfg.Publishing, s.st)
+		} else {
+			s.pub.UpdateConfig(s.cfg.Publishing)
+		}
+	} else {
+		s.pub = nil
+	}
+
+	newInterval := s.cfg.FetchInterval
+
+	// If fetch interval changed, signal running event loop
+	if newInterval != oldInterval && newInterval > 0 {
+		select {
+		case s.intervalCh <- newInterval:
+		default:
+			select {
+			case <-s.intervalCh:
+			default:
+			}
+			select {
+			case s.intervalCh <- newInterval:
+			default:
+			}
+		}
+	}
 }
 
 // Run blocks until ctx is cancelled, running one cycle immediately
@@ -84,8 +160,18 @@ func (s *Scheduler) SetPublisher(pub *publisher.Publisher) {
 func (s *Scheduler) Run(ctx context.Context) {
 	s.runCycle(ctx)
 
-	ticker := time.NewTicker(s.cfg.FetchInterval)
+	s.mu.RLock()
+	interval := s.cfg.FetchInterval
+	s.mu.RUnlock()
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	var configSub <-chan any
+	if s.bus != nil {
+		configSub = s.bus.Subscribe()
+		defer s.bus.Unsubscribe(configSub)
+	}
 
 	for {
 		select {
@@ -95,13 +181,35 @@ func (s *Scheduler) Run(ctx context.Context) {
 			s.runCycle(ctx)
 		case <-s.Trigger:
 			s.runCycle(ctx)
-			ticker.Reset(s.cfg.FetchInterval)
+			s.mu.RLock()
+			interval = s.cfg.FetchInterval
+			s.mu.RUnlock()
+			ticker.Reset(interval)
+		case evt, ok := <-configSub:
+			if !ok {
+				configSub = nil
+				continue
+			}
+			if cu, ok := evt.(config.ConfigUpdated); ok {
+				s.UpdateConfig(cu.New)
+			}
+		case newInterval := <-s.intervalCh:
+			if newInterval > 0 {
+				interval = newInterval
+				ticker.Reset(newInterval)
+			}
 		}
 	}
 }
 
 func (s *Scheduler) runCycle(ctx context.Context) {
-	s.runCycleWithRunner(ctx, tester.Probe)
+	s.mu.RLock()
+	runner := s.runner
+	s.mu.RUnlock()
+	if runner == nil {
+		runner = tester.Probe
+	}
+	s.runCycleWithRunner(ctx, runner)
 }
 
 func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeRunner) {
@@ -111,7 +219,14 @@ func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeR
 		StartedAt: cycleStart,
 	})
 
-	links, fetchErrs := source.FetchAll(ctx, s.cfg.Sources)
+	s.mu.RLock()
+	sources := append([]string(nil), s.cfg.Sources...)
+	probeLimit := s.cfg.ProbeLimit
+	testCfg := *s.cfg.Test.Clone()
+	pub := s.pub
+	s.mu.RUnlock()
+
+	links, fetchErrs := source.FetchAll(ctx, sources)
 	for _, e := range fetchErrs {
 		slog.Error("scheduler: fetch error", "err", e)
 	}
@@ -156,7 +271,7 @@ func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeR
 	rot.PruneStale(linkSet)
 
 	// Apply fair Least-Recently-Tested (LRT) candidate rotation under ProbeLimit.
-	candidates = rot.SelectCandidates(candidates, s.cfg.ProbeLimit)
+	candidates = rot.SelectCandidates(candidates, probeLimit)
 
 	slog.Info("scheduler: selected candidates for probing", "selected", len(candidates), "total", totalParsed)
 	s.bus.Publish(events.CandidatesLoaded{
@@ -167,7 +282,7 @@ func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeR
 	var passed, failed, inconclusive int64
 	var regionBlocked, timeout int64
 
-	completed := tester.RunPoolWithRunner(ctx, candidates, &s.cfg.Test, runner, s.bus, func(r store.Result) {
+	completed := tester.RunPoolWithRunner(ctx, candidates, &testCfg, runner, s.bus, func(r store.Result) {
 		s.st.PutWithTransition(r)
 		rot.RecordTested(r.Link, r.TestedAt)
 		switch r.Status {
@@ -235,8 +350,8 @@ func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeR
 		Servable:  stats.Servable,
 	})
 
-	if s.pub != nil {
-		if err := s.pub.Publish(ctx); err != nil {
+	if pub != nil {
+		if err := pub.Publish(ctx); err != nil {
 			slog.Error("scheduler: publish failed", "err", err)
 		}
 	}

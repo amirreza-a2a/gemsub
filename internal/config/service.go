@@ -24,10 +24,11 @@ type ConfigUpdated struct {
 // Service provides thread-safe access, validation, mutation, and atomic
 // persistence for gemsub's configuration.
 type Service struct {
-	mu   sync.RWMutex
-	path string
-	cfg  *Config
-	bus  EventPublisher
+	mu         sync.RWMutex
+	path       string
+	cfg        *Config
+	initialCfg *Config
+	bus        EventPublisher
 }
 
 // ConfigService is an alias for Service.
@@ -43,9 +44,10 @@ func NewService(path string, cfg *Config, bus EventPublisher) (*Service, error) 
 			return nil, fmt.Errorf("invalid config: %w", err)
 		}
 		return &Service{
-			path: path,
-			cfg:  cloned,
-			bus:  bus,
+			path:       path,
+			cfg:        cloned,
+			initialCfg: cloned.Clone(),
+			bus:        bus,
 		}, nil
 	}
 
@@ -59,10 +61,22 @@ func NewService(path string, cfg *Config, bus EventPublisher) (*Service, error) 
 	}
 
 	return &Service{
-		path: path,
-		cfg:  loaded,
-		bus:  bus,
+		path:       path,
+		cfg:        loaded,
+		initialCfg: loaded.Clone(),
+		bus:        bus,
 	}, nil
+}
+
+// PendingRestartFields returns any canonical field paths modified since initialization
+// that require an application restart to take effect in the runtime environment.
+func (s *Service) PendingRestartFields() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.initialCfg == nil || s.cfg == nil {
+		return nil
+	}
+	return RequiresRestart(*s.initialCfg, *s.cfg)
 }
 
 // Get returns an immutable deep-cloned snapshot of current configuration.

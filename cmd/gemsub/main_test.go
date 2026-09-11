@@ -261,3 +261,62 @@ func TestVersionOutput(t *testing.T) {
 		t.Errorf("expected version output to contain 'built:', got: %s", info)
 	}
 }
+
+func TestProductionRuntime_ConfigUpdated_ReachesAdapter(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	stateFile := filepath.Join(tmpDir, "state.json")
+
+	baseCfg := &config.Config{
+		Sources:          []string{"https://example.com/sub"},
+		StateFile:        stateFile,
+		FetchIntervalRaw: "1h",
+		FlagMode:         "auto",
+		Test: config.TestConfig{
+			TargetURL:    "https://example.com",
+			BlockPhrases: []string{"blocked"},
+			TimeoutRaw:   "5s",
+		},
+	}
+	if err := baseCfg.Validate(); err != nil {
+		t.Fatalf("baseCfg.Validate: %v", err)
+	}
+
+	configSvc, err := config.NewService(cfgPath, baseCfg, nil)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	rt, cleanup := setupRuntime(baseCfg, &logBuf, configSvc)
+	defer cleanup()
+
+	if rt.Adapter == nil {
+		t.Fatal("expected rt.Adapter to be non-nil in non-headless runtime")
+	}
+	if rt.Adapter.FlagMode() != country.ModeAuto {
+		t.Fatalf("expected initial FlagMode Auto, got %v", rt.Adapter.FlagMode())
+	}
+
+	// Mutate FlagMode through ConfigService (simulating control plane / settings update)
+	err = configSvc.Update(func(c *config.Config) error {
+		c.FlagMode = "ascii"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("configSvc.Update: %v", err)
+	}
+
+	// Verify that ConfigUpdated reached Adapter through the production bus wiring
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if rt.Adapter.FlagMode() == country.ModeASCII {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if rt.Adapter.FlagMode() != country.ModeASCII {
+		t.Fatalf("expected FlagMode updated to ASCII via production bus, got %v", rt.Adapter.FlagMode())
+	}
+}

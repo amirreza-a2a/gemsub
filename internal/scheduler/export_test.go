@@ -15,3 +15,10 @@ func (s *Scheduler) RunCycleForTest(ctx context.Context, runner tester.ProbeRunn
 func (s *Scheduler) GetRotatorForTest() any {
 	return s.getRotator()
 }
+
+// SetRunnerForTest sets a custom probe runner for test execution of Run.
+func (s *Scheduler) SetRunnerForTest(runner tester.ProbeRunner) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runner = runner
+}

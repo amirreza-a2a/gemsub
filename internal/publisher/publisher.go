@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gemsub/internal/config"
@@ -128,7 +129,8 @@ func ExpandHome(path string) string {
 
 // Publisher coordinates rendering subscription files and committing/pushing them.
 type Publisher struct {
-	cfg *config.PublishingConfig
+	mu  sync.RWMutex
+	cfg config.PublishingConfig
 	st  *store.Store
 	git GitRunner
 
@@ -143,11 +145,35 @@ func New(cfg *config.PublishingConfig, st *store.Store) *Publisher {
 
 // NewWithGit creates a Publisher with a custom GitRunner (useful for tests).
 func NewWithGit(cfg *config.PublishingConfig, st *store.Store, git GitRunner) *Publisher {
+	var c config.PublishingConfig
+	if cfg != nil {
+		c = *cfg
+	}
 	return &Publisher{
-		cfg: cfg,
+		cfg: c,
 		st:  st,
 		git: git,
 	}
+}
+
+// UpdateConfig updates the publisher configuration under lock.
+func (p *Publisher) UpdateConfig(cfg config.PublishingConfig) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cfg = cfg
+}
+
+// Config returns the current publishing configuration snapshot.
+func (p *Publisher) Config() config.PublishingConfig {
+	if p == nil {
+		return config.PublishingConfig{}
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.cfg
 }
 
 // WithFSOverrides configures custom filesystem write and remove hooks for testing failure injection.
@@ -470,11 +496,15 @@ func (p *Publisher) isAheadOfRemote(ctx context.Context, repoDir, branch string)
 // Publish generates subscription files, stages them in the Git repository,
 // and pushes them if changes or unpushed commits are detected.
 func (p *Publisher) Publish(ctx context.Context) (err error) {
-	if p.cfg == nil || !p.cfg.Enabled {
+	p.mu.RLock()
+	cfg := p.cfg
+	p.mu.RUnlock()
+
+	if !cfg.Enabled {
 		return nil
 	}
 
-	repoDir := ExpandHome(p.cfg.Repository)
+	repoDir := ExpandHome(cfg.Repository)
 	if repoDir == "" {
 		return fmt.Errorf("publisher: repository path is empty")
 	}
@@ -503,7 +533,7 @@ func (p *Publisher) Publish(ctx context.Context) (err error) {
 	}
 	originURL = strings.TrimSpace(originURL)
 
-	expectedRemote := strings.TrimSpace(p.cfg.RemoteURL)
+	expectedRemote := strings.TrimSpace(cfg.RemoteURL)
 	if expectedRemote == "" {
 		return fmt.Errorf("publisher: remote_url is required")
 	}
@@ -645,7 +675,7 @@ func (p *Publisher) Publish(ctx context.Context) (err error) {
 		return fmt.Errorf("publisher: git diff check failed: %w", err)
 	}
 
-	branch := p.cfg.Branch
+	branch := cfg.Branch
 	if branch == "" {
 		branch = "main"
 	}

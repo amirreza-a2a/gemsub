@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"gemsub/internal/config"
 	"gemsub/internal/events"
 	"gemsub/internal/logging"
 	"gemsub/internal/store"
@@ -2389,5 +2390,60 @@ func TestAdapter_CandidateRowsWindow_EventualConsistencyWhileRebuilding(t *testi
 	// Invariant 6: Revision contract is preserved
 	if ad.LastIndexRevForTest() != newRev {
 		t.Fatalf("expected adapter to converge to Store revision %d, got %d", newRev, ad.LastIndexRevForTest())
+	}
+}
+
+func TestAdapter_ConfigUpdated_DynamicFlagMode(t *testing.T) {
+	ad, _, bus, _ := setupTestAdapter(t)
+	ad.SetFlagMode(country.ModeAuto)
+	ad.Subscribe()
+
+	if ad.FlagMode() != country.ModeAuto {
+		t.Fatalf("expected initial FlagMode to be Auto, got %v", ad.FlagMode())
+	}
+
+	// Drain initial dirty state
+	_ = ad.CheckAndResetDirty()
+
+	// 1. Publish ConfigUpdated with flag_mode = "ascii"
+	bus.Publish(events.ConfigUpdated{
+		Old: config.Config{FlagMode: "auto"},
+		New: config.Config{FlagMode: "ascii"},
+	})
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if ad.FlagMode() == country.ModeASCII {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if ad.FlagMode() != country.ModeASCII {
+		t.Fatalf("expected FlagMode updated to ASCII, got %v", ad.FlagMode())
+	}
+	if !ad.CheckAndResetDirty() {
+		t.Errorf("expected adapter dirty to be true after FlagMode update")
+	}
+
+	// 2. Publish ConfigUpdated with flag_mode = "unicode"
+	bus.Publish(events.ConfigUpdated{
+		Old: config.Config{FlagMode: "ascii"},
+		New: config.Config{FlagMode: "unicode"},
+	})
+
+	deadline = time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if ad.FlagMode() == country.ModeUnicode {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if ad.FlagMode() != country.ModeUnicode {
+		t.Fatalf("expected FlagMode updated to Unicode, got %v", ad.FlagMode())
+	}
+	if !ad.CheckAndResetDirty() {
+		t.Errorf("expected adapter dirty to be true after second FlagMode update")
 	}
 }

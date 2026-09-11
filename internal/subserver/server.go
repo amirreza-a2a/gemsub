@@ -12,25 +12,65 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gemsub/internal/config"
+	"gemsub/internal/events"
 	"gemsub/internal/store"
 )
 
 type Server struct {
-	cfg *config.ServeConfig
+	mu  sync.RWMutex
+	cfg config.ServeConfig
 	st  *store.Store
+	bus *events.EventBus
 }
 
 func New(cfg *config.ServeConfig, st *store.Store) *Server {
-	return &Server{cfg: cfg, st: st}
+	var c config.ServeConfig
+	if cfg != nil {
+		c = *cfg
+	}
+	return &Server{cfg: c, st: st}
+}
+
+// SetEventBus sets the event bus for receiving configuration updates.
+func (s *Server) SetEventBus(bus *events.EventBus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bus = bus
+}
+
+// UpdateConfig updates hot-reloadable configuration in a thread-safe manner.
+// Listen and Path changes are logged as requiring restart and not hot-rebound.
+func (s *Server) UpdateConfig(cfg config.ServeConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cfg.Listen != s.cfg.Listen || cfg.Path != s.cfg.Path {
+		slog.Warn("subserver: listen address or path changed; restart required to apply",
+			"current_listen", s.cfg.Listen, "new_listen", cfg.Listen,
+			"current_path", s.cfg.Path, "new_path", cfg.Path)
+	}
+	s.cfg.Format = cfg.Format
+}
+
+// Config returns a copy of the current serve configuration.
+func (s *Server) Config() config.ServeConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
 }
 
 // Run starts the HTTP server and blocks until ctx is cancelled or an error occurs.
 // When ctx is cancelled, it gracefully shuts down the server with a 5-second timeout.
 func (s *Server) Run(ctx context.Context) error {
+	s.mu.RLock()
 	basePath := s.cfg.Path
+	listenAddr := s.cfg.Listen
+	bus := s.bus
+	s.mu.RUnlock()
+
 	if basePath == "" {
 		basePath = "/sub"
 	}
@@ -47,8 +87,28 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/healthz", s.handleHealth)
 
 	httpSrv := &http.Server{
-		Addr:    s.cfg.Listen,
+		Addr:    listenAddr,
 		Handler: mux,
+	}
+
+	if bus != nil {
+		configSub := bus.Subscribe()
+		defer bus.Unsubscribe(configSub)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case evt, ok := <-configSub:
+					if !ok {
+						return
+					}
+					if cu, ok := evt.(config.ConfigUpdated); ok {
+						s.UpdateConfig(cu.New.Serve)
+					}
+				}
+			}
+		}()
 	}
 
 	serverStopped := make(chan struct{})
@@ -65,7 +125,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}()
 
-	slog.Info("subserver: listening", "addr", s.cfg.Listen, "path", basePath)
+	slog.Info("subserver: listening", "addr", listenAddr, "path", basePath)
 	err := httpSrv.ListenAndServe()
 	close(serverStopped)
 
@@ -77,7 +137,10 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) handleSub(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
 	basePath := s.cfg.Path
+	defaultFormat := s.cfg.Format
+	s.mu.RUnlock()
 	if basePath == "" {
 		basePath = "/sub"
 	}
@@ -153,7 +216,7 @@ func (s *Server) handleSub(w http.ResponseWriter, r *http.Request) {
 
 	// Format override: support ?format=raw and ?format=base64 (request-local only)
 	formatParam := strings.TrimSpace(strings.ToLower(q.Get("format")))
-	format := s.cfg.Format
+	format := defaultFormat
 	if format == "" {
 		format = "base64"
 	}

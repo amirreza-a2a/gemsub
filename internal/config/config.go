@@ -234,6 +234,25 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// Clone returns a deep copy of TestConfig.
+func (t *TestConfig) Clone() *TestConfig {
+	if t == nil {
+		return nil
+	}
+	cp := *t
+	if t.BlockPhrases != nil {
+		cp.BlockPhrases = append([]string(nil), t.BlockPhrases...)
+	}
+	if t.Gemini.BlockPhrases != nil {
+		cp.Gemini.BlockPhrases = append([]string(nil), t.Gemini.BlockPhrases...)
+	}
+	if t.MaxRetriesRaw != nil {
+		v := *t.MaxRetriesRaw
+		cp.MaxRetriesRaw = &v
+	}
+	return &cp
+}
+
 // Clone returns a deep copy of Config.
 func (c *Config) Clone() *Config {
 	if c == nil {
@@ -243,15 +262,6 @@ func (c *Config) Clone() *Config {
 	if c.Sources != nil {
 		cp.Sources = append([]string(nil), c.Sources...)
 	}
-	if c.Test.BlockPhrases != nil {
-		cp.Test.BlockPhrases = append([]string(nil), c.Test.BlockPhrases...)
-	}
-	if c.Test.Gemini.BlockPhrases != nil {
-		cp.Test.Gemini.BlockPhrases = append([]string(nil), c.Test.Gemini.BlockPhrases...)
-	}
-	if c.Test.MaxRetriesRaw != nil {
-		v := *c.Test.MaxRetriesRaw
-		cp.Test.MaxRetriesRaw = &v
-	}
+	cp.Test = *c.Test.Clone()
 	return &cp
 }
