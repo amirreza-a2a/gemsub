@@ -493,34 +493,49 @@ func (p *Publisher) isAheadOfRemote(ctx context.Context, repoDir, branch string)
 	return ahead > 0, nil
 }
 
-// Publish generates subscription files, stages them in the Git repository,
-// and pushes them if changes or unpushed commits are detected.
-func (p *Publisher) Publish(ctx context.Context) (err error) {
+// ValidatePrerequisites verifies the real minimum prerequisites needed before publication:
+// - context cancellation
+// - publishing is enabled
+// - repository path exists and is a directory
+// - repository is actually a git repository
+// - configured remote URL matches origin
+// - branch is configured
+// It does not commit, push, or mutate repository state.
+func (p *Publisher) ValidatePrerequisites(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	p.mu.RLock()
 	cfg := p.cfg
 	p.mu.RUnlock()
 
 	if !cfg.Enabled {
-		return nil
+		return ErrPublishingDisabled
 	}
 
 	repoDir := ExpandHome(cfg.Repository)
-	if repoDir == "" {
-		return fmt.Errorf("publisher: repository path is empty")
+	if strings.TrimSpace(repoDir) == "" {
+		return fmt.Errorf("%w: publisher: repository path is empty", ErrInvalidConfiguration)
 	}
 
 	info, err := os.Stat(repoDir)
 	if err != nil {
-		return fmt.Errorf("publisher: repository path %q inaccessible: %w", repoDir, err)
+		return fmt.Errorf("%w: publisher: repository path %q inaccessible: %v", ErrRepositoryUnavailable, repoDir, err)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("publisher: repository path %q is not a directory", repoDir)
+		return fmt.Errorf("%w: publisher: repository path %q is not a directory", ErrRepositoryUnavailable, repoDir)
 	}
 
 	// Verify Git repository
 	isGit, err := p.git.Run(ctx, repoDir, "rev-parse", "--is-inside-work-tree")
 	if err != nil || strings.TrimSpace(isGit) != "true" {
-		return fmt.Errorf("publisher: %q is not a valid git repository: %w", repoDir, err)
+		return fmt.Errorf("%w: publisher: %q is not a valid git repository", ErrRepositoryUnavailable, repoDir)
+	}
+
+	expectedRemote := strings.TrimSpace(cfg.RemoteURL)
+	if expectedRemote == "" {
+		return fmt.Errorf("%w: publisher: remote_url is required", ErrInvalidConfiguration)
 	}
 
 	// Verify remote origin URL
@@ -528,18 +543,32 @@ func (p *Publisher) Publish(ctx context.Context) (err error) {
 	if err != nil {
 		originURL, err = p.git.Run(ctx, repoDir, "remote", "get-url", "origin")
 		if err != nil {
-			return fmt.Errorf("publisher: failed to get remote origin URL: %w", err)
+			return fmt.Errorf("%w: publisher: failed to get remote origin URL: %v", ErrInvalidConfiguration, err)
 		}
 	}
 	originURL = strings.TrimSpace(originURL)
 
-	expectedRemote := strings.TrimSpace(cfg.RemoteURL)
-	if expectedRemote == "" {
-		return fmt.Errorf("publisher: remote_url is required")
-	}
 	if originURL != expectedRemote {
-		return fmt.Errorf("publisher: remote origin URL mismatch: expected %q, got %q", expectedRemote, originURL)
+		return fmt.Errorf("%w: publisher: remote origin URL mismatch: expected %q, got %q", ErrInvalidConfiguration, SanitizeURL(expectedRemote), SanitizeURL(originURL))
 	}
+
+	return nil
+}
+
+// Publish generates subscription files, stages them in the Git repository,
+// and pushes them if changes or unpushed commits are detected.
+func (p *Publisher) Publish(ctx context.Context) (err error) {
+	if err := p.ValidatePrerequisites(ctx); err != nil {
+		if errors.Is(err, ErrPublishingDisabled) {
+			return nil
+		}
+		return err
+	}
+
+	p.mu.RLock()
+	cfg := p.cfg
+	p.mu.RUnlock()
+	repoDir := ExpandHome(cfg.Repository)
 
 	// Safety check: ensure publisher-owned files have no pre-existing uncommitted changes
 	if err := p.checkWorkingTreeSafety(ctx, repoDir); err != nil {

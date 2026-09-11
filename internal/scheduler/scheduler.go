@@ -14,17 +14,21 @@ import (
 	"gemsub/internal/config"
 	"gemsub/internal/events"
 	"gemsub/internal/parser"
-	"gemsub/internal/publisher"
 	"gemsub/internal/source"
 	"gemsub/internal/store"
 	"gemsub/internal/tester"
 )
 
+// Publisher abstracts subscription publishing operations.
+type Publisher interface {
+	Publish(ctx context.Context) error
+}
+
 type Scheduler struct {
 	mu          sync.RWMutex
 	cfg         config.Config
 	st          *store.Store
-	pub         *publisher.Publisher
+	pub         Publisher
 	bus         *events.EventBus
 	rotatorOnce sync.Once
 	rotator     *candidateRotator
@@ -51,10 +55,6 @@ func New(cfg *config.Config, st *store.Store, bus ...*events.EventBus) *Schedule
 	if cfg != nil {
 		c = *cfg.Clone()
 	}
-	var pub *publisher.Publisher
-	if c.Publishing.Enabled {
-		pub = publisher.New(&c.Publishing, st)
-	}
 	var b *events.EventBus
 	if len(bus) > 0 && bus[0] != nil {
 		b = bus[0]
@@ -64,7 +64,6 @@ func New(cfg *config.Config, st *store.Store, bus ...*events.EventBus) *Schedule
 	return &Scheduler{
 		cfg:        c,
 		st:         st,
-		pub:        pub,
 		bus:        b,
 		rotator:    newCandidateRotator(),
 		intervalCh: make(chan time.Duration, 1),
@@ -93,8 +92,8 @@ func (s *Scheduler) SetEventBus(bus *events.EventBus) {
 	s.bus = bus
 }
 
-// SetPublisher allows configuring a custom publisher (e.g. for testing).
-func (s *Scheduler) SetPublisher(pub *publisher.Publisher) {
+// SetPublisher allows configuring a custom publisher abstraction (e.g. PublishingService or test double).
+func (s *Scheduler) SetPublisher(pub Publisher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pub = pub
@@ -160,7 +159,7 @@ func (s *Scheduler) publishCycleFinished(cf events.CycleFinished) {
 }
 
 // UpdateConfig updates the scheduler runtime configuration under lock,
-// updating child publishers and notifying running timers if FetchInterval changed.
+// notifying running timers if FetchInterval changed.
 func (s *Scheduler) UpdateConfig(newCfg config.Config) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -169,17 +168,6 @@ func (s *Scheduler) UpdateConfig(newCfg config.Config) {
 	cloned := newCfg.Clone()
 	if cloned != nil {
 		s.cfg = *cloned
-	}
-
-	// Update or instantiate/teardown publisher based on updated publishing configuration
-	if s.cfg.Publishing.Enabled {
-		if s.pub == nil {
-			s.pub = publisher.New(&s.cfg.Publishing, s.st)
-		} else {
-			s.pub.UpdateConfig(s.cfg.Publishing)
-		}
-	} else {
-		s.pub = nil
 	}
 
 	newInterval := s.cfg.FetchInterval

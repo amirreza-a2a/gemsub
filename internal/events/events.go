@@ -44,3 +44,29 @@ type CycleFinished struct {
 	Cancelled bool
 	Servable  int
 }
+
+// PublishingStarted is emitted when a subscription publication begins.
+type PublishingStarted struct {
+	StartedAt  time.Time `json:"started_at"`
+	Repository string    `json:"repository"`
+	Branch     string    `json:"branch"`
+}
+
+// PublishingFinished is emitted when subscription publication completes successfully.
+type PublishingFinished struct {
+	StartedAt  time.Time     `json:"started_at"`
+	FinishedAt time.Time     `json:"finished_at"`
+	Duration   time.Duration `json:"duration"`
+	Repository string        `json:"repository"`
+	Branch     string        `json:"branch"`
+}
+
+// PublishingFailed is emitted when subscription publication fails.
+type PublishingFailed struct {
+	StartedAt  time.Time     `json:"started_at"`
+	FailedAt   time.Time     `json:"failed_at"`
+	Duration   time.Duration `json:"duration"`
+	Repository string        `json:"repository"`
+	Branch     string        `json:"branch"`
+	Error      string        `json:"error"`
+}

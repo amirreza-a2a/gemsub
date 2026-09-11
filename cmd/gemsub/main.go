@@ -20,6 +20,7 @@ import (
 	"gemsub/internal/config"
 	"gemsub/internal/events"
 	"gemsub/internal/logging"
+	"gemsub/internal/publisher"
 	"gemsub/internal/scheduler"
 	"gemsub/internal/source"
 	"gemsub/internal/store"
@@ -156,6 +157,7 @@ func runLifecycle(ctx context.Context, cfg *config.Config, logWriter io.Writer, 
 type Runtime struct {
 	ConfigSvc     *config.Service
 	SourceSvc     *source.Service
+	PublishSvc    *publisher.Service
 	SchedulerCtrl *scheduler.ControlService
 	RingHandler   *logging.RingLogHandler
 	Store         *store.Store
@@ -186,19 +188,27 @@ func setupRuntime(cfg *config.Config, logWriter io.Writer, configSvc ...*config.
 
 	var svc *config.Service
 	var srcSvc *source.Service
+	var pubSvc *publisher.Service
 	if len(configSvc) > 0 && configSvc[0] != nil {
 		svc = configSvc[0]
 		svc.SetEventPublisher(bus)
 		srcSvc = source.NewService(svc)
+		pubSvc = publisher.NewService(svc, st, bus)
+	} else {
+		pubSvc = publisher.NewService(nil, st, bus)
 	}
 
 	// Step 4: Instantiate Scheduler and ControlService
 	sched := scheduler.New(cfg, st, bus)
+	if pubSvc != nil {
+		sched.SetPublisher(pubSvc)
+	}
 	schedCtrl := scheduler.NewControlService(sched)
 
 	rt := &Runtime{
 		ConfigSvc:     svc,
 		SourceSvc:     srcSvc,
+		PublishSvc:    pubSvc,
 		SchedulerCtrl: schedCtrl,
 		RingHandler:   ringHandler,
 		Store:         st,

@@ -1152,3 +1152,354 @@ func TestScheduler_Rotation_Fairness_N7_K3_StorePreserved(t *testing.T) {
 		}
 	}
 }
+
+type testPubBackend struct {
+	mu           sync.Mutex
+	publishCount int
+	publishErr   error
+	cfg          config.PublishingConfig
+}
+
+func (b *testPubBackend) Publish(ctx context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.publishCount++
+	return b.publishErr
+}
+
+func (b *testPubBackend) UpdateConfig(cfg config.PublishingConfig) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.cfg = cfg
+}
+
+func (b *testPubBackend) Config() config.PublishingConfig {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cfg
+}
+
+func (b *testPubBackend) ValidatePrerequisites(ctx context.Context) error {
+	return nil
+}
+
+func TestScheduler_PublishesViaPublishingService(t *testing.T) {
+	sourceSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("vless://user@host.com:443#node1\n"))
+	}))
+	defer sourceSrv.Close()
+
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+
+	pubCfg := config.PublishingConfig{
+		Enabled:    true,
+		Repository: tmpDir,
+		Branch:     "main",
+		RemoteURL:  "https://github.com/user/repo.git",
+	}
+
+	cfg := &config.Config{
+		Sources:          config.NewSources(sourceSrv.URL),
+		FetchIntervalRaw: "1h",
+		Publishing:       pubCfg,
+		Test: config.TestConfig{
+			TargetURL:    "https://example.com",
+			BlockPhrases: []string{"blocked"},
+			TimeoutRaw:   "5s",
+			Concurrency:  1,
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg.Validate: %v", err)
+	}
+
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	cfgSvc, err := config.NewService(cfgPath, cfg, nil)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+
+	bus := events.New()
+	defer bus.Close()
+
+	backend := &testPubBackend{}
+	pubSvc := publisher.NewService(cfgSvc, st, bus, backend)
+
+	sched := scheduler.New(cfg, st, bus)
+	sched.SetPublisher(pubSvc)
+
+	sched.SetRunnerForTest(func(ctx context.Context, cand parser.Candidate, tc *config.TestConfig, limiter *rate.Limiter) store.Result {
+		return store.Result{Link: cand.Link, Status: store.StatusPassed, TestedAt: time.Now()}
+	})
+
+	ctrl := scheduler.NewControlService(sched)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := ctrl.Start(ctx); err != nil {
+		t.Fatalf("ctrl.Start failed: %v", err)
+	}
+	defer func() { _ = ctrl.Stop() }()
+
+	// Wait for initial cycle to complete
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		backend.mu.Lock()
+		count := backend.publishCount
+		backend.mu.Unlock()
+		if count >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	backend.mu.Lock()
+	finalCount := backend.publishCount
+	backend.mu.Unlock()
+
+	if finalCount < 1 {
+		t.Fatalf("expected PublishingService to be called on cycle completion, got count %d", finalCount)
+	}
+
+	// Verify Store was not corrupted and has passed candidate
+	passing := st.Passing()
+	if len(passing) != 1 {
+		t.Errorf("expected 1 passing candidate in Store, got %d", len(passing))
+	}
+}
+
+func TestScheduler_DisabledPublishingHandledCleanly(t *testing.T) {
+	sourceSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("vless://user@host.com:443#node1\n"))
+	}))
+	defer sourceSrv.Close()
+
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+
+	pubCfg := config.PublishingConfig{
+		Enabled:    false, // Disabled publishing
+		Repository: tmpDir,
+		Branch:     "main",
+		RemoteURL:  "https://github.com/user/repo.git",
+	}
+
+	cfg := &config.Config{
+		Sources:          config.NewSources(sourceSrv.URL),
+		FetchIntervalRaw: "1h",
+		Publishing:       pubCfg,
+		Test: config.TestConfig{
+			TargetURL:    "https://example.com",
+			BlockPhrases: []string{"blocked"},
+			TimeoutRaw:   "5s",
+			Concurrency:  1,
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg.Validate: %v", err)
+	}
+
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	cfgSvc, err := config.NewService(cfgPath, cfg, nil)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+
+	bus := events.New()
+	defer bus.Close()
+
+	backend := &testPubBackend{}
+	pubSvc := publisher.NewService(cfgSvc, st, bus, backend)
+
+	sched := scheduler.New(cfg, st, bus)
+	sched.SetPublisher(pubSvc)
+
+	sched.SetRunnerForTest(func(ctx context.Context, cand parser.Candidate, tc *config.TestConfig, limiter *rate.Limiter) store.Result {
+		return store.Result{Link: cand.Link, Status: store.StatusPassed, TestedAt: time.Now()}
+	})
+
+	ctrl := scheduler.NewControlService(sched)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := ctrl.Start(ctx); err != nil {
+		t.Fatalf("ctrl.Start failed: %v", err)
+	}
+	defer func() { _ = ctrl.Stop() }()
+
+	// Wait for initial cycle to complete
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !ctrl.Status().CycleActive && len(st.Passing()) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	backend.mu.Lock()
+	backendCalls := backend.publishCount
+	backend.mu.Unlock()
+
+	// Backend publish must NOT be called when publishing is disabled
+	if backendCalls != 0 {
+		t.Errorf("expected backend publish not to be called when disabled, got %d", backendCalls)
+	}
+
+	// Store state is still correctly updated by the cycle
+	passing := st.Passing()
+	if len(passing) != 1 {
+		t.Errorf("expected 1 passing candidate in Store, got %d", len(passing))
+	}
+}
+
+func TestScheduler_NoConfigUpdatedFeedbackLoop(t *testing.T) {
+	sourceSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("vless://user@host.com:443#node1\n"))
+	}))
+	defer sourceSrv.Close()
+
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+
+	pubCfg := config.PublishingConfig{
+		Enabled:    false,
+		Repository: tmpDir,
+		Branch:     "main",
+		RemoteURL:  "https://github.com/user/repo.git",
+	}
+
+	cfg := &config.Config{
+		Sources:          config.NewSources(sourceSrv.URL),
+		FetchIntervalRaw: "1h",
+		Publishing:       pubCfg,
+		Test: config.TestConfig{
+			TargetURL:    "https://example.com",
+			BlockPhrases: []string{"blocked"},
+			TimeoutRaw:   "5s",
+			Concurrency:  1,
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg.Validate: %v", err)
+	}
+
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	bus := events.New()
+	defer bus.Close()
+
+	cfgSvc, err := config.NewService(cfgPath, cfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+
+	backend := &testPubBackend{}
+	pubSvc := publisher.NewService(cfgSvc, st, bus, backend)
+
+	initCfg := cfgSvc.Get()
+	sched := scheduler.New(&initCfg, st, bus)
+	sched.SetPublisher(pubSvc)
+	sched.SetRunnerForTest(func(ctx context.Context, cand parser.Candidate, tc *config.TestConfig, limiter *rate.Limiter) store.Result {
+		return store.Result{Link: cand.Link, Status: store.StatusPassed, TestedAt: time.Now()}
+	})
+
+	ctrl := scheduler.NewControlService(sched)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := ctrl.Start(ctx); err != nil {
+		t.Fatalf("ctrl.Start failed: %v", err)
+	}
+	defer func() { _ = ctrl.Stop() }()
+
+	subCh := bus.Subscribe(50)
+	defer bus.Unsubscribe(subCh)
+
+	// Mutate publishing configuration through ConfigService
+	err = cfgSvc.Update(func(c *config.Config) error {
+		c.Publishing.Branch = "staging-v2"
+		c.Publishing.Enabled = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("cfgSvc.Update failed: %v", err)
+	}
+
+	// 1. Initial ConfigUpdated event must be received
+	var cuReceived *config.ConfigUpdated
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case evt := <-subCh:
+			if cu, ok := evt.(config.ConfigUpdated); ok {
+				cuReceived = &cu
+				break
+			}
+		case <-time.After(10 * time.Millisecond):
+		}
+		if cuReceived != nil {
+			break
+		}
+	}
+	if cuReceived == nil {
+		t.Fatal("timed out waiting for initial ConfigUpdated event")
+	}
+
+	if cuReceived.New.Publishing.Branch != "staging-v2" {
+		t.Fatalf("expected ConfigUpdated event to contain branch staging-v2, got: %s", cuReceived.New.Publishing.Branch)
+	}
+
+	// 2. Wait deterministically for Scheduler to process the ConfigUpdated event
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if sched.Config().Publishing.Branch == "staging-v2" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if sched.Config().Publishing.Branch != "staging-v2" {
+		t.Fatalf("timed out waiting for Scheduler to update its internal config")
+	}
+
+	// 3. Publish a synchronization barrier to prove no recursive ConfigUpdated was emitted
+	type barrierEvent struct{}
+	bus.Publish(barrierEvent{})
+
+	var barrierReceived bool
+	barrierDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(barrierDeadline) {
+		select {
+		case evt := <-subCh:
+			switch e := evt.(type) {
+			case barrierEvent:
+				barrierReceived = true
+				break
+			case config.ConfigUpdated:
+				t.Fatalf("feedback loop detected: received extra ConfigUpdated event: %+v", e)
+			}
+		case <-time.After(10 * time.Millisecond):
+		}
+		if barrierReceived {
+			break
+		}
+	}
+	if !barrierReceived {
+		t.Fatal("timed out waiting for barrier event")
+	}
+
+	// 4. Verify PublishingService observes the new authoritative configuration directly
+	if pubSvc.Config().Branch != "staging-v2" || !pubSvc.Config().Enabled {
+		t.Fatalf("expected PublishingService.Config to reflect updated branch, got: %+v", pubSvc.Config())
+	}
+	if pubSvc.Status().Branch != "staging-v2" || !pubSvc.Status().Enabled {
+		t.Fatalf("expected PublishingService.Status to reflect updated branch, got: %+v", pubSvc.Status())
+	}
+
+	// 5. Verify backend synchronizes immediately before publication
+	if err := pubSvc.Publish(ctx); err != nil {
+		t.Fatalf("pubSvc.Publish failed: %v", err)
+	}
+	if backend.Config().Branch != "staging-v2" || !backend.Config().Enabled {
+		t.Fatalf("expected backend to be synchronized with authoritative config, got: %+v", backend.Config())
+	}
+}

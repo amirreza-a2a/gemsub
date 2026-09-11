@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -389,5 +390,76 @@ func TestProductionRuntime_SchedulerControlWiring(t *testing.T) {
 	// 5. Duplicate Stop idempotent
 	if err := rt.SchedulerCtrl.Stop(); err != nil {
 		t.Errorf("duplicate Stop returned error: %v", err)
+	}
+}
+
+func TestProductionRuntime_PublishingServiceWiring(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(""))
+	}))
+	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	pubRepo := filepath.Join(tmpDir, "pubrepo")
+	cfgPath := filepath.Join(tmpDir, "config.json")
+
+	cfg := &config.Config{
+		Headless:         true,
+		StateFile:        filepath.Join(tmpDir, "state.json"),
+		Sources:          config.NewSources(srv.URL),
+		FetchIntervalRaw: "1h",
+		Publishing: config.PublishingConfig{
+			Enabled:    false,
+			Repository: pubRepo,
+			Branch:     "main",
+			RemoteURL:  "https://ghp_testToken@github.com/user/repo.git",
+		},
+		Test: config.TestConfig{
+			TargetURL:    "https://example.com",
+			BlockPhrases: []string{"blocked"},
+			TimeoutRaw:   "5s",
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg.Validate: %v", err)
+	}
+
+	cfgSvc, err := config.NewService(cfgPath, cfg, nil)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	rt, cleanup := setupRuntime(cfg, &logBuf, cfgSvc)
+	defer cleanup()
+
+	if rt.PublishSvc == nil {
+		t.Fatal("expected rt.PublishSvc to be non-nil")
+	}
+
+	// 1. Initial config matches
+	c := rt.PublishSvc.Config()
+	if c.Repository != pubRepo || c.Branch != "main" {
+		t.Errorf("unexpected PublishSvc config: %+v", c)
+	}
+
+	// 2. Status hides credentials
+	st := rt.PublishSvc.Status()
+	if strings.Contains(st.RemoteURL, "ghp_testToken") {
+		t.Errorf("secret token leaked in Status.RemoteURL: %q", st.RemoteURL)
+	}
+	if st.RemoteURL != "https://***@github.com/user/repo.git" {
+		t.Errorf("expected masked RemoteURL, got: %q", st.RemoteURL)
+	}
+
+	// 3. Mutation propagates and persists via ConfigService
+	if err := rt.PublishSvc.SetBranch("release"); err != nil {
+		t.Fatalf("PublishSvc.SetBranch failed: %v", err)
+	}
+	if rt.PublishSvc.Config().Branch != "release" {
+		t.Errorf("expected Branch=release, got %s", rt.PublishSvc.Config().Branch)
+	}
+	if cfgSvc.Get().Publishing.Branch != "release" {
+		t.Errorf("expected ConfigService to reflect Branch=release, got %s", cfgSvc.Get().Publishing.Branch)
 	}
 }
