@@ -2786,3 +2786,161 @@ func TestAdapter_ConfigCenter_URLSanitizationAcrossAllCategories(t *testing.T) {
 		t.Errorf("Remote URL item not found in Publishing category")
 	}
 }
+
+func TestAdapter_SourceManagerOperations(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	bus := events.New()
+	defer bus.Close()
+
+	initialSources := []config.SourceItem{
+		{ID: "src-1", URL: "https://user:pass@sub1.example.com/feed", Name: "Source One", Enabled: true},
+		{ID: "src-2", URL: "https://sub2.example.com/feed", Name: "Source Two", Enabled: false},
+	}
+	cfg := config.Config{
+		FetchIntervalRaw: "10m",
+		Sources:          initialSources,
+		Test: config.TestConfig{
+			TimeoutRaw:  "12s",
+			Concurrency: 8,
+			Gemini: config.GeminiConfig{
+				BlockPhrases: []string{"blocked"},
+			},
+		},
+	}
+
+	cfgSvc, err := config.NewService(cfgPath, &cfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+	srcSvc := source.NewService(cfgSvc)
+
+	ad, _, _, _ := setupTestAdapter(t)
+	ad.SetServices(cfgSvc, srcSvc, nil, nil)
+
+	// 1. Check Sources in ConfigCenter
+	vm := ad.ConfigCenter()
+	srcCat := vm.Categories[viewmodel.CategorySources]
+	if len(srcCat.Sources) != 2 {
+		t.Fatalf("expected 2 sources in ConfigCenter, got %d", len(srcCat.Sources))
+	}
+	if srcCat.Sources[0].ID != "src-1" || !srcCat.Sources[0].Enabled || srcCat.Sources[0].Name != "Source One" {
+		t.Errorf("unexpected first source: %+v", srcCat.Sources[0])
+	}
+	if strings.Contains(srcCat.Sources[0].URL, "pass") {
+		t.Errorf("credentials leaked in SourceItemViewModel URL: %s", srcCat.Sources[0].URL)
+	}
+	if srcCat.Sources[1].ID != "src-2" || srcCat.Sources[1].Enabled || srcCat.Sources[1].Name != "Source Two" {
+		t.Errorf("unexpected second source: %+v", srcCat.Sources[1])
+	}
+
+	// 2. Toggle Source
+	if err := ad.ToggleSource("src-1"); err != nil {
+		t.Fatalf("ToggleSource(src-1): %v", err)
+	}
+	s1, err := srcSvc.Get("src-1")
+	if err != nil || s1.Enabled != false {
+		t.Fatalf("expected src-1 disabled in sourceSvc, got err=%v, enabled=%v", err, s1.Enabled)
+	}
+	vm = ad.ConfigCenter()
+	if vm.Categories[viewmodel.CategorySources].Sources[0].Enabled != false {
+		t.Errorf("expected ConfigCenter to reflect disabled src-1")
+	}
+
+	// 3. Add Source
+	if err := ad.AddSource("https://sub3.example.com/feed", "Source Three"); err != nil {
+		t.Fatalf("AddSource: %v", err)
+	}
+	vm = ad.ConfigCenter()
+	if len(vm.Categories[viewmodel.CategorySources].Sources) != 3 {
+		t.Fatalf("expected 3 sources after add, got %d", len(vm.Categories[viewmodel.CategorySources].Sources))
+	}
+
+	// Invalid URL should fail
+	if err := ad.AddSource("ftp://invalid-scheme.com", "Bad"); err == nil {
+		t.Error("expected error adding ftp URL, got nil")
+	}
+
+	// 4. Update Source (update name and retain sanitized credentials)
+	if err := ad.UpdateSource("src-1", "https://***@sub1.example.com/feed", "Updated Source One"); err != nil {
+		t.Fatalf("UpdateSource: %v", err)
+	}
+	s1, err = srcSvc.Get("src-1")
+	if err != nil {
+		t.Fatalf("Get(src-1): %v", err)
+	}
+	if s1.Name != "Updated Source One" {
+		t.Errorf("expected name 'Updated Source One', got %q", s1.Name)
+	}
+	if s1.URL != "https://user:pass@sub1.example.com/feed" {
+		t.Errorf("original credentials lost on update with sanitized URL: got %q", s1.URL)
+	}
+
+	// 5. Delete Source
+	if err := ad.DeleteSource("src-2"); err != nil {
+		t.Fatalf("DeleteSource(src-2): %v", err)
+	}
+	if err := ad.DeleteSource("src-1"); err != nil {
+		t.Fatalf("DeleteSource(src-1): %v", err)
+	}
+	// Deleting the last remaining source should fail
+	lastSrcs := srcSvc.List()
+	if len(lastSrcs) != 1 {
+		t.Fatalf("expected 1 source remaining, got %d", len(lastSrcs))
+	}
+	if err := ad.DeleteSource(lastSrcs[0].ID); err == nil {
+		t.Error("expected error deleting last source, got nil")
+	}
+}
+
+func TestAdapter_SourceItemViewModel_TelemetrySemantics(t *testing.T) {
+	// Telemetry verification for Issue #17:
+	// Issue #17 specifies telemetry is displayed "if known".
+	// The current scheduler and store pipeline tracks only aggregate cycle metrics,
+	// not per-source attribution. This test proves that the Adapter produces
+	// HasCount=false and StatusMsg="" without fabricating speculative telemetry.
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	bus := events.New()
+	defer bus.Close()
+
+	cfg := config.Config{
+		FetchIntervalRaw: "10m",
+		Sources: []config.SourceItem{
+			{ID: "src-1", URL: "https://example.com/feed1", Name: "Source 1", Enabled: true},
+		},
+		Test: config.TestConfig{
+			TimeoutRaw:  "10s",
+			Concurrency: 5,
+			Gemini: config.GeminiConfig{
+				BlockPhrases: []string{"blocked"},
+			},
+		},
+	}
+
+	cfgSvc, err := config.NewService(cfgPath, &cfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+	srcSvc := source.NewService(cfgSvc)
+
+	ad, _, _, _ := setupTestAdapter(t)
+	ad.SetServices(cfgSvc, srcSvc, nil, nil)
+
+	vm := ad.ConfigCenter()
+	srcCat := vm.Categories[viewmodel.CategorySources]
+	if len(srcCat.Sources) != 1 {
+		t.Fatalf("expected 1 source, got %d", len(srcCat.Sources))
+	}
+
+	s := srcCat.Sources[0]
+	if s.HasCount {
+		t.Errorf("expected HasCount=false in current architecture, got true")
+	}
+	if s.CandidateCount != 0 {
+		t.Errorf("expected CandidateCount=0 when unmeasured, got %d", s.CandidateCount)
+	}
+	if s.StatusMsg != "" {
+		t.Errorf("expected StatusMsg=\"\" when unmeasured, got %q", s.StatusMsg)
+	}
+}

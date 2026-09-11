@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -1298,6 +1299,22 @@ func (c *testDecoupledController) ConfigCenter() viewmodel.ConfigCenterViewModel
 	return c.configCenter
 }
 
+func (c *testDecoupledController) ToggleSource(id string) error {
+	return nil
+}
+
+func (c *testDecoupledController) AddSource(rawURL string, name string) error {
+	return nil
+}
+
+func (c *testDecoupledController) UpdateSource(id string, rawURL string, name string) error {
+	return nil
+}
+
+func (c *testDecoupledController) DeleteSource(id string) error {
+	return nil
+}
+
 func TestModel_ConfigCenterDecoupledController(t *testing.T) {
 	mock := &testDecoupledController{
 		configCenter: viewmodel.ConfigCenterViewModel{
@@ -1494,5 +1511,867 @@ func TestModel_ConfigCenter_LiveRefreshWhileInViewConfig(t *testing.T) {
 	}
 	if strings.Contains(pubView3, "secretToken") {
 		t.Errorf("CRITICAL: secretToken leaked in failure message: %s", pubView3)
+	}
+}
+
+type testSourceMockController struct {
+	testDecoupledController
+	sources []viewmodel.SourceItemViewModel
+
+	toggledID   string
+	addedURL    string
+	addedName   string
+	updatedID   string
+	updatedURL  string
+	updatedName string
+	deletedID   string
+
+	toggleErr error
+	addErr    error
+	updateErr error
+	deleteErr error
+}
+
+func newTestSourceMockController() *testSourceMockController {
+	c := &testSourceMockController{
+		sources: []viewmodel.SourceItemViewModel{
+			{ID: "src-1", Name: "Primary Feed", URL: "https://sub1.example.com/feed", Enabled: true, CandidateCount: 15, HasCount: true},
+			{ID: "src-2", Name: "Backup Feed", URL: "https://sub2.example.com/feed", Enabled: false, CandidateCount: 0, HasCount: false},
+		},
+	}
+	c.syncConfigCenter()
+	return c
+}
+
+func (c *testSourceMockController) syncConfigCenter() {
+	c.configCenter = viewmodel.ConfigCenterViewModel{
+		Categories: []viewmodel.ConfigCategoryViewModel{
+			{Category: viewmodel.CategoryGeneral, Name: "General"},
+			{Category: viewmodel.CategorySources, Name: "Sources", Sources: c.sources},
+			{Category: viewmodel.CategoryTesting, Name: "Testing"},
+			{Category: viewmodel.CategoryGemini, Name: "Gemini"},
+			{Category: viewmodel.CategoryScheduler, Name: "Scheduler"},
+			{Category: viewmodel.CategoryPublishing, Name: "Publishing"},
+		},
+	}
+}
+
+func (c *testSourceMockController) ConfigCenter() viewmodel.ConfigCenterViewModel {
+	return c.configCenter
+}
+
+func (c *testSourceMockController) ToggleSource(id string) error {
+	c.toggledID = id
+	if c.toggleErr != nil {
+		return c.toggleErr
+	}
+	for i := range c.sources {
+		if c.sources[i].ID == id {
+			c.sources[i].Enabled = !c.sources[i].Enabled
+			break
+		}
+	}
+	c.syncConfigCenter()
+	return nil
+}
+
+func (c *testSourceMockController) AddSource(rawURL string, name string) error {
+	c.addedURL = rawURL
+	c.addedName = name
+	if c.addErr != nil {
+		return c.addErr
+	}
+	c.sources = append(c.sources, viewmodel.SourceItemViewModel{
+		ID:      fmt.Sprintf("src-%d", len(c.sources)+1),
+		Name:    name,
+		URL:     rawURL,
+		Enabled: true,
+	})
+	c.syncConfigCenter()
+	return nil
+}
+
+func (c *testSourceMockController) UpdateSource(id string, rawURL string, name string) error {
+	c.updatedID = id
+	c.updatedURL = rawURL
+	c.updatedName = name
+	if c.updateErr != nil {
+		return c.updateErr
+	}
+	for i := range c.sources {
+		if c.sources[i].ID == id {
+			if rawURL != "" {
+				c.sources[i].URL = rawURL
+			}
+			if name != "" {
+				c.sources[i].Name = name
+			}
+			break
+		}
+	}
+	c.syncConfigCenter()
+	return nil
+}
+
+func (c *testSourceMockController) DeleteSource(id string) error {
+	c.deletedID = id
+	if c.deleteErr != nil {
+		return c.deleteErr
+	}
+	for i := range c.sources {
+		if c.sources[i].ID == id {
+			c.sources = append(c.sources[:i], c.sources[i+1:]...)
+			break
+		}
+	}
+	c.syncConfigCenter()
+	return nil
+}
+
+func TestModel_SourceManager_ListRenderingAndNavigation(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// Navigate to Sources category (tab from General)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+
+	view := m.View()
+
+	// Verify badges, names, URLs, and telemetry
+	if !strings.Contains(view, "[ENABLED]") {
+		t.Errorf("expected view to contain [ENABLED] badge, got:\n%s", view)
+	}
+	if !strings.Contains(view, "[DISABLED]") {
+		t.Errorf("expected view to contain [DISABLED] badge, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Primary Feed") {
+		t.Errorf("expected view to contain 'Primary Feed', got:\n%s", view)
+	}
+	if !strings.Contains(view, "Backup Feed") {
+		t.Errorf("expected view to contain 'Backup Feed', got:\n%s", view)
+	}
+	if !strings.Contains(view, "https://sub1.example.com/feed") {
+		t.Errorf("expected view to contain 'https://sub1.example.com/feed', got:\n%s", view)
+	}
+	// Telemetry candidate count
+	if !strings.Contains(view, "15") {
+		t.Errorf("expected view to contain telemetry count '15', got:\n%s", view)
+	}
+
+	// Verify footer hints for sources
+	if !strings.Contains(view, "Toggle") || !strings.Contains(view, "Add") || !strings.Contains(view, "Delete") {
+		t.Errorf("expected footer to show source management controls, got:\n%s", view)
+	}
+}
+
+func TestModel_SourceManager_ToggleSource(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center and navigate to Sources
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+
+	// Press Space to toggle Primary Feed (src-1) from enabled to disabled
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(*tui.Model)
+
+	if mock.toggledID != "src-1" {
+		t.Fatalf("expected ToggleSource called with src-1, got %q", mock.toggledID)
+	}
+	if mock.sources[0].Enabled != false {
+		t.Errorf("expected src-1 to be disabled in mock")
+	}
+
+	view := m.View()
+	if strings.Contains(view, "Source disabled") == false && strings.Contains(view, "disabled") == false {
+		t.Errorf("expected status or view to reflect disabled state, got:\n%s", view)
+	}
+}
+
+func TestModel_SourceManager_DeleteSource(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center and navigate to Sources
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+
+	// Press 'd' to delete selected source (src-1)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	m = updated.(*tui.Model)
+
+	// Should prompt for confirmation, NOT delete yet
+	if mock.deletedID != "" {
+		t.Fatalf("DeleteSource was called without confirmation")
+	}
+	view := m.View()
+	if !strings.Contains(view, "confirm") && !strings.Contains(view, "y") {
+		t.Errorf("expected confirmation prompt for deletion, got:\n%s", view)
+	}
+
+	// Press 'n' to cancel
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	m = updated.(*tui.Model)
+	if mock.deletedID != "" {
+		t.Fatalf("DeleteSource called despite cancellation")
+	}
+
+	// Press 'd' again, then 'y' to confirm
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = updated.(*tui.Model)
+
+	if mock.deletedID != "src-1" {
+		t.Fatalf("expected DeleteSource called with src-1, got %q", mock.deletedID)
+	}
+	if len(mock.sources) != 1 {
+		t.Errorf("expected 1 source remaining, got %d", len(mock.sources))
+	}
+}
+
+func TestModel_SourceManager_AddSource(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center and navigate to Sources
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+
+	// Press 'a' to enter Add mode
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	m = updated.(*tui.Model)
+
+	// View should show Add Source prompt
+	view := m.View()
+	if !strings.Contains(view, "URL") && !strings.Contains(view, "Add") {
+		t.Errorf("expected Add Source form/prompt in view, got:\n%s", view)
+	}
+
+	// Type URL
+	for _, r := range "https://new.example.com/sub" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(*tui.Model)
+	}
+
+	// Press Tab to switch to Name field
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+
+	// Type Name
+	for _, r := range "Tertiary Feed" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(*tui.Model)
+	}
+
+	// Press Enter to submit
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	if mock.addedURL != "https://new.example.com/sub" {
+		t.Errorf("expected addedURL 'https://new.example.com/sub', got %q", mock.addedURL)
+	}
+	if mock.addedName != "Tertiary Feed" {
+		t.Errorf("expected addedName 'Tertiary Feed', got %q", mock.addedName)
+	}
+	if len(mock.sources) != 3 {
+		t.Errorf("expected 3 sources, got %d", len(mock.sources))
+	}
+}
+
+func TestModel_SourceManager_EditSource(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center and navigate to Sources
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+
+	// Press Enter to edit selected source (src-1)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	view := m.View()
+	if !strings.Contains(view, "Edit") && !strings.Contains(view, "Primary Feed") {
+		t.Errorf("expected Edit Source form in view, got:\n%s", view)
+	}
+
+	// Switch to Name field
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+
+	// Backspace to clear and type new name
+	for i := 0; i < 20; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(*tui.Model)
+	}
+	for _, r := range "Renamed Feed" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(*tui.Model)
+	}
+
+	// Press Enter to save
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	if mock.updatedID != "src-1" {
+		t.Errorf("expected updatedID 'src-1', got %q", mock.updatedID)
+	}
+	if mock.updatedName != "Renamed Feed" {
+		t.Errorf("expected updatedName 'Renamed Feed', got %q", mock.updatedName)
+	}
+}
+
+func TestModel_SourceManager_ErrorFeedback(t *testing.T) {
+	mock := newTestSourceMockController()
+	mock.addErr = fmt.Errorf("duplicate source URL")
+	m := tui.New(mock)
+
+	// Enter Config Center and navigate to Sources
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+
+	// Press 'a' to add
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	m = updated.(*tui.Model)
+
+	// Type URL and submit
+	for _, r := range "https://dup.com" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(*tui.Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	view := m.View()
+	if !strings.Contains(view, "duplicate source URL") {
+		t.Errorf("expected error feedback 'duplicate source URL' in view, got:\n%s", view)
+	}
+}
+
+func TestModel_SourceManager_EdgeCases(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center and navigate to Sources
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+
+	// 1. Toggle with 'e'
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	m = updated.(*tui.Model)
+	if mock.toggledID != "src-1" {
+		t.Errorf("expected toggle with 'e' key to toggle src-1, got %q", mock.toggledID)
+	}
+
+	// 2. Delete with 'x' then cancel
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m = updated.(*tui.Model)
+	view := m.View()
+	if !strings.Contains(view, "Delete source") {
+		t.Errorf("expected delete prompt with 'x' key, got:\n%s", view)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(*tui.Model)
+	view = m.View()
+	if strings.Contains(view, "Delete source") {
+		t.Errorf("expected delete prompt to be dismissed on Esc")
+	}
+
+	// 3. Add mode: empty URL submission
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+	view = m.View()
+	if !strings.Contains(view, "URL cannot be empty") {
+		t.Errorf("expected empty URL validation error, got:\n%s", view)
+	}
+
+	// 4. Add mode: Esc cancels
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(*tui.Model)
+	view = m.View()
+	if strings.Contains(view, "Add Subscription Source") {
+		t.Errorf("expected Add prompt dismissed on Esc")
+	}
+
+	// 5. Edit mode: Esc cancels
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+	view = m.View()
+	if !strings.Contains(view, "Edit Subscription Source") {
+		t.Errorf("expected Edit prompt on Enter, got:\n%s", view)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(*tui.Model)
+	view = m.View()
+	if strings.Contains(view, "Edit Subscription Source") {
+		t.Errorf("expected Edit prompt dismissed on Esc")
+	}
+
+	// 6. Navigation: j, k, g, G
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	m = updated.(*tui.Model)
+
+	// 7. Terminal bounds test: 80x24
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = updated.(*tui.Model)
+	view = m.View()
+	lines := strings.Split(view, "\n")
+	if len(lines) > 24 {
+		t.Errorf("expected at most 24 lines in 80x24 terminal, got %d", len(lines))
+	}
+}
+
+func TestModel_SourceManager_InputFocusNavigation(t *testing.T) {
+	modes := []struct {
+		name      string
+		enterKey  tea.KeyMsg
+		promptKey string
+	}{
+		{
+			name:      "AddMode",
+			enterKey:  tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")},
+			promptKey: "Add Subscription Source",
+		},
+		{
+			name:      "EditMode",
+			enterKey:  tea.KeyMsg{Type: tea.KeyEnter},
+			promptKey: "Edit Subscription Source",
+		},
+	}
+
+	for _, tc := range modes {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newTestSourceMockController()
+			m := tui.New(mock)
+
+			// Enter Config Center and navigate to Sources category
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+			m = updated.(*tui.Model)
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+			m = updated.(*tui.Model)
+
+			// Enter mode (Add or Edit)
+			updated, _ = m.Update(tc.enterKey)
+			m = updated.(*tui.Model)
+
+			// Step 1: Start on URL (focus 0)
+			if focus := m.SourceInputFocusForTest(); focus != 0 {
+				t.Fatalf("step 1: expected initial focus 0 (URL), got %d", focus)
+			}
+			view := stripANSI(m.View())
+			if !strings.Contains(view, "> URL:") || strings.Contains(view, "> Name:") {
+				t.Errorf("step 1: expected focus indicator on URL, got:\n%s", view)
+			}
+
+			// Step 2: Tab -> Name (focus 1)
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+			m = updated.(*tui.Model)
+			if focus := m.SourceInputFocusForTest(); focus != 1 {
+				t.Fatalf("step 2 (Tab): expected focus 1 (Name), got %d", focus)
+			}
+			view = stripANSI(m.View())
+			if !strings.Contains(view, "> Name:") || strings.Contains(view, "> URL:") {
+				t.Errorf("step 2: expected focus indicator on Name, got:\n%s", view)
+			}
+
+			// Step 3: Shift+Tab -> URL (focus 0)
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+			m = updated.(*tui.Model)
+			if focus := m.SourceInputFocusForTest(); focus != 0 {
+				t.Fatalf("step 3 (Shift+Tab): expected focus 0 (URL), got %d", focus)
+			}
+			view = stripANSI(m.View())
+			if !strings.Contains(view, "> URL:") || strings.Contains(view, "> Name:") {
+				t.Errorf("step 3: expected focus indicator on URL, got:\n%s", view)
+			}
+
+			// Step 4: Tab -> Name (focus 1)
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+			m = updated.(*tui.Model)
+			if focus := m.SourceInputFocusForTest(); focus != 1 {
+				t.Fatalf("step 4 (Tab): expected focus 1 (Name), got %d", focus)
+			}
+			view = stripANSI(m.View())
+			if !strings.Contains(view, "> Name:") || strings.Contains(view, "> URL:") {
+				t.Errorf("step 4: expected focus indicator on Name, got:\n%s", view)
+			}
+
+			// Step 5: Up -> URL (focus 0)
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+			m = updated.(*tui.Model)
+			if focus := m.SourceInputFocusForTest(); focus != 0 {
+				t.Fatalf("step 5 (Up): expected focus 0 (URL), got %d", focus)
+			}
+			view = stripANSI(m.View())
+			if !strings.Contains(view, "> URL:") || strings.Contains(view, "> Name:") {
+				t.Errorf("step 5: expected focus indicator on URL, got:\n%s", view)
+			}
+
+			// Step 6: Down -> Name (focus 1)
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+			m = updated.(*tui.Model)
+			if focus := m.SourceInputFocusForTest(); focus != 1 {
+				t.Fatalf("step 6 (Down): expected focus 1 (Name), got %d", focus)
+			}
+			view = stripANSI(m.View())
+			if !strings.Contains(view, "> Name:") || strings.Contains(view, "> URL:") {
+				t.Errorf("step 6: expected focus indicator on Name, got:\n%s", view)
+			}
+
+			// Step 7: Up -> URL (focus 0)
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+			m = updated.(*tui.Model)
+			if focus := m.SourceInputFocusForTest(); focus != 0 {
+				t.Fatalf("step 7 (Up): expected focus 0 (URL), got %d", focus)
+			}
+
+			// Step 8: Up from URL -> Name (focus 1, modulo-safe reverse wrap)
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+			m = updated.(*tui.Model)
+			if focus := m.SourceInputFocusForTest(); focus != 1 {
+				t.Fatalf("step 8 (Up wrap): expected focus 1 (Name), got %d", focus)
+			}
+
+			// Step 9: Shift+Tab -> URL (focus 0)
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+			m = updated.(*tui.Model)
+			if focus := m.SourceInputFocusForTest(); focus != 0 {
+				t.Fatalf("step 9 (Shift+Tab): expected focus 0 (URL), got %d", focus)
+			}
+
+			// Step 10: Shift+Tab from URL -> Name (focus 1, modulo-safe reverse wrap)
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+			m = updated.(*tui.Model)
+			if focus := m.SourceInputFocusForTest(); focus != 1 {
+				t.Fatalf("step 10 (Shift+Tab wrap): expected focus 1 (Name), got %d", focus)
+			}
+		})
+	}
+}
+
+func TestModel_Footer_TerminalWidthSafeTruncation_UnicodeAndANSI(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Set status message containing multi-byte Unicode runes and emojis
+	unicodeStatus := "Status: 🚀 Привет سلام دنیا 世界 🎉"
+	m.SetStatusMessageForTest(unicodeStatus)
+
+	testWidths := []int{-10, 0, 1, 2, 5, 8, 12, 17, 25, 30, 40, 55, 80, 100, 140}
+
+	for _, w := range testWidths {
+		t.Run(fmt.Sprintf("Width_%d", w), func(t *testing.T) {
+			m.SetWidthForTest(w)
+			footer := m.RenderFooterForTest()
+
+			// 1. Never panic on negative or zero widths; output must be empty if w <= 0
+			if w <= 0 {
+				if footer != "" {
+					t.Errorf("expected empty string for width %d, got %q", w, footer)
+				}
+				return
+			}
+
+			// 2. Output must remain valid UTF-8
+			if !utf8.ValidString(footer) {
+				t.Fatalf("width %d: footer contains invalid UTF-8 bytes: %q", w, footer)
+			}
+
+			// 3. Rendered terminal display width must never exceed w
+			dispWidth := lipgloss.Width(footer)
+			if dispWidth > w {
+				t.Errorf("width %d: rendered footer display width %d exceeds terminal width", w, dispWidth)
+			}
+
+			// 4. No malformed/truncated ANSI sequence (stripping valid ANSI leaves NO raw '\x1b')
+			stripped := stripANSI(footer)
+			if strings.Contains(stripped, "\x1b") {
+				t.Errorf("width %d: truncated footer contains dangling/malformed ANSI escape byte: %q", w, footer)
+			}
+		})
+	}
+}
+
+func TestModel_SourceManager_UnicodeAndWidthSafety(t *testing.T) {
+	mock := newTestSourceMockController()
+	// Populate sources with diverse Unicode, wide CJK characters, emojis, and long URLs
+	mock.sources = []viewmodel.SourceItemViewModel{
+		{
+			ID:             "src-fa",
+			Name:           "کانال تست پروکسی 🌐",
+			URL:            "https://example.com/کانال/feed?token=xyz",
+			Enabled:        true,
+			CandidateCount: 12,
+			HasCount:       true,
+		},
+		{
+			ID:             "src-ru",
+			Name:           "Тестовый канал подписки",
+			URL:            "https://ru.example.com/sub/тест",
+			Enabled:        false,
+			CandidateCount: 0,
+			HasCount:       false,
+		},
+		{
+			ID:             "src-cjk",
+			Name:           "订阅源中文测试 🚀",
+			URL:            "https://cjk.example.com/sub/测试?param=1",
+			Enabled:        true,
+			CandidateCount: 5,
+			HasCount:       true,
+		},
+		{
+			ID:             "src-long",
+			Name:           "Super Long Source Name That Definitely Exceeds The Maximum Column Width Of Twenty Cells",
+			URL:            "https://extremely-long-domain-name.example.com/very/long/path/with/lots/of/parameters?token=1234567890&user=abcdefghij&format=json",
+			Enabled:        true,
+			CandidateCount: 99,
+			HasCount:       true,
+		},
+	}
+	mock.syncConfigCenter()
+
+	widths := []int{40, 50, 60, 72, 80, 100, 120}
+
+	for _, w := range widths {
+		t.Run(fmt.Sprintf("Width_%d", w), func(t *testing.T) {
+			m := tui.New(mock)
+			m.SetWidthForTest(w)
+
+			// Navigate to Config Center -> Sources
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+			m = updated.(*tui.Model)
+			m.SetWidthForTest(w)
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+			m = updated.(*tui.Model)
+			m.SetWidthForTest(w)
+
+			// Render source manager list
+			rendered := m.RenderSourceManagerForTest()
+
+			// 1. Output must remain valid UTF-8
+			if !utf8.ValidString(rendered) {
+				t.Fatalf("width %d: rendered source manager contains invalid UTF-8 bytes", w)
+			}
+
+			// 2. Output must not have malformed/dangling ANSI escapes
+			stripped := stripANSI(rendered)
+			if strings.Contains(stripped, "\x1b") {
+				t.Errorf("width %d: rendered source manager contains dangling ANSI escape: %q", w, rendered)
+			}
+
+			// 3. Every individual line must not exceed terminal width
+			lines := strings.Split(rendered, "\n")
+			for lineIdx, line := range lines {
+				if line == "" {
+					continue
+				}
+				lineWidth := lipgloss.Width(line)
+				if lineWidth > w {
+					t.Errorf("width %d: line %d visual width %d exceeds terminal width %d: %q",
+						w, lineIdx+1, lineWidth, w, line)
+				}
+			}
+
+			// 4. Test delete confirm prompt with long Unicode name
+			m.SetSourceModeForTest(tui.SourceModeDeleteConfirm)
+			m.SetConfirmDeleteNameForTest("کانال تست فوق‌العاده طولانی برای بررسی محدودیت عرض ترمینال")
+			delRendered := m.RenderSourceManagerForTest()
+			if !utf8.ValidString(delRendered) {
+				t.Fatalf("width %d: delete confirm contains invalid UTF-8 bytes", w)
+			}
+			delLines := strings.Split(delRendered, "\n")
+			for lineIdx, line := range delLines {
+				if line == "" {
+					continue
+				}
+				lineWidth := lipgloss.Width(line)
+				if lineWidth > w {
+					t.Errorf("width %d: delete confirm line %d visual width %d exceeds terminal width %d: %q",
+						w, lineIdx+1, lineWidth, w, line)
+				}
+			}
+		})
+	}
+}
+
+func TestModel_SourceManager_Modal_UnicodeAndBorders(t *testing.T) {
+	mock := newTestSourceMockController()
+
+	testCases := []struct {
+		name       string
+		mode       int
+		url        string
+		inputName  string
+		focus      int
+		termWidths []int
+	}{
+		{
+			name:       "Add_Unicode_Persian_CJK_FocusedURL",
+			mode:       tui.SourceModeAdd,
+			url:        "https://example.com/کانال/feed_🚀",
+			inputName:  "کانال فارسی 🇮🇷",
+			focus:      0,
+			termWidths: []int{40, 50, 72, 80, 100},
+		},
+		{
+			name:       "Add_EmptyName_OptionalANSI_FocusedName",
+			mode:       tui.SourceModeAdd,
+			url:        "https://example.com/sub",
+			inputName:  "",
+			focus:      1,
+			termWidths: []int{40, 50, 72, 80, 100},
+		},
+		{
+			name:       "Edit_VeryLongValues",
+			mode:       tui.SourceModeEdit,
+			url:        "https://extremely-long-domain-name.example.com/very/long/path/with/lots/of/parameters?token=1234567890&user=abcdefghij&format=json&extra=long",
+			inputName:  "Super Long Source Name That Exceeds Modal Field Width By A Significant Margin",
+			focus:      0,
+			termWidths: []int{40, 50, 72, 80, 100},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, w := range tc.termWidths {
+				t.Run(fmt.Sprintf("Width_%d", w), func(t *testing.T) {
+					m := tui.New(mock)
+					m.SetWidthForTest(w)
+					m.SetSourceModeForTest(tc.mode)
+					m.SetSourceInputFocusForTest(tc.focus)
+					m.SetSourceInputURLForTest(tc.url)
+					m.SetSourceInputNameForTest(tc.inputName)
+
+					rendered := m.RenderSourceManagerForTest()
+
+					// 1. Output must be valid UTF-8
+					if !utf8.ValidString(rendered) {
+						t.Fatalf("width %d: modal contains invalid UTF-8 bytes", w)
+					}
+
+					// 2. Output must not have malformed ANSI escape sequences
+					stripped := stripANSI(rendered)
+					if strings.Contains(stripped, "\x1b") {
+						t.Errorf("width %d: modal contains dangling ANSI escape: %q", w, rendered)
+					}
+
+					// 3. Check border alignment:
+					// All non-empty lines of the modal box must have the exact same visual cell width!
+					lines := strings.Split(strings.TrimRight(rendered, "\n"), "\n")
+					if len(lines) != 6 {
+						t.Fatalf("width %d: expected 6 modal lines, got %d:\n%s", w, len(lines), rendered)
+					}
+
+					expectedWidth := lipgloss.Width(lines[0])
+					for idx, line := range lines {
+						lineWidth := lipgloss.Width(line)
+						if lineWidth != expectedWidth {
+							t.Errorf("width %d: modal line %d visual width %d != top bar width %d:\nLine: %q",
+								w, idx+1, lineWidth, expectedWidth, line)
+						}
+						// Ensure it does not exceed terminal width
+						if lineWidth > w {
+							t.Errorf("width %d: modal line %d visual width %d exceeds terminal width %d",
+								w, idx+1, lineWidth, w)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestModel_SourceManager_Backspace_UTF8Safety(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center and open Add modal ('a')
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	m = updated.(*tui.Model)
+
+	// Set multi-byte Persian string in URL: "سلام" (4 runes, 8 bytes: \xd8\xb3 \xd9\x84 \xd8\xa7 \xd9\x85)
+	m.SetSourceInputURLForTest("سلام")
+
+	// Backspace once -> should be "سلا" (3 runes, 6 bytes), never corrupted half-rune
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	m = updated.(*tui.Model)
+	if url := m.SourceInputURLForTest(); url != "سلا" {
+		t.Fatalf("expected 'سلا', got %q", url)
+	}
+	if !utf8.ValidString(m.SourceInputURLForTest()) {
+		t.Fatalf("URL contains invalid UTF-8 after backspace")
+	}
+
+	// Backspace until empty
+	for i := 0; i < 5; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(*tui.Model)
+	}
+	if url := m.SourceInputURLForTest(); url != "" {
+		t.Fatalf("expected empty URL, got %q", url)
+	}
+
+	// Switch focus to Name
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(*tui.Model)
+
+	// Set CJK string: "测试" (2 runes, 6 bytes)
+	m.SetSourceInputNameForTest("测试")
+
+	// Backspace once -> should be "测" (1 rune, 3 bytes)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	m = updated.(*tui.Model)
+	if name := m.SourceInputNameForTest(); name != "测" {
+		t.Fatalf("expected '测', got %q", name)
+	}
+	if !utf8.ValidString(m.SourceInputNameForTest()) {
+		t.Fatalf("Name contains invalid UTF-8 after backspace")
+	}
+
+	// Backspace again -> empty
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	m = updated.(*tui.Model)
+	if name := m.SourceInputNameForTest(); name != "" {
+		t.Fatalf("expected empty Name, got %q", name)
+	}
+
+	// Set emoji: "🚀" (1 rune, 4 bytes)
+	m.SetSourceInputNameForTest("🚀")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	m = updated.(*tui.Model)
+	if name := m.SourceInputNameForTest(); name != "" {
+		t.Fatalf("expected empty Name after deleting emoji, got %q", name)
 	}
 }

@@ -1010,6 +1010,7 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 		sources = cfg.Sources
 	}
 	var sourceItems []viewmodel.ConfigItemViewModel
+	var sourceVMs []viewmodel.SourceItemViewModel
 	if len(sources) == 0 {
 		sourceItems = append(sourceItems, viewmodel.ConfigItemViewModel{
 			Label: "Status",
@@ -1029,9 +1030,27 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 			if name == "" {
 				name = fmt.Sprintf("Source #%d", i+1)
 			}
+			sanURL := publisher.SanitizeURL(src.URL)
 			sourceItems = append(sourceItems, viewmodel.ConfigItemViewModel{
 				Label: name,
-				Value: fmt.Sprintf("[%s] %s", state, publisher.SanitizeURL(src.URL)),
+				Value: fmt.Sprintf("[%s] %s", state, sanURL),
+			})
+			// Telemetry semantics (Issue #17):
+			// SourceItemViewModel defines CandidateCount, HasCount, and StatusMsg for
+			// presentation "if known". The current Scheduler, EventBus, and Store pipeline
+			// tracks only aggregate cycle metrics (events.CycleFinished, events.CandidatesLoaded)
+			// without authoritative per-source candidate attribution or fetch error history.
+			// In accordance with repository boundaries prohibiting speculative state in presentation
+			// layers, HasCount remains false and StatusMsg remains "" until an authoritative
+			// per-source telemetry seam is scoped and implemented.
+			sourceVMs = append(sourceVMs, viewmodel.SourceItemViewModel{
+				ID:             src.ID,
+				Name:           name,
+				URL:            sanURL,
+				Enabled:        src.Enabled,
+				CandidateCount: 0,
+				HasCount:       false,
+				StatusMsg:      "",
 			})
 		}
 	}
@@ -1039,6 +1058,7 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 		Category: viewmodel.CategorySources,
 		Name:     viewmodel.CategorySources.Name(),
 		Items:    sourceItems,
+		Sources:  sourceVMs,
 	}
 
 	// 3. Testing Category
@@ -1220,4 +1240,82 @@ func valueOrFallback(val, fallback string) string {
 		return fallback
 	}
 	return val
+}
+
+// ToggleSource flips the enabled state of the specified source via SourceService.
+func (a *Adapter) ToggleSource(id string) error {
+	a.mu.RLock()
+	srcSvc := a.sourceSvc
+	a.mu.RUnlock()
+	if srcSvc == nil {
+		return fmt.Errorf("source service unavailable")
+	}
+
+	item, err := srcSvc.Get(id)
+	if err != nil {
+		return err
+	}
+	if err := srcSvc.SetEnabled(id, !item.Enabled); err != nil {
+		return err
+	}
+	atomic.StoreInt32(&a.dirty, 1)
+	return nil
+}
+
+// AddSource adds a new subscription source via SourceService.
+func (a *Adapter) AddSource(rawURL string, name string) error {
+	a.mu.RLock()
+	srcSvc := a.sourceSvc
+	a.mu.RUnlock()
+	if srcSvc == nil {
+		return fmt.Errorf("source service unavailable")
+	}
+
+	if _, err := srcSvc.AddURL(rawURL, name); err != nil {
+		return err
+	}
+	atomic.StoreInt32(&a.dirty, 1)
+	return nil
+}
+
+// UpdateSource mutates an existing source's alias and/or URL via SourceService.
+// If rawURL matches the existing sanitized URL, existing credentials are preserved.
+func (a *Adapter) UpdateSource(id string, rawURL string, name string) error {
+	a.mu.RLock()
+	srcSvc := a.sourceSvc
+	a.mu.RUnlock()
+	if srcSvc == nil {
+		return fmt.Errorf("source service unavailable")
+	}
+
+	_, err := srcSvc.Update(id, func(item *source.SourceItem) error {
+		if rawURL != "" && rawURL != item.URL && rawURL != publisher.SanitizeURL(item.URL) {
+			item.URL = rawURL
+		}
+		if name != "" {
+			item.Name = name
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	atomic.StoreInt32(&a.dirty, 1)
+	return nil
+}
+
+// DeleteSource deletes a subscription source by ID via SourceService.
+func (a *Adapter) DeleteSource(id string) error {
+	a.mu.RLock()
+	srcSvc := a.sourceSvc
+	a.mu.RUnlock()
+	if srcSvc == nil {
+		return fmt.Errorf("source service unavailable")
+	}
+
+	if err := srcSvc.Remove(id); err != nil {
+		return err
+	}
+	atomic.StoreInt32(&a.dirty, 1)
+	return nil
 }

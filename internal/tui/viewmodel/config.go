@@ -42,14 +42,36 @@ type ConfigItemViewModel struct {
 	Value string // Formatted display value, e.g. ":8080"
 }
 
+// SourceItemViewModel represents a single subscription source item in the Config Center.
+type SourceItemViewModel struct {
+	ID             string // Unique deterministic source ID
+	Name           string // Display name or alias
+	URL            string // Sanitized URL (credentials masked)
+	Enabled        bool   // Active state
+	CandidateCount int    // Contributed from latest fetch telemetry (if known)
+	HasCount       bool   // True if candidate count telemetry is available
+	StatusMsg      string // Last fetch status or error message (if known)
+}
+
 // ConfigCategoryViewModel contains the display items for a single category tab.
 type ConfigCategoryViewModel struct {
 	Category ConfigCategory
 	Name     string
 	Items    []ConfigItemViewModel
+	Sources  []SourceItemViewModel
 }
 
 // ConfigCenterViewModel bundles all category view data for the Configuration Center.
 type ConfigCenterViewModel struct {
 	Categories []ConfigCategoryViewModel
+}
+
+// Sources returns the slice of SourceItemViewModels if the Sources category exists.
+func (c ConfigCenterViewModel) Sources() []SourceItemViewModel {
+	for _, cat := range c.Categories {
+		if cat.Category == CategorySources {
+			return cat.Sources
+		}
+	}
+	return nil
 }

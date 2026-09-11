@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"gemsub/internal/tui/viewmodel"
 )
@@ -23,6 +25,10 @@ type Controller interface {
 	CopyCandidateLink(opaqueID string) error
 	CandidateRowsWindow(filter viewmodel.FilterMode, offset, limit int) []viewmodel.CandidateRowViewModel
 	ConfigCenter() viewmodel.ConfigCenterViewModel
+	ToggleSource(id string) error
+	AddSource(rawURL string, name string) error
+	UpdateSource(id string, rawURL string, name string) error
+	DeleteSource(id string) error
 }
 
 // ActiveView represents the primary content pane currently displayed.
@@ -81,7 +87,25 @@ type Model struct {
 	configCenter    viewmodel.ConfigCenterViewModel
 	configCategory  viewmodel.ConfigCategory
 	configItemIndex int
+
+	// Source Manager state
+	sourceMode        sourceInputMode
+	confirmDeleteID   string
+	confirmDeleteName string
+	editSourceID      string
+	inputURL          string
+	inputName         string
+	inputFocus        int // 0 = URL, 1 = Name
 }
+
+type sourceInputMode int
+
+const (
+	sourceModeNormal sourceInputMode = iota
+	sourceModeDeleteConfirm
+	sourceModeAdd
+	sourceModeEdit
+)
 
 // New creates and pre-hydrates a new Bubble Tea Model using the presentation Controller.
 func New(ctrl Controller) *Model {
@@ -141,6 +165,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// In Config Center Sources category, active input modes capture keys (q, esc, etc.)
+	if m.activeView == ViewConfig && m.configCategory == viewmodel.CategorySources && m.sourceMode != sourceModeNormal {
+		if msg.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+		return m.handleConfigKeys(msg)
+	}
+
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
@@ -151,6 +183,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.prevActiveView = m.activeView
 			m.activeView = ViewConfig
 			m.configItemIndex = 0
+			m.sourceMode = sourceModeNormal
 			m.refreshConfigCenter()
 			return m, nil
 		}
@@ -159,6 +192,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// From Config Center, return to previous view
 		if m.activeView == ViewConfig {
 			m.activeView = m.prevActiveView
+			m.sourceMode = sourceModeNormal
 			return m, nil
 		}
 	}
@@ -355,6 +389,10 @@ func (m *Model) handleLogKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.configCategory == viewmodel.CategorySources {
+		return m.handleSourceKeys(msg)
+	}
+
 	catCount := viewmodel.ConfigCategoryCount
 	switch msg.String() {
 	case "tab", "l", "right":
@@ -387,6 +425,237 @@ func (m *Model) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) handleSourceKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	catCount := viewmodel.ConfigCategoryCount
+
+	// 1. Delete confirmation mode
+	if m.sourceMode == sourceModeDeleteConfirm {
+		switch msg.String() {
+		case "y", "Y":
+			if m.ctrl != nil && m.confirmDeleteID != "" {
+				if err := m.ctrl.DeleteSource(m.confirmDeleteID); err != nil {
+					m.setStatus(fmt.Sprintf("Error: %s", err))
+				} else {
+					m.setStatus(fmt.Sprintf("Deleted source: %s", m.confirmDeleteName))
+					m.refreshConfigCenter()
+					sources := m.configCategorySources()
+					if m.configItemIndex >= len(sources) && len(sources) > 0 {
+						m.configItemIndex = len(sources) - 1
+					}
+				}
+			}
+			m.sourceMode = sourceModeNormal
+			m.confirmDeleteID = ""
+			m.confirmDeleteName = ""
+			return m, nil
+		default:
+			m.sourceMode = sourceModeNormal
+			m.confirmDeleteID = ""
+			m.confirmDeleteName = ""
+			m.setStatus("Deletion cancelled")
+			return m, nil
+		}
+	}
+
+	// 2. Add or Edit modal modes
+	if m.sourceMode == sourceModeAdd || m.sourceMode == sourceModeEdit {
+		switch msg.String() {
+		case "esc":
+			m.sourceMode = sourceModeNormal
+			m.inputURL = ""
+			m.inputName = ""
+			m.setStatus("Cancelled")
+			return m, nil
+
+		case "tab", "down":
+			m.inputFocus = (m.inputFocus + 1) % 2
+			return m, nil
+
+		case "shift+tab", "up":
+			m.inputFocus = (m.inputFocus - 1 + 2) % 2
+			return m, nil
+
+		case "backspace":
+			if m.inputFocus == 0 {
+				_, size := utf8.DecodeLastRuneInString(m.inputURL)
+				if size > 0 {
+					m.inputURL = m.inputURL[:len(m.inputURL)-size]
+				}
+			} else if m.inputFocus == 1 {
+				_, size := utf8.DecodeLastRuneInString(m.inputName)
+				if size > 0 {
+					m.inputName = m.inputName[:len(m.inputName)-size]
+				}
+			}
+			return m, nil
+
+		case "enter":
+			trimmedURL := strings.TrimSpace(m.inputURL)
+			trimmedName := strings.TrimSpace(m.inputName)
+			if trimmedURL == "" {
+				m.setStatus("Error: URL cannot be empty")
+				return m, nil
+			}
+
+			if m.sourceMode == sourceModeAdd {
+				if m.ctrl != nil {
+					if err := m.ctrl.AddSource(trimmedURL, trimmedName); err != nil {
+						m.setStatus(fmt.Sprintf("Error: %s", err))
+						return m, nil
+					}
+					m.setStatus(fmt.Sprintf("Added source: %s", trimmedURL))
+					m.refreshConfigCenter()
+					sources := m.configCategorySources()
+					m.configItemIndex = len(sources) - 1
+				}
+			} else { // sourceModeEdit
+				if m.ctrl != nil {
+					if err := m.ctrl.UpdateSource(m.editSourceID, trimmedURL, trimmedName); err != nil {
+						m.setStatus(fmt.Sprintf("Error: %s", err))
+						return m, nil
+					}
+					m.setStatus(fmt.Sprintf("Updated source: %s", trimmedName))
+					m.refreshConfigCenter()
+				}
+			}
+			m.sourceMode = sourceModeNormal
+			m.inputURL = ""
+			m.inputName = ""
+			m.editSourceID = ""
+			return m, nil
+
+		default:
+			var char string
+			if msg.Type == tea.KeyRunes {
+				char = string(msg.Runes)
+			} else if msg.Type == tea.KeySpace || msg.String() == " " || msg.String() == "space" {
+				char = " "
+			} else if len(msg.String()) == 1 {
+				char = msg.String()
+			}
+			if char != "" {
+				if m.inputFocus == 0 {
+					m.inputURL += char
+				} else {
+					m.inputName += char
+				}
+			}
+			return m, nil
+		}
+	}
+
+	// 3. Normal navigation mode in CategorySources
+	sources := m.configCategorySources()
+	switch msg.String() {
+	case "tab", "l", "right":
+		m.configCategory = (m.configCategory + 1) % viewmodel.ConfigCategory(catCount)
+		m.configItemIndex = 0
+		return m, nil
+
+	case "shift+tab", "h", "left":
+		if m.configCategory == 0 {
+			m.configCategory = viewmodel.ConfigCategory(catCount - 1)
+		} else {
+			m.configCategory--
+		}
+		m.configItemIndex = 0
+		return m, nil
+
+	case "j", "down":
+		if m.configItemIndex < len(sources)-1 {
+			m.configItemIndex++
+		}
+		return m, nil
+
+	case "k", "up":
+		if m.configItemIndex > 0 {
+			m.configItemIndex--
+		}
+		return m, nil
+
+	case "g":
+		m.configItemIndex = 0
+		return m, nil
+
+	case "G":
+		if len(sources) > 0 {
+			m.configItemIndex = len(sources) - 1
+		}
+		return m, nil
+
+	case " ", "e":
+		if len(sources) == 0 || m.ctrl == nil {
+			return m, nil
+		}
+		if m.configItemIndex >= len(sources) {
+			m.configItemIndex = 0
+		}
+		sel := sources[m.configItemIndex]
+		if err := m.ctrl.ToggleSource(sel.ID); err != nil {
+			m.setStatus(fmt.Sprintf("Error: %s", err))
+		} else {
+			newState := "enabled"
+			if sel.Enabled {
+				newState = "disabled"
+			}
+			m.setStatus(fmt.Sprintf("Source %s: %s", newState, sel.Name))
+			m.refreshConfigCenter()
+		}
+		return m, nil
+
+	case "a":
+		m.sourceMode = sourceModeAdd
+		m.inputURL = ""
+		m.inputName = ""
+		m.inputFocus = 0
+		m.setStatus("Add Source: enter URL and optional Name ([Enter] Submit, [Tab] Field, [Esc] Cancel)")
+		return m, nil
+
+	case "enter":
+		if len(sources) == 0 {
+			return m, nil
+		}
+		if m.configItemIndex >= len(sources) {
+			m.configItemIndex = 0
+		}
+		sel := sources[m.configItemIndex]
+		m.sourceMode = sourceModeEdit
+		m.editSourceID = sel.ID
+		m.inputURL = sel.URL
+		m.inputName = sel.Name
+		m.inputFocus = 0
+		m.setStatus("Edit Source: update URL or Name ([Enter] Save, [Tab] Field, [Esc] Cancel)")
+		return m, nil
+
+	case "d", "x":
+		if len(sources) == 0 {
+			m.setStatus("No sources to delete")
+			return m, nil
+		}
+		if m.configItemIndex >= len(sources) {
+			m.configItemIndex = 0
+		}
+		sel := sources[m.configItemIndex]
+		m.sourceMode = sourceModeDeleteConfirm
+		m.confirmDeleteID = sel.ID
+		m.confirmDeleteName = sel.Name
+		m.setStatus(fmt.Sprintf("Delete %q? Press 'y' to confirm, any other key to cancel", sel.Name))
+		return m, nil
+	}
+
+	return m, nil
+}
+
+// configCategorySources returns the sources for the CategorySources tab.
+func (m *Model) configCategorySources() []viewmodel.SourceItemViewModel {
+	for _, cat := range m.configCenter.Categories {
+		if cat.Category == viewmodel.CategorySources {
+			return cat.Sources
+		}
+	}
+	return nil
+}
+
 // configCategoryItems returns the items for the currently active config category.
 func (m *Model) configCategoryItems() []viewmodel.ConfigItemViewModel {
 	for _, cat := range m.configCenter.Categories {
@@ -402,11 +671,20 @@ func (m *Model) configCategoryItems() []viewmodel.ConfigItemViewModel {
 func (m *Model) refreshConfigCenter() {
 	if m.ctrl != nil {
 		m.configCenter = m.ctrl.ConfigCenter()
-		items := m.configCategoryItems()
-		if m.configItemIndex >= len(items) && len(items) > 0 {
-			m.configItemIndex = len(items) - 1
-		} else if len(items) == 0 {
-			m.configItemIndex = 0
+		if m.configCategory == viewmodel.CategorySources {
+			sources := m.configCategorySources()
+			if m.configItemIndex >= len(sources) && len(sources) > 0 {
+				m.configItemIndex = len(sources) - 1
+			} else if len(sources) == 0 {
+				m.configItemIndex = 0
+			}
+		} else {
+			items := m.configCategoryItems()
+			if m.configItemIndex >= len(items) && len(items) > 0 {
+				m.configItemIndex = len(items) - 1
+			} else if len(items) == 0 {
+				m.configItemIndex = 0
+			}
 		}
 	}
 }
@@ -903,10 +1181,8 @@ func (m *Model) renderLogs() string {
 }
 
 func (m *Model) renderConfigCenter() string {
-	bold := lipgloss.NewStyle().Bold(true)
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	cyan := lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
-	selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("236")).Bold(true)
 
 	var sb strings.Builder
 
@@ -926,6 +1202,12 @@ func (m *Model) renderConfigCenter() string {
 	sb.WriteString(dim.Render(strings.Repeat("─", m.width)))
 	sb.WriteString("\n")
 
+	// Special handling for CategorySources
+	if m.configCategory == viewmodel.CategorySources {
+		sb.WriteString(m.renderSourceManager())
+		return sb.String()
+	}
+
 	// Items for the active category
 	items := m.configCategoryItems()
 	if len(items) == 0 {
@@ -934,8 +1216,16 @@ func (m *Model) renderConfigCenter() string {
 		return sb.String()
 	}
 
+	sb.WriteString(m.renderCategoryItems(items))
+	return sb.String()
+}
+
+func (m *Model) renderCategoryItems(items []viewmodel.ConfigItemViewModel) string {
+	bold := lipgloss.NewStyle().Bold(true)
+	selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("236")).Bold(true)
+
+	var sb strings.Builder
 	visibleItems := m.visibleConfigRows()
-	// Scroll offset for items if needed
 	scrollOffset := 0
 	if m.configItemIndex >= scrollOffset+visibleItems {
 		scrollOffset = m.configItemIndex - visibleItems + 1
@@ -949,7 +1239,6 @@ func (m *Model) renderConfigCenter() string {
 		end = len(items)
 	}
 
-	// Calculate label width for alignment (capped to avoid overflow on narrow terminals)
 	maxLabel := 0
 	for _, item := range items {
 		if len(item.Label) > maxLabel {
@@ -972,7 +1261,7 @@ func (m *Model) renderConfigCenter() string {
 			label = label[:maxLabel]
 		}
 
-		valueWidth := m.width - maxLabel - 8 // cursor(2) + padding(4) + colon(2)
+		valueWidth := m.width - maxLabel - 8
 		if valueWidth < 10 {
 			valueWidth = 10
 		}
@@ -987,6 +1276,221 @@ func (m *Model) renderConfigCenter() string {
 		} else {
 			sb.WriteString("  " + bold.Render(fmt.Sprintf("%-*s", maxLabel, label)) + "  " + value)
 		}
+		sb.WriteString("\n")
+	}
+
+	return sb.String()
+}
+
+func (m *Model) renderSourceManager() string {
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	cyan := lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+	green := lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	yellow := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("236")).Bold(true)
+
+	var sb strings.Builder
+
+	// Modal prompt mode (Add or Edit)
+	if m.sourceMode == sourceModeAdd || m.sourceMode == sourceModeEdit {
+		title := "Add Subscription Source"
+		actionHint := "[Enter] Add"
+		if m.sourceMode == sourceModeEdit {
+			title = "Edit Subscription Source"
+			actionHint = "[Enter] Save"
+		}
+
+		boxWidth := m.width - 4
+		if boxWidth > 72 {
+			boxWidth = 72
+		}
+		if boxWidth < 40 {
+			if m.width >= 44 {
+				boxWidth = 40
+			} else {
+				boxWidth = m.width - 4
+				if boxWidth < 20 {
+					boxWidth = 20
+				}
+			}
+		}
+
+		urlPrefix := "  URL:  "
+		namePrefix := "  Name: "
+		if m.inputFocus == 0 {
+			urlPrefix = cyan.Render("> URL:  ")
+		} else {
+			namePrefix = cyan.Render("> Name: ")
+		}
+
+		urlVal := m.inputURL
+		if m.inputFocus == 0 {
+			urlVal += "_"
+		}
+		nameVal := m.inputName
+		if m.inputFocus == 1 {
+			nameVal += "_"
+		}
+		if nameVal == "" && m.inputFocus != 1 {
+			nameVal = dim.Render("(optional)")
+		}
+
+		titleWidth := lipgloss.Width(title)
+		repeatTop := boxWidth - titleWidth - 5
+		if repeatTop < 0 {
+			repeatTop = 0
+		}
+		repeatBot := boxWidth - 2
+		if repeatBot < 0 {
+			repeatBot = 0
+		}
+		topBar := "┌─ " + title + " " + strings.Repeat("─", repeatTop) + "┐"
+		botBar := "└" + strings.Repeat("─", repeatBot) + "┘"
+
+		// Available width for field values:
+		// Box width minus 2 (outer borders) minus 2 (inner 1-char margins) = boxWidth - 4
+		// minus prefix width (8) = boxWidth - 12
+		fieldWidth := boxWidth - 12
+		if fieldWidth < 5 {
+			fieldWidth = 5
+		}
+
+		dispURL := urlVal
+		if lipgloss.Width(dispURL) > fieldWidth {
+			dispURL = ansi.Truncate(dispURL, fieldWidth, "…")
+		}
+		urlPadLen := fieldWidth - lipgloss.Width(dispURL)
+		if urlPadLen < 0 {
+			urlPadLen = 0
+		}
+		urlPad := strings.Repeat(" ", urlPadLen)
+
+		dispName := nameVal
+		if lipgloss.Width(dispName) > fieldWidth {
+			dispName = ansi.Truncate(dispName, fieldWidth, "…")
+		}
+		namePadLen := fieldWidth - lipgloss.Width(dispName)
+		if namePadLen < 0 {
+			namePadLen = 0
+		}
+		namePad := strings.Repeat(" ", namePadLen)
+
+		blankPadLen := boxWidth - 4
+		if blankPadLen < 0 {
+			blankPadLen = 0
+		}
+		blankLine := strings.Repeat(" ", blankPadLen)
+
+		hintContent := fmt.Sprintf(" %s   [Tab] Switch Field   [Esc] Cancel", actionHint)
+		hintMax := boxWidth - 4
+		if hintMax < 5 {
+			hintMax = 5
+		}
+		if lipgloss.Width(hintContent) > hintMax {
+			hintContent = ansi.Truncate(hintContent, hintMax, "…")
+		}
+		hintPadLen := hintMax - lipgloss.Width(hintContent)
+		if hintPadLen < 0 {
+			hintPadLen = 0
+		}
+		hintPad := strings.Repeat(" ", hintPadLen)
+
+		sb.WriteString("  " + dim.Render(topBar) + "\n")
+		sb.WriteString("  │ " + urlPrefix + dispURL + urlPad + " │\n")
+		sb.WriteString("  │ " + namePrefix + dispName + namePad + " │\n")
+		sb.WriteString("  │ " + blankLine + " │\n")
+		sb.WriteString("  │ " + hintContent + hintPad + " │\n")
+		sb.WriteString("  " + dim.Render(botBar) + "\n")
+		return sb.String()
+	}
+
+	sources := m.configCategorySources()
+	if len(sources) == 0 {
+		items := m.configCategoryItems()
+		if len(items) > 0 {
+			return m.renderCategoryItems(items)
+		}
+		sb.WriteString(dim.Render("  No subscription sources configured."))
+		sb.WriteString("\n")
+		sb.WriteString(dim.Render("  Press 'a' to add a new subscription source."))
+		sb.WriteString("\n")
+		return sb.String()
+	}
+
+	visibleRows := m.visibleConfigRows()
+	scrollOffset := 0
+	if m.configItemIndex >= scrollOffset+visibleRows {
+		scrollOffset = m.configItemIndex - visibleRows + 1
+	}
+	if m.configItemIndex < scrollOffset {
+		scrollOffset = m.configItemIndex
+	}
+
+	end := scrollOffset + visibleRows
+	if end > len(sources) {
+		end = len(sources)
+	}
+
+	for i := scrollOffset; i < end; i++ {
+		src := sources[i]
+		cursor := "  "
+		if i == m.configItemIndex {
+			cursor = "> "
+		}
+
+		badge := green.Render("[ENABLED] ")
+		if !src.Enabled {
+			badge = dim.Render("[DISABLED]")
+		}
+
+		nameStr := src.Name
+		if src.HasCount {
+			nameStr = fmt.Sprintf("%s (%d)", src.Name, src.CandidateCount)
+		} else if src.CandidateCount > 0 {
+			nameStr = fmt.Sprintf("%s (%d)", src.Name, src.CandidateCount)
+		}
+
+		nameColWidth := 20
+		if lipgloss.Width(nameStr) > nameColWidth {
+			nameStr = ansi.Truncate(nameStr, nameColWidth, "…")
+		}
+		namePadLen := nameColWidth - lipgloss.Width(nameStr)
+		if namePadLen < 0 {
+			namePadLen = 0
+		}
+		namePadded := nameStr + strings.Repeat(" ", namePadLen)
+
+		urlWidth := m.width - 2 - 11 - nameColWidth - 4
+		if urlWidth < 10 && m.width >= 47 {
+			urlWidth = 10
+		} else if urlWidth < 3 {
+			urlWidth = 3
+		}
+		urlStr := src.URL
+		if lipgloss.Width(urlStr) > urlWidth {
+			urlStr = ansi.Truncate(urlStr, urlWidth, "…")
+		}
+
+		line := fmt.Sprintf("%s%s  %s  %s", cursor, badge, namePadded, urlStr)
+		if m.width > 0 && lipgloss.Width(line) > m.width {
+			line = ansi.Truncate(line, m.width, "")
+		}
+
+		if i == m.configItemIndex {
+			sb.WriteString(selectedStyle.Render(line))
+		} else {
+			sb.WriteString(line)
+		}
+		sb.WriteString("\n")
+	}
+
+	if m.sourceMode == sourceModeDeleteConfirm {
+		sb.WriteString("\n")
+		confirmPrompt := fmt.Sprintf("  Delete source %q? Press 'y' to confirm, any other key to cancel", m.confirmDeleteName)
+		if m.width > 0 && lipgloss.Width(confirmPrompt) > m.width {
+			confirmPrompt = ansi.Truncate(confirmPrompt, m.width, "…")
+		}
+		sb.WriteString(yellow.Render(confirmPrompt))
 		sb.WriteString("\n")
 	}
 
@@ -1024,8 +1528,20 @@ func (m *Model) renderFooter() string {
 	if m.showDetail {
 		hints = "[Esc] Close Detail  [y] Copy Link  [q] Quit"
 	} else if m.activeView == ViewConfig {
-		hints = fmt.Sprintf("%s [Tab/h/l] Category  [j/k] Navigate  [Esc] Back  [q] Quit",
-			statusStr)
+		if m.configCategory == viewmodel.CategorySources {
+			switch m.sourceMode {
+			case sourceModeDeleteConfirm:
+				hints = fmt.Sprintf("%s Press 'y' to confirm deletion, any other key to cancel", statusStr)
+			case sourceModeAdd:
+				hints = fmt.Sprintf("%s [Enter] Add  [Tab] Switch Field  [Esc] Cancel", statusStr)
+			case sourceModeEdit:
+				hints = fmt.Sprintf("%s [Enter] Save  [Tab] Switch Field  [Esc] Cancel", statusStr)
+			default:
+				hints = fmt.Sprintf("%s [Space] Toggle [a] Add [Enter] Edit [d] Delete [Tab] Cat [Esc] Back [q] Quit", statusStr)
+			}
+		} else {
+			hints = fmt.Sprintf("%s [Tab/h/l] Category  [j/k] Navigate  [Esc] Back  [q] Quit", statusStr)
+		}
 	} else if m.activeView == ViewCandidates {
 		hints = fmt.Sprintf("%s [s] Filter %s  [Enter] Detail  [y] Copy  [c] Config  [Tab] Logs  [q] Quit",
 			statusStr, filterState)
@@ -1034,7 +1550,21 @@ func (m *Model) renderFooter() string {
 			statusStr)
 	}
 
-	return dim.Render(hints)
+	rendered := dim.Render(hints)
+	return truncateToWidth(rendered, m.width)
+}
+
+// truncateToWidth truncates a string (preserving UTF-8 integrity and ANSI styling)
+// so that its terminal visual width does not exceed maxWidth cells.
+// It handles zero or negative widths safely without panicking.
+func truncateToWidth(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxWidth {
+		return s
+	}
+	return ansi.Truncate(s, maxWidth, "")
 }
 
 // formatHostPort formats host and port using bracketed host:port notation for IPv6 addresses.
