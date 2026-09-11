@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -318,5 +320,74 @@ func TestProductionRuntime_ConfigUpdated_ReachesAdapter(t *testing.T) {
 
 	if rt.Adapter.FlagMode() != country.ModeASCII {
 		t.Fatalf("expected FlagMode updated to ASCII via production bus, got %v", rt.Adapter.FlagMode())
+	}
+}
+
+func TestProductionRuntime_SchedulerControlWiring(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(""))
+	}))
+	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Headless:         true,
+		StateFile:        filepath.Join(tmpDir, "state.json"),
+		Sources:          config.NewSources(srv.URL),
+		FetchIntervalRaw: "1h",
+		Test: config.TestConfig{
+			TargetURL:    "https://example.com",
+			BlockPhrases: []string{"blocked"},
+			TimeoutRaw:   "5s",
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg.Validate: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	rt, cleanup := setupRuntime(cfg, &logBuf)
+	defer cleanup()
+
+	if rt.SchedulerCtrl == nil {
+		t.Fatal("expected rt.SchedulerCtrl to be non-nil")
+	}
+
+	// 1. Initially stopped
+	if rt.SchedulerCtrl.IsRunning() {
+		t.Error("expected SchedulerCtrl to be stopped initially")
+	}
+	st := rt.SchedulerCtrl.Status()
+	if st.Running {
+		t.Error("expected Status.Running=false initially")
+	}
+
+	// 2. Start
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := rt.SchedulerCtrl.Start(ctx); err != nil {
+		t.Fatalf("SchedulerCtrl.Start failed: %v", err)
+	}
+	if !rt.SchedulerCtrl.IsRunning() {
+		t.Error("expected SchedulerCtrl to be running after Start")
+	}
+
+	// 3. Duplicate Start rejected
+	if err := rt.SchedulerCtrl.Start(ctx); err == nil {
+		t.Error("expected error on duplicate Start, got nil")
+	}
+
+	// 4. Stop
+	if err := rt.SchedulerCtrl.Stop(); err != nil {
+		t.Fatalf("SchedulerCtrl.Stop failed: %v", err)
+	}
+	if rt.SchedulerCtrl.IsRunning() {
+		t.Error("expected SchedulerCtrl to be stopped after Stop")
+	}
+
+	// 5. Duplicate Stop idempotent
+	if err := rt.SchedulerCtrl.Stop(); err != nil {
+		t.Errorf("duplicate Stop returned error: %v", err)
 	}
 }

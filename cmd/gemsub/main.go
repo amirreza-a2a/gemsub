@@ -112,13 +112,12 @@ func runLifecycle(ctx context.Context, cfg *config.Config, logWriter io.Writer, 
 
 	var wg sync.WaitGroup
 
-	// Step 5: Instantiate and start Scheduler
-	sched := scheduler.New(cfg, rt.Store, rt.Bus)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		sched.Run(ctx)
-	}()
+	// Step 5: Start Scheduler via ControlService
+	if err := rt.SchedulerCtrl.Start(ctx); err != nil {
+		slog.Error("scheduler start error", "err", err)
+		cancel()
+	}
+	defer func() { _ = rt.SchedulerCtrl.Stop() }()
 
 	// Step 6: Start HTTP subserver
 	srv := subserver.New(&cfg.Serve, rt.Store)
@@ -155,14 +154,15 @@ func runLifecycle(ctx context.Context, cfg *config.Config, logWriter io.Writer, 
 
 // Runtime encapsulates application infrastructure and optional presentation components.
 type Runtime struct {
-	ConfigSvc   *config.Service
-	SourceSvc   *source.Service
-	RingHandler *logging.RingLogHandler
-	Store       *store.Store
-	Bus         *events.EventBus
-	Adapter     *adapter.Adapter
-	TUIModel    *tui.Model
-	Program     *tea.Program
+	ConfigSvc     *config.Service
+	SourceSvc     *source.Service
+	SchedulerCtrl *scheduler.ControlService
+	RingHandler   *logging.RingLogHandler
+	Store         *store.Store
+	Bus           *events.EventBus
+	Adapter       *adapter.Adapter
+	TUIModel      *tui.Model
+	Program       *tea.Program
 }
 
 // setupRuntime instantiates application components in the strict startup sequence.
@@ -192,15 +192,20 @@ func setupRuntime(cfg *config.Config, logWriter io.Writer, configSvc ...*config.
 		srcSvc = source.NewService(svc)
 	}
 
+	// Step 4: Instantiate Scheduler and ControlService
+	sched := scheduler.New(cfg, st, bus)
+	schedCtrl := scheduler.NewControlService(sched)
+
 	rt := &Runtime{
-		ConfigSvc:   svc,
-		SourceSvc:   srcSvc,
-		RingHandler: ringHandler,
-		Store:       st,
-		Bus:         bus,
+		ConfigSvc:     svc,
+		SourceSvc:     srcSvc,
+		SchedulerCtrl: schedCtrl,
+		RingHandler:   ringHandler,
+		Store:         st,
+		Bus:           bus,
 	}
 
-	// Step 4: In non-headless mode, instantiate and subscribe TUI adapter BEFORE scheduler execution
+	// Step 5: In non-headless mode, instantiate and subscribe TUI adapter BEFORE scheduler execution
 	if !cfg.Headless {
 		ad := adapter.New(st, bus, ringHandler)
 		if cfg.FlagMode != "" {
@@ -215,6 +220,9 @@ func setupRuntime(cfg *config.Config, logWriter io.Writer, configSvc ...*config.
 	var once sync.Once
 	cleanup := func() {
 		once.Do(func() {
+			if rt.SchedulerCtrl != nil {
+				_ = rt.SchedulerCtrl.Stop()
+			}
 			if rt.Adapter != nil {
 				rt.Adapter.Close()
 			}

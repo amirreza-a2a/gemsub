@@ -36,6 +36,14 @@ type Scheduler struct {
 	// immediate cycle instead of waiting for the interval. Buffered
 	// so a trigger while a cycle is already running isn't lost.
 	Trigger chan struct{}
+
+	inCycle          bool
+	lastCycleStart   time.Time
+	lastCycleEnd     time.Time
+	lastCycleDur     time.Duration
+	lastCycleMetrics events.ProgressMetrics
+	lastCancelled    bool
+	lastServable     int
 }
 
 func New(cfg *config.Config, st *store.Store, bus ...*events.EventBus) *Scheduler {
@@ -113,6 +121,44 @@ func (s *Scheduler) ProbeLimit() int {
 	return s.cfg.ProbeLimit
 }
 
+// CycleActive returns whether a scheduler cycle is currently executing.
+func (s *Scheduler) CycleActive() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.inCycle
+}
+
+// LastCycleInfo returns telemetry for the most recently started/finished cycle.
+func (s *Scheduler) LastCycleInfo() (start, end time.Time, dur time.Duration, metrics events.ProgressMetrics, cancelled bool, servable int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastCycleStart, s.lastCycleEnd, s.lastCycleDur, s.lastCycleMetrics, s.lastCancelled, s.lastServable
+}
+
+func (s *Scheduler) publishCycleStarted(startedAt time.Time) {
+	s.mu.Lock()
+	s.inCycle = true
+	s.lastCycleStart = startedAt
+	s.mu.Unlock()
+
+	s.bus.Publish(events.CycleStarted{
+		StartedAt: startedAt,
+	})
+}
+
+func (s *Scheduler) publishCycleFinished(cf events.CycleFinished) {
+	s.mu.Lock()
+	s.inCycle = false
+	s.lastCycleEnd = time.Now()
+	s.lastCycleDur = cf.Duration
+	s.lastCycleMetrics = cf.ProgressMetrics
+	s.lastCancelled = cf.Cancelled
+	s.lastServable = cf.Servable
+	s.mu.Unlock()
+
+	s.bus.Publish(cf)
+}
+
 // UpdateConfig updates the scheduler runtime configuration under lock,
 // updating child publishers and notifying running timers if FetchInterval changed.
 func (s *Scheduler) UpdateConfig(newCfg config.Config) {
@@ -173,6 +219,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 	s.mu.RLock()
 	interval := s.cfg.FetchInterval
 	s.mu.RUnlock()
+	if interval <= 0 {
+		interval = 1 * time.Hour
+	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -188,6 +237,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 			s.mu.RLock()
 			interval = s.cfg.FetchInterval
 			s.mu.RUnlock()
+			if interval <= 0 {
+				interval = 1 * time.Hour
+			}
 			ticker.Reset(interval)
 		case evt, ok := <-configSub:
 			if !ok {
@@ -219,9 +271,7 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeRunner) {
 	slog.Info("scheduler: cycle starting")
 	cycleStart := time.Now()
-	s.bus.Publish(events.CycleStarted{
-		StartedAt: cycleStart,
-	})
+	s.publishCycleStarted(cycleStart)
 
 	s.mu.RLock()
 	sources := s.cfg.EnabledSourceURLs()
@@ -238,7 +288,7 @@ func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeR
 	//   wiping of all candidates during complete source suspension.
 	if len(sources) == 0 {
 		slog.Warn("scheduler: no enabled sources; skipping cycle")
-		s.bus.Publish(events.CycleFinished{
+		s.publishCycleFinished(events.CycleFinished{
 			ProgressMetrics: events.ProgressMetrics{
 				Total:        0,
 				Completed:    0,
@@ -261,7 +311,7 @@ func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeR
 
 	if len(links) == 0 && len(fetchErrs) > 0 {
 		slog.Warn("scheduler: fetch failed; aborting cycle without updating store or publishing", "errors", len(fetchErrs), "links", 0)
-		s.bus.Publish(events.CycleFinished{
+		s.publishCycleFinished(events.CycleFinished{
 			ProgressMetrics: events.ProgressMetrics{
 				Total:        0,
 				Completed:    0,
@@ -333,7 +383,7 @@ func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeR
 		if err := s.st.Save(); err != nil {
 			slog.Error("scheduler: save state failed", "err", err)
 		}
-		s.bus.Publish(events.CycleFinished{
+		s.publishCycleFinished(events.CycleFinished{
 			ProgressMetrics: events.ProgressMetrics{
 				Total:        len(candidates),
 				Completed:    int(atomic.LoadInt64(&passed) + atomic.LoadInt64(&failed) + atomic.LoadInt64(&inconclusive)),
@@ -364,7 +414,7 @@ func (s *Scheduler) runCycleWithRunner(ctx context.Context, runner tester.ProbeR
 		"servable", stats.Servable,
 	)
 
-	s.bus.Publish(events.CycleFinished{
+	s.publishCycleFinished(events.CycleFinished{
 		ProgressMetrics: events.ProgressMetrics{
 			Total:        len(candidates),
 			Completed:    len(candidates),
