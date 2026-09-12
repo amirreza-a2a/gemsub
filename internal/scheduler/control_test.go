@@ -582,8 +582,49 @@ func TestControlService_ParentContextCancellationCleansUpRunningState(t *testing
 	_ = ctrl.Stop()
 }
 
+func waitForControlEvent[T any](t *testing.T, subCh <-chan any, timeout time.Duration) T {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case evt, ok := <-subCh:
+			if !ok {
+				t.Fatalf("subCh closed while waiting for %T", *new(T))
+			}
+			if target, match := evt.(T); match {
+				return target
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for %T", *new(T))
+		}
+	}
+}
+
+func assertNoControlEvent[T any](t *testing.T, subCh <-chan any, timeout time.Duration, msg string) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case evt, ok := <-subCh:
+			if !ok {
+				return
+			}
+			if _, match := evt.(T); match {
+				t.Fatal(msg)
+			}
+		case <-timer.C:
+			return
+		}
+	}
+}
+
 func TestControlService_PauseResumeLifecycleAndEvents(t *testing.T) {
 	sched, _, bus, _ := setupTestScheduler(t)
+	sched.SetRunnerForTest(func(ctx context.Context, cand parser.Candidate, tc *config.TestConfig, limiter *rate.Limiter) store.Result {
+		return store.Result{Link: cand.Link, Status: store.StatusPassed, TestedAt: time.Now()}
+	})
 	subCh := bus.Subscribe()
 	defer bus.Unsubscribe(subCh)
 
@@ -632,29 +673,8 @@ func TestControlService_PauseResumeLifecycleAndEvents(t *testing.T) {
 		t.Fatalf("Pause failed: %v", err)
 	}
 
-	// Verify event emission
-	select {
-	case evt := <-subCh:
-		if _, ok := evt.(events.SchedulerPaused); !ok {
-			// Might receive initial cycle events; drain until SchedulerPaused
-			found := false
-			for i := 0; i < 10; i++ {
-				select {
-				case e2 := <-subCh:
-					if _, ok2 := e2.(events.SchedulerPaused); ok2 {
-						found = true
-						break
-					}
-				default:
-				}
-			}
-			if !found {
-				t.Errorf("expected events.SchedulerPaused, got %T", evt)
-			}
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("timed out waiting for events.SchedulerPaused")
-	}
+	// Verify event emission: wait deterministically for SchedulerPaused, ignoring unrelated cycle events
+	waitForControlEvent[events.SchedulerPaused](t, subCh, 1*time.Second)
 
 	// State should be StatePaused
 	stPaused := ctrl.Status()
@@ -672,29 +692,15 @@ func TestControlService_PauseResumeLifecycleAndEvents(t *testing.T) {
 	if err := ctrl.Pause(); !errors.Is(err, scheduler.ErrSchedulerAlreadyPaused) {
 		t.Errorf("second Pause err = %v, want ErrSchedulerAlreadyPaused", err)
 	}
-	select {
-	case evt := <-subCh:
-		if _, ok := evt.(events.SchedulerPaused); ok {
-			t.Fatal("unexpected duplicate events.SchedulerPaused emitted on second Pause")
-		}
-	default:
-		// No event as expected
-	}
+	assertNoControlEvent[events.SchedulerPaused](t, subCh, 50*time.Millisecond, "unexpected duplicate events.SchedulerPaused emitted on second Pause")
 
 	// 4. Resume scheduler
 	if err := ctrl.Resume(); err != nil {
 		t.Fatalf("Resume failed: %v", err)
 	}
 
-	// Verify resume event
-	select {
-	case evt := <-subCh:
-		if _, ok := evt.(events.SchedulerResumed); !ok {
-			t.Errorf("expected events.SchedulerResumed, got %T", evt)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("timed out waiting for events.SchedulerResumed")
-	}
+	// Verify resume event: wait deterministically for SchedulerResumed, ignoring unrelated cycle events
+	waitForControlEvent[events.SchedulerResumed](t, subCh, 1*time.Second)
 
 	stResumed := ctrl.Status()
 	if stResumed.State != scheduler.StateRunning {
@@ -711,14 +717,7 @@ func TestControlService_PauseResumeLifecycleAndEvents(t *testing.T) {
 	if err := ctrl.Resume(); !errors.Is(err, scheduler.ErrSchedulerNotPaused) {
 		t.Errorf("second Resume err = %v, want ErrSchedulerNotPaused", err)
 	}
-	select {
-	case evt := <-subCh:
-		if _, ok := evt.(events.SchedulerResumed); ok {
-			t.Fatal("unexpected duplicate events.SchedulerResumed emitted on second Resume")
-		}
-	default:
-		// No event as expected
-	}
+	assertNoControlEvent[events.SchedulerResumed](t, subCh, 50*time.Millisecond, "unexpected duplicate events.SchedulerResumed emitted on second Resume")
 }
 
 func TestControlService_TriggerWhilePaused_Rejection(t *testing.T) {
