@@ -419,7 +419,11 @@ func TestScheduler_Run_CanonicalIntervalResetViaIntervalCh(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go sched.Run(ctx)
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		sched.Run(ctx)
+	}()
 
 	// Wait for initial startup cycle to complete
 	deadline := time.Now().Add(2 * time.Second)
@@ -455,6 +459,13 @@ func TestScheduler_Run_CanonicalIntervalResetViaIntervalCh(t *testing.T) {
 
 	if count := atomic.LoadInt64(&cycleCount); count < 2 {
 		t.Fatalf("expected at least 2 cycles within 2s after interval reset to 50ms, got %d", count)
+	}
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sched.Run did not terminate within 2s after cancellation")
 	}
 }
 
