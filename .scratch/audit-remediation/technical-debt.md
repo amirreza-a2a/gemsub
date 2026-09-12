@@ -10,10 +10,10 @@ The canonical local register for non-blocking findings, deferred hardening items
 |:---|:---:|:---|
 | **Active Technical Debt (P1)** | 0 | Material architectural, product, or reliability issues requiring planned engineering tickets. |
 | **Future Hardening & Observability (P2)** | 3 | Non-blocking enhancements to metrics, operational logging, scheduling fairness, or optional configuration. |
-| **Code Quality & Test Cleanup (P2)** | 10 | Maintainability, naming clarity, deduplication, and test fixture consolidation. |
+| **Code Quality & Test Cleanup (P2/P3)** | 12 | Maintainability, naming clarity, deduplication, documentation, and test fixture consolidation. |
 | **External & Upstream Tracking** | 1 | Issues rooted in external dependencies tracked across upstream releases. |
 | **Promoted / Resolved** | 5 | Items promoted to active GitHub issues or resolved in implementation commits. |
-| **Total Registered Items** | **19** | |
+| **Total Registered Items** | **21** | |
 
 ---
 
@@ -40,6 +40,8 @@ The canonical local register for non-blocking findings, deferred hardening items
 | [TD-017](#td-017--transport-wsaeconnrefused-named-constant) | Transport WSAECONNREFUSED named constant | P2 | Tester / Transport / Code Quality | GitHub Issue #23 Final Review | Open |
 | [TD-018](#td-018--publisher-windows-test-path-normalization) | Host-independent Windows test path normalization | P2 | Publisher / Testability | GitHub Issue #23 Final Review | Open |
 | [TD-019](#td-019--publisher-forward-slash-unc-detection) | Forward-slash UNC path detection in test fallback | P2 | Publisher / Testability | GitHub Issue #23 Final Review | Open |
+| [TD-020](#td-020--redundant-1ms-sleep-in-testtwostage_b_transportsuccess_geminisuccess) | Redundant 1ms sleep in TestTwoStage_B_TransportSuccess_GeminiSuccess | P2 | Tester / Test Quality | GitHub Issue #23 Windows CI Review | Open |
+| [TD-021](#td-021--latency-invariant-documentation-for-probe-error-paths) | Document latency invariant relative to probe error paths | P3 | Tester / Transport / Documentation | GitHub Issue #23 Windows CI Review | Open / Documentation |
 
 ---
 
@@ -453,6 +455,50 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **Dependencies:** `internal/publisher/remote.go`, `internal/publisher/remote_test.go`
 - **Promotion Criteria:**
   Promote if test environments require forward-slash UNC path fixtures or during general publisher test harness maintenance.
+
+---
+
+### TD-020 — Redundant 1ms sleep in TestTwoStage_B_TransportSuccess_GeminiSuccess
+
+- **ID:** `TD-020`
+- **Title:** Redundant 1ms sleep in TestTwoStage_B_TransportSuccess_GeminiSuccess
+- **Priority:** P2
+- **Area:** Tester / Test Quality
+- **Status:** Open
+- **Origin:** GitHub Issue #23 Windows CI review (Finding F-04)
+- **Problem:**
+  The test fixture adds `time.Sleep(1 * time.Millisecond)` to the mock health handler in `TestTwoStage_B_TransportSuccess_GeminiSuccess` (`internal/tester/probe_test.go`). After `clampLatency` was introduced in `internal/tester/transport/probe.go`, a successful transport probe is already guaranteed to have `TransportLatency > 0`, so this sleep is no longer necessary to satisfy the test's invariant.
+- **Impact:**
+  - Adds unnecessary wall-clock delay to the test suite.
+  - Does not reliably guarantee crossing a Windows timer tick on its own.
+  - Can give the impression that the test depends on timing realism when the actual contract is enforced by `clampLatency`.
+- **Proposed Future Remediation:**
+  Remove the sleep in a future test-hardening cleanup, while retaining the existing `TransportLatency > 0` assertion and deterministic `clampLatency` unit test.
+  - This is non-blocking cleanup only.
+- **Dependencies:** `internal/tester/probe_test.go`, `internal/tester/transport/probe.go`
+- **Promotion Criteria:**
+  Promote during a future tester test-hardening or code-cleanup pass.
+
+---
+
+### TD-021 — Latency invariant documentation for probe error paths
+
+- **ID:** `TD-021`
+- **Title:** Document the latency invariant relative to probe error paths
+- **Priority:** P3
+- **Area:** Tester / Transport / Documentation
+- **Status:** Open / Documentation
+- **Origin:** GitHub Issue #23 Windows CI review (Finding F-05)
+- **Problem:**
+  `transport.Probe` in `internal/tester/transport/probe.go` currently evaluates `clampLatency(time.Since(start))` before branching on the HTTP error result. This is harmless because latency is not used downstream as successful transport evidence when the probe fails, but the code currently does not explicitly document whether positive latency is a universal `transport.Result` invariant or specifically a successful-probe invariant.
+- **Impact:**
+  Low. Current behavior is correct, but the invariant could be ambiguous to future maintainers.
+- **Proposed Future Remediation:**
+  Clarify the invariant in code documentation at the next relevant cleanup: successful/executed probe evidence must have strictly positive latency; error-path latency remains non-semantic and must not be interpreted as valid transport evidence.
+  - This is non-blocking documentation/code hygiene only.
+- **Dependencies:** `internal/tester/transport/probe.go`
+- **Promotion Criteria:**
+  Promote during future transport probe refactoring or documentation maintenance.
 
 ---
 
