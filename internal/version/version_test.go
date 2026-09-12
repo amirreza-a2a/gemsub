@@ -28,13 +28,13 @@ func TestInfo_Defaults(t *testing.T) {
 
 func TestFormatInfo(t *testing.T) {
 	tests := []struct {
-		name       string
-		ver        string
-		commit     string
-		date       string
-		wantLine0  string
-		wantLine1  string
-		wantLine2  string
+		name      string
+		ver       string
+		commit    string
+		date      string
+		wantLine0 string
+		wantLine1 string
+		wantLine2 string
 	}{
 		{
 			name:      "semantic version with v prefix",
