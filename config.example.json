@@ -1,6 +1,10 @@
 {
   "sources": [
-    "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/githubmirror/1.txt"
+    {
+      "url": "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/githubmirror/1.txt",
+      "name": "Primary Source",
+      "enabled": true
+    }
   ],
   "fetch_interval": "3h",
   "test": {
@@ -34,5 +38,7 @@
     "remote_url": "git@github.com:your-user/your-subscriptions.git"
   },
   "state_file": "./gemsub_state.json",
-  "headless": false
+  "headless": false,
+  "probe_limit": 0,
+  "flag_mode": "auto"
 }
