@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -481,6 +482,9 @@ func TestService_Reload_CorruptedFileRollback(t *testing.T) {
 }
 
 func TestService_Permissions_NewFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping POSIX file permission mode assertion on Windows")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "new_config.json")
 
@@ -506,6 +510,9 @@ func TestService_Permissions_NewFile(t *testing.T) {
 }
 
 func TestService_Permissions_PreserveExisting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping POSIX file permission mode assertion on Windows")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "existing_config.json")
 

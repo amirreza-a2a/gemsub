@@ -43,6 +43,24 @@ builds:
       - -X gemsub/internal/version.Commit={{.Commit}}
       - -X gemsub/internal/version.Date={{.Date}}
 
+  - id: gemsub-windows
+    main: ./cmd/gemsub
+    binary: gemsub
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    tags:
+      - with_utls
+    ldflags:
+      - -s -w
+      - -X gemsub/internal/version.Version={{.Version}}
+      - -X gemsub/internal/version.Commit={{.Commit}}
+      - -X gemsub/internal/version.Date={{.Date}}
+
 archives:
   - id: linux-archive
     ids:
@@ -63,6 +81,18 @@ archives:
       {{ .ProjectName }}_Termux_{{ .Arch }}
     formats:
       - tar.gz
+    files:
+      - README.md
+      - config.example.json
+      - LICENSE
+
+  - id: windows-archive
+    ids:
+      - gemsub-windows
+    name_template: >-
+      {{ .ProjectName }}_Windows_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}
+    formats:
+      - zip
     files:
       - README.md
       - config.example.json

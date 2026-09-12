@@ -205,6 +205,38 @@ The installer verifies the userspace environment, validates architecture, checks
 
 ---
 
+### Windows
+
+Official standalone zip archives are available for 64-bit Windows on both x86_64 and ARM64 architectures.
+
+#### Manual Installation
+
+1. Download the release archive for your architecture from GitHub Releases:
+   - `x86_64` (64-bit Intel/AMD): `gemsub_Windows_x86_64.zip`
+   - `arm64` (64-bit ARM): `gemsub_Windows_arm64.zip`
+2. Download `checksums.txt` and verify the SHA-256 digest in PowerShell:
+   ```powershell
+   Get-FileHash .\gemsub_Windows_x86_64.zip -Algorithm SHA256
+   ```
+3. Extract the archive (via Windows Explorer or PowerShell):
+   ```powershell
+   Expand-Archive .\gemsub_Windows_x86_64.zip -DestinationPath .\gemsub
+   cd .\gemsub
+   ```
+4. Run `gemsub.exe` in Windows Terminal or PowerShell:
+   ```powershell
+   # Interactive mode (launches onboarding wizard or TUI)
+   .\gemsub.exe
+
+   # Headless daemon mode with configuration file
+   .\gemsub.exe -headless -config config.json
+   ```
+
+> [!NOTE]
+> **Git Publishing Requirement:** If Git publishing is enabled (`publishing.enabled: true` or `-publish`), [Git for Windows](https://git-scm.com/download/win) must be installed and available in `%PATH%`.
+
+---
+
 ### Building from Source
 
 #### Prerequisites

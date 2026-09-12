@@ -48,3 +48,32 @@ jobs:
 
       - name: Build
         run: go build -tags with_utls ./cmd/gemsub
+
+      - name: Cross-build Windows (amd64 and arm64)
+        run: |
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags with_utls -o /dev/null ./cmd/gemsub
+          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -tags with_utls -o /dev/null ./cmd/gemsub
+
+  validate-windows:
+    name: Validate Windows
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Static analysis (go vet)
+        run: go vet -tags with_utls ./...
+
+      - name: Unit tests
+        run: go test -tags with_utls -count=1 -p 1 ./...
+
+      - name: Build
+        run: go build -tags with_utls ./cmd/gemsub

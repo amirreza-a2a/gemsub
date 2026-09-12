@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1872,6 +1873,10 @@ func TestPublisher_AtomicWriteFile_Guarantees(t *testing.T) {
 	// 4. Reader concurrency / truncation test:
 	// A file with 50,000 bytes of 'A' is updated to 50,000 bytes of 'B'.
 	// A concurrent reader must NEVER observe an empty file (0 bytes) or partial length.
+	if runtime.GOOS == "windows" {
+		// Windows filesystem MoveFileEx does not support atomically replacing a file currently open by another handle.
+		return
+	}
 	concurrentFile := filepath.Join(tmpDir, "concurrent.txt")
 	chunkA := strings.Repeat("A", 50000)
 	chunkB := strings.Repeat("B", 50000)
