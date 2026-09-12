@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Verify formatting (gofmt)
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "The following Go files are not formatted with gofmt:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Verify whitespace (git diff --check)
+        run: git diff --check
+
+      - name: Static analysis (go vet)
+        run: go vet -tags with_utls ./...
+
+      - name: Unit tests
+        run: go test -tags with_utls ./...
+
+      - name: Race detector
+        run: go test -tags with_utls -race -count=1 ./...
+
+      - name: Build
+        run: go build -tags with_utls ./cmd/gemsub
