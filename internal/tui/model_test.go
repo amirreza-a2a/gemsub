@@ -18,6 +18,7 @@ import (
 	"gemsub/internal/events"
 	"gemsub/internal/logging"
 	"gemsub/internal/publisher"
+	"gemsub/internal/scheduler"
 	"gemsub/internal/store"
 	"gemsub/internal/tui"
 	"gemsub/internal/tui/adapter"
@@ -1321,6 +1322,18 @@ func (c *testDecoupledController) UpdateSetting(key string, value string) error 
 	return nil
 }
 
+func (c *testDecoupledController) PauseScheduler() error {
+	return nil
+}
+
+func (c *testDecoupledController) ResumeScheduler() error {
+	return nil
+}
+
+func (c *testDecoupledController) TriggerCycleNow() error {
+	return nil
+}
+
 func TestModel_ConfigCenterDecoupledController(t *testing.T) {
 	mock := &testDecoupledController{
 		configCenter: viewmodel.ConfigCenterViewModel{
@@ -1541,6 +1554,14 @@ type testSourceMockController struct {
 	updatedSettingKey string
 	updatedSettingVal string
 
+	schedPaused        bool
+	pauseCalls         int
+	resumeCalls        int
+	triggerCalls       int
+	pauseSchedulerErr  error
+	resumeSchedulerErr error
+	triggerCycleErr    error
+
 	toggleErr        error
 	addErr           error
 	updateErr        error
@@ -1580,12 +1601,33 @@ func (c *testSourceMockController) syncConfigCenter() {
 			{Key: "test.gemini.block_phrases", Label: "Block Phrases", Value: "blocked", EditorValue: "blocked", RawValue: "blocked", Type: viewmodel.SettingTypeString, Editable: true},
 		}
 	}
+
+	schedState := "RUNNING"
+	daemonVal := "Running"
+	nextCycleVal := "in 4m 58s (12:05:00)"
+	if c.schedPaused {
+		schedState = "PAUSED"
+		daemonVal = "Paused"
+		nextCycleVal = "— (paused)"
+	}
 	if len(c.schedulerItems) == 0 {
 		c.schedulerItems = []viewmodel.ConfigItemViewModel{
 			{Key: "fetch_interval", Label: "Fetch Interval", Value: "5m", EditorValue: "5m", RawValue: "5m", Type: viewmodel.SettingTypeDuration, Editable: true},
-			{Label: "Daemon Status", Value: "Running", Type: viewmodel.SettingTypeReadOnly, Editable: false},
+			{Label: "Daemon Status", Value: daemonVal, Type: viewmodel.SettingTypeReadOnly, Editable: false},
+			{Label: "Cycle Active", Value: "No", Type: viewmodel.SettingTypeReadOnly, Editable: false},
+			{Label: "Next Cycle", Value: nextCycleVal, Type: viewmodel.SettingTypeReadOnly, Editable: false},
+			{Label: "Last Duration", Value: "1.2s", Type: viewmodel.SettingTypeReadOnly, Editable: false},
+		}
+	} else {
+		for i := range c.schedulerItems {
+			if c.schedulerItems[i].Label == "Daemon Status" {
+				c.schedulerItems[i].Value = daemonVal
+			} else if c.schedulerItems[i].Label == "Next Cycle" {
+				c.schedulerItems[i].Value = nextCycleVal
+			}
 		}
 	}
+
 	if len(c.publishingItems) == 0 {
 		c.publishingItems = []viewmodel.ConfigItemViewModel{
 			{Key: "publishing.enabled", Label: "Publishing Enabled", Value: "true", EditorValue: "true", RawValue: "true", Type: viewmodel.SettingTypeBool, Editable: true},
@@ -1600,10 +1642,58 @@ func (c *testSourceMockController) syncConfigCenter() {
 			{Category: viewmodel.CategorySources, Name: "Sources", Sources: c.sources},
 			{Category: viewmodel.CategoryTesting, Name: "Testing", Items: c.testingItems},
 			{Category: viewmodel.CategoryGemini, Name: "Gemini", Items: c.geminiItems},
-			{Category: viewmodel.CategoryScheduler, Name: "Scheduler", Items: c.schedulerItems},
+			{
+				Category: viewmodel.CategoryScheduler,
+				Name:     "Scheduler",
+				Items:    c.schedulerItems,
+				Scheduler: viewmodel.SchedulerViewModel{
+					State:            schedState,
+					NextCycleText:    nextCycleVal,
+					LastDurationText: "1.2s",
+					FetchInterval:    "5m",
+					ProbeLimit:       "0",
+				},
+			},
 			{Category: viewmodel.CategoryPublishing, Name: "Publishing", Items: c.publishingItems},
 		},
 	}
+}
+
+func (c *testSourceMockController) PauseScheduler() error {
+	c.pauseCalls++
+	if c.pauseSchedulerErr != nil {
+		return c.pauseSchedulerErr
+	}
+	if c.schedPaused {
+		return scheduler.ErrSchedulerAlreadyPaused
+	}
+	c.schedPaused = true
+	c.syncConfigCenter()
+	return nil
+}
+
+func (c *testSourceMockController) ResumeScheduler() error {
+	c.resumeCalls++
+	if c.resumeSchedulerErr != nil {
+		return c.resumeSchedulerErr
+	}
+	if !c.schedPaused {
+		return scheduler.ErrSchedulerNotPaused
+	}
+	c.schedPaused = false
+	c.syncConfigCenter()
+	return nil
+}
+
+func (c *testSourceMockController) TriggerCycleNow() error {
+	c.triggerCalls++
+	if c.triggerCycleErr != nil {
+		return c.triggerCycleErr
+	}
+	if c.schedPaused {
+		return scheduler.ErrSchedulerPaused
+	}
+	return nil
 }
 
 func (c *testSourceMockController) ConfigCenter() viewmodel.ConfigCenterViewModel {
@@ -3329,4 +3419,245 @@ func TestModel_SettingsEditor_MockStateConsistency_Regression(t *testing.T) {
 			t.Errorf("expected public URL saved cleanly across Value, EditorValue, RawValue, got %+v", geminiItem)
 		}
 	})
+}
+
+func TestModel_SchedulerControls_PauseResumeToggle(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// Navigate to Scheduler category (CategoryScheduler = index 4)
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryScheduler))
+	m.SetConfigItemIndexForTest(0)
+
+	// Verify initial footer shows pause hint
+	footer := m.RenderFooterForTest()
+	if !strings.Contains(footer, "[p] Pause") || !strings.Contains(footer, "[r] Run Now") {
+		t.Fatalf("expected footer to show '[p] Pause' and '[r] Run Now', got: %s", footer)
+	}
+
+	// Press 'p' to pause
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+
+	if mock.pauseCalls != 1 {
+		t.Fatalf("expected 1 pause call, got %d", mock.pauseCalls)
+	}
+	if !mock.schedPaused {
+		t.Fatalf("expected scheduler to be paused in mock")
+	}
+	if got := m.StatusMessageForTest(); got != "Scheduler paused" {
+		t.Fatalf("expected status message 'Scheduler paused', got %q", got)
+	}
+
+	// Footer should now reflect resume hint
+	footer = m.RenderFooterForTest()
+	if !strings.Contains(footer, "[p] Resume") {
+		t.Fatalf("expected footer to show '[p] Resume' after pausing, got: %s", footer)
+	}
+
+	// Press 'p' to resume
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+
+	if mock.resumeCalls != 1 {
+		t.Fatalf("expected 1 resume call, got %d", mock.resumeCalls)
+	}
+	if mock.schedPaused {
+		t.Fatalf("expected scheduler to be resumed in mock")
+	}
+	if got := m.StatusMessageForTest(); got != "Scheduler resumed" {
+		t.Fatalf("expected status message 'Scheduler resumed', got %q", got)
+	}
+
+	// Footer should show pause hint again
+	footer = m.RenderFooterForTest()
+	if !strings.Contains(footer, "[p] Pause") {
+		t.Fatalf("expected footer to show '[p] Pause' after resuming, got: %s", footer)
+	}
+
+	// Test pause error handling
+	mock.pauseSchedulerErr = fmt.Errorf("daemon connection refused")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+	if got := m.StatusMessageForTest(); !strings.Contains(got, "Error: daemon connection refused") {
+		t.Fatalf("expected error status for pause failure, got %q", got)
+	}
+	mock.pauseSchedulerErr = nil
+
+	// Pause for resume error test
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+	if !mock.schedPaused {
+		t.Fatalf("expected scheduler paused")
+	}
+
+	mock.resumeSchedulerErr = fmt.Errorf("context cancelled")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+	if got := m.StatusMessageForTest(); !strings.Contains(got, "Error: context cancelled") {
+		t.Fatalf("expected error status for resume failure, got %q", got)
+	}
+}
+
+func TestModel_SchedulerControls_TriggerCycle(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// Navigate to Scheduler category (CategoryScheduler = index 4)
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryScheduler))
+
+	// Press 'r' to trigger cycle while running
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m = updated.(*tui.Model)
+
+	if mock.triggerCalls != 1 {
+		t.Fatalf("expected 1 trigger call, got %d", mock.triggerCalls)
+	}
+	if got := m.StatusMessageForTest(); got != "Test cycle triggered" {
+		t.Fatalf("expected status message 'Test cycle triggered', got %q", got)
+	}
+
+	// Pause scheduler
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+	if !mock.schedPaused {
+		t.Fatalf("expected scheduler to be paused")
+	}
+
+	// Press 'r' while paused: strictly rejected
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m = updated.(*tui.Model)
+
+	if mock.triggerCalls != 2 {
+		t.Fatalf("expected trigger call attempt while paused, got %d", mock.triggerCalls)
+	}
+	if got := m.StatusMessageForTest(); !strings.Contains(got, "scheduler is paused") {
+		t.Fatalf("expected error mentioning 'scheduler is paused', got %q", got)
+	}
+
+	// Resume scheduler
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+	if mock.schedPaused {
+		t.Fatalf("expected scheduler resumed")
+	}
+
+	// Test arbitrary trigger error
+	mock.triggerCycleErr = fmt.Errorf("active cycle in progress")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m = updated.(*tui.Model)
+	if got := m.StatusMessageForTest(); !strings.Contains(got, "Error: active cycle in progress") {
+		t.Fatalf("expected error status for trigger error, got %q", got)
+	}
+}
+
+func TestModel_SchedulerControls_EditorModalKeyIsolation(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// Navigate to Scheduler category (CategoryScheduler = index 4)
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryScheduler))
+	// Item 0 is "Fetch Interval" (editable)
+	m.SetConfigItemIndexForTest(0)
+
+	// Press Enter to open editor modal
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	if !m.SettingEditModeForTest() {
+		t.Fatalf("expected setting editor modal to be open")
+	}
+
+	initialPauseCalls := mock.pauseCalls
+	initialTriggerCalls := mock.triggerCalls
+
+	// Press 'p' while in editor modal
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+
+	if mock.pauseCalls != initialPauseCalls {
+		t.Fatalf("typing 'p' in modal must not call PauseScheduler()")
+	}
+	if !strings.HasSuffix(m.SettingInputValForTest(), "p") {
+		t.Fatalf("expected 'p' to be typed into input, got %q", m.SettingInputValForTest())
+	}
+
+	// Press 'r' while in editor modal
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m = updated.(*tui.Model)
+
+	if mock.triggerCalls != initialTriggerCalls {
+		t.Fatalf("typing 'r' in modal must not call TriggerCycleNow()")
+	}
+	if !strings.HasSuffix(m.SettingInputValForTest(), "pr") {
+		t.Fatalf("expected 'pr' in modal input, got %q", m.SettingInputValForTest())
+	}
+
+	// Press Esc to close modal
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(*tui.Model)
+
+	if m.SettingEditModeForTest() {
+		t.Fatalf("expected setting editor modal to close")
+	}
+}
+
+func TestModel_SchedulerControls_CategoryIsolation(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// In General category (index 0)
+	m.SetConfigCategoryForTest(0)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+	if mock.pauseCalls != 0 || mock.resumeCalls != 0 {
+		t.Fatalf("p key in General category must not trigger pause/resume")
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m = updated.(*tui.Model)
+	if mock.triggerCalls != 0 {
+		t.Fatalf("r key in General category must not trigger cycle")
+	}
+
+	// In Sources category (index 1)
+	m.SetConfigCategoryForTest(1)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+	if mock.pauseCalls != 0 || mock.resumeCalls != 0 {
+		t.Fatalf("p key in Sources category must not trigger pause/resume")
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m = updated.(*tui.Model)
+	if mock.triggerCalls != 0 {
+		t.Fatalf("r key in Sources category must not trigger cycle")
+	}
+
+	// In Publishing category (index 5)
+	m.SetConfigCategoryForTest(5)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+	if mock.pauseCalls != 0 || mock.resumeCalls != 0 {
+		t.Fatalf("p key in Publishing category must not trigger pause/resume")
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m = updated.(*tui.Model)
+	if mock.triggerCalls != 0 {
+		t.Fatalf("r key in Publishing category must not trigger cycle")
+	}
 }

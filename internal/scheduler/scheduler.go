@@ -48,6 +48,11 @@ type Scheduler struct {
 	lastCycleMetrics events.ProgressMetrics
 	lastCancelled    bool
 	lastServable     int
+
+	paused         bool
+	pauseCh        chan bool
+	nextEstimate   time.Time
+	completedCount int
 }
 
 func New(cfg *config.Config, st *store.Store, bus ...*events.EventBus) *Scheduler {
@@ -68,6 +73,7 @@ func New(cfg *config.Config, st *store.Store, bus ...*events.EventBus) *Schedule
 		rotator:    newCandidateRotator(),
 		intervalCh: make(chan time.Duration, 1),
 		Trigger:    make(chan struct{}, 1),
+		pauseCh:    make(chan bool, 1),
 	}
 }
 
@@ -145,6 +151,22 @@ func (s *Scheduler) publishCycleStarted(startedAt time.Time) {
 	})
 }
 
+func (s *Scheduler) updateNextEstimateLocked() {
+	if s.paused {
+		s.nextEstimate = time.Time{}
+		return
+	}
+	interval := s.cfg.FetchInterval
+	if interval <= 0 {
+		interval = 1 * time.Hour
+	}
+	s.nextEstimate = time.Now().Add(interval)
+}
+
+func (s *Scheduler) clearNextEstimateLocked() {
+	s.nextEstimate = time.Time{}
+}
+
 func (s *Scheduler) publishCycleFinished(cf events.CycleFinished) {
 	s.mu.Lock()
 	s.inCycle = false
@@ -153,9 +175,118 @@ func (s *Scheduler) publishCycleFinished(cf events.CycleFinished) {
 	s.lastCycleMetrics = cf.ProgressMetrics
 	s.lastCancelled = cf.Cancelled
 	s.lastServable = cf.Servable
+	s.completedCount++
+	s.updateNextEstimateLocked()
 	s.mu.Unlock()
 
 	s.bus.Publish(cf)
+}
+
+// Pause halts automatic timer execution. Running cycles continue uninterrupted.
+// Returns true if the state transitioned from unpaused to paused, or false if already paused.
+func (s *Scheduler) Pause() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.paused {
+		return false
+	}
+	s.paused = true
+	s.clearNextEstimateLocked()
+	select {
+	case s.pauseCh <- true:
+	default:
+		select {
+		case <-s.pauseCh:
+		default:
+		}
+		select {
+		case s.pauseCh <- true:
+		default:
+		}
+	}
+	return true
+}
+
+// Resume restores automatic timer execution and resets the ticker from resume time.
+// Returns true if the state transitioned from paused to unpaused, or false if not paused.
+func (s *Scheduler) Resume() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.paused {
+		return false
+	}
+	s.paused = false
+	s.updateNextEstimateLocked()
+	select {
+	case s.pauseCh <- false:
+	default:
+		select {
+		case <-s.pauseCh:
+		default:
+		}
+		select {
+		case s.pauseCh <- false:
+		default:
+		}
+	}
+	return true
+}
+
+// IsPaused returns true if automatic timer execution is paused.
+func (s *Scheduler) IsPaused() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.paused
+}
+
+// NextCycleEstimate returns the estimated timestamp of the next scheduled cycle,
+// or zero time if paused or not scheduled.
+func (s *Scheduler) NextCycleEstimate() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.paused {
+		return time.Time{}
+	}
+	return s.nextEstimate
+}
+
+// CycleCount returns the total number of completed test cycles.
+func (s *Scheduler) CycleCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.completedCount
+}
+
+// ResetControlState restores clean idle state: clears paused, clears nextEstimate,
+// and drains any pending pause or trigger channel signals.
+//
+// Invariant: ResetControlState is invoked during idle or teardown phases:
+// - Start(): before the scheduler loop is started.
+// - Stop(): after the scheduler loop has fully exited (<-done) and activeOps has drained.
+// - Run(): in deferred cleanup after the event loop has exited.
+// Thus, no concurrent consumer is reading from pauseCh or Trigger during reset.
+func (s *Scheduler) ResetControlState() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.paused = false
+	s.clearNextEstimateLocked()
+
+	select {
+	case <-s.pauseCh:
+	default:
+	}
+	select {
+	case <-s.Trigger:
+	default:
+	}
+}
+
+// InitNextEstimate calculates and records the initial nextEstimate based on the configured FetchInterval.
+func (s *Scheduler) InitNextEstimate() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateNextEstimateLocked()
 }
 
 // UpdateConfig updates the scheduler runtime configuration under lock,
@@ -202,6 +333,11 @@ func (s *Scheduler) Run(ctx context.Context) {
 		defer bus.Unsubscribe(configSub)
 	}
 
+	defer func() {
+		s.ResetControlState()
+	}()
+
+	s.InitNextEstimate()
 	s.runCycle(ctx)
 
 	s.mu.RLock()
@@ -214,13 +350,23 @@ func (s *Scheduler) Run(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	select {
+	case <-s.intervalCh:
+	default:
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+
 		case <-ticker.C:
-			s.runCycle(ctx)
-		case <-s.Trigger:
+			s.mu.RLock()
+			isPaused := s.paused
+			s.mu.RUnlock()
+			if isPaused {
+				continue
+			}
 			s.runCycle(ctx)
 			s.mu.RLock()
 			interval = s.cfg.FetchInterval
@@ -229,6 +375,42 @@ func (s *Scheduler) Run(ctx context.Context) {
 				interval = 1 * time.Hour
 			}
 			ticker.Reset(interval)
+			select {
+			case <-s.intervalCh:
+			default:
+			}
+
+		case <-s.Trigger:
+			s.mu.RLock()
+			isPaused := s.paused
+			s.mu.RUnlock()
+			if isPaused {
+				continue
+			}
+			s.runCycle(ctx)
+			s.mu.RLock()
+			interval = s.cfg.FetchInterval
+			s.mu.RUnlock()
+			if interval <= 0 {
+				interval = 1 * time.Hour
+			}
+			ticker.Reset(interval)
+			select {
+			case <-s.intervalCh:
+			default:
+			}
+
+		case isPaused := <-s.pauseCh:
+			if !isPaused {
+				s.mu.RLock()
+				interval = s.cfg.FetchInterval
+				s.mu.RUnlock()
+				if interval <= 0 {
+					interval = 1 * time.Hour
+				}
+				ticker.Reset(interval)
+			}
+
 		case evt, ok := <-configSub:
 			if !ok {
 				configSub = nil
@@ -237,10 +419,14 @@ func (s *Scheduler) Run(ctx context.Context) {
 			if cu, ok := evt.(config.ConfigUpdated); ok {
 				s.UpdateConfig(cu.New)
 			}
+
 		case newInterval := <-s.intervalCh:
 			if newInterval > 0 {
 				interval = newInterval
 				ticker.Reset(newInterval)
+				s.mu.Lock()
+				s.updateNextEstimateLocked()
+				s.mu.Unlock()
 			}
 		}
 	}

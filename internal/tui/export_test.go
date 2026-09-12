@@ -23,6 +23,11 @@ func (m *Model) SetStatusMessageForTest(msg string) {
 	m.statusMessage = msg
 }
 
+// StatusMessageForTest returns the current status message on Model for testing.
+func (m *Model) StatusMessageForTest() string {
+	return m.statusMessage
+}
+
 // SetWidthForTest sets the model terminal width for testing.
 func (m *Model) SetWidthForTest(w int) {
 	m.width = w

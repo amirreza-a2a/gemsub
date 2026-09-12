@@ -2,6 +2,7 @@ package adapter_test
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -3869,5 +3870,171 @@ func TestAdapter_UpdateSetting_LegacyGeminiSynchronization(t *testing.T) {
 		if reloaded2.Test.BlockPhrases[i] != phrase {
 			t.Errorf("reloaded Test.BlockPhrases[%d] = %q, want %q", i, reloaded2.Test.BlockPhrases[i], phrase)
 		}
+	}
+}
+
+func TestAdapter_Scheduler_ViewModelAndControls(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "store.json"), 2)
+	bus := events.New()
+	defer bus.Close()
+	ring := logging.NewRingLogHandler(50)
+
+	ad := adapter.New(st, bus, ring)
+	defer ad.Close()
+	ad.Subscribe()
+
+	// 1. Scheduler service unavailable when nil
+	if err := ad.PauseScheduler(); err == nil || !strings.Contains(err.Error(), "scheduler service unavailable") {
+		t.Fatalf("expected 'scheduler service unavailable', got %v", err)
+	}
+	if err := ad.ResumeScheduler(); err == nil || !strings.Contains(err.Error(), "scheduler service unavailable") {
+		t.Fatalf("expected 'scheduler service unavailable', got %v", err)
+	}
+	if err := ad.TriggerCycleNow(); err == nil || !strings.Contains(err.Error(), "scheduler service unavailable") {
+		t.Fatalf("expected 'scheduler service unavailable', got %v", err)
+	}
+
+	vmNil := ad.ConfigCenter()
+	schedCatNil := vmNil.Categories[viewmodel.CategoryScheduler]
+	if schedCatNil.Scheduler.State != "IDLE" {
+		t.Errorf("expected IDLE state when uninitialized, got %q", schedCatNil.Scheduler.State)
+	}
+
+	// 2. Inject ControlService
+	cfg := &config.Config{
+		FetchInterval: 10 * time.Minute,
+	}
+	sched := scheduler.New(cfg, st, bus)
+	schedCtrl := scheduler.NewControlService(sched)
+
+	ad.SetServices(nil, nil, nil, schedCtrl)
+
+	// In idle state (not started)
+	vmIdle := ad.ConfigCenter()
+	schedCatIdle := vmIdle.Categories[viewmodel.CategoryScheduler]
+	if schedCatIdle.Scheduler.State != "IDLE" {
+		t.Errorf("expected IDLE state when not started, got %q", schedCatIdle.Scheduler.State)
+	}
+	foundDaemonStatusStopped := false
+	for _, item := range schedCatIdle.Items {
+		if item.Label == "Daemon Status" && item.Value == "Stopped" {
+			foundDaemonStatusStopped = true
+		}
+	}
+	if !foundDaemonStatusStopped {
+		t.Errorf("expected Daemon Status == Stopped in idle state")
+	}
+
+	// Start scheduler
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := schedCtrl.Start(ctx); err != nil {
+		t.Fatalf("schedCtrl.Start: %v", err)
+	}
+	defer schedCtrl.Stop()
+
+	// In running state
+	vmRunning := ad.ConfigCenter()
+	schedCatRunning := vmRunning.Categories[viewmodel.CategoryScheduler]
+	if schedCatRunning.Scheduler.State != "RUNNING" {
+		t.Errorf("expected RUNNING state, got %q", schedCatRunning.Scheduler.State)
+	}
+	foundDaemonStatusRunning := false
+	for _, item := range schedCatRunning.Items {
+		if item.Label == "Daemon Status" && item.Value == "Running" {
+			foundDaemonStatusRunning = true
+		}
+	}
+	if !foundDaemonStatusRunning {
+		t.Errorf("expected Daemon Status == Running in running state")
+	}
+
+	// 3. Pause via Adapter
+	ad.CheckAndResetDirty() // clear dirty flag
+	if err := ad.PauseScheduler(); err != nil {
+		t.Fatalf("ad.PauseScheduler(): %v", err)
+	}
+	if !schedCtrl.IsPaused() {
+		t.Errorf("expected scheduler to be paused")
+	}
+	if !ad.CheckAndResetDirty() {
+		t.Errorf("expected dirty flag set after PauseScheduler")
+	}
+
+	vmPaused := ad.ConfigCenter()
+	schedCatPaused := vmPaused.Categories[viewmodel.CategoryScheduler]
+	if schedCatPaused.Scheduler.State != "PAUSED" {
+		t.Errorf("expected PAUSED state, got %q", schedCatPaused.Scheduler.State)
+	}
+	if schedCatPaused.Scheduler.NextCycleText != "— (paused)" {
+		t.Errorf("expected NextCycleText == '— (paused)', got %q", schedCatPaused.Scheduler.NextCycleText)
+	}
+	foundDaemonStatusPaused := false
+	for _, item := range schedCatPaused.Items {
+		if item.Label == "Daemon Status" && item.Value == "Paused" {
+			foundDaemonStatusPaused = true
+		}
+	}
+	if !foundDaemonStatusPaused {
+		t.Errorf("expected Daemon Status == Paused in paused state")
+	}
+
+	// 4. Trigger cycle while paused must fail
+	if err := ad.TriggerCycleNow(); err == nil || !strings.Contains(err.Error(), "scheduler is paused") {
+		t.Fatalf("expected trigger while paused to fail with 'scheduler is paused', got: %v", err)
+	}
+
+	// 5. Resume via Adapter
+	ad.CheckAndResetDirty()
+	if err := ad.ResumeScheduler(); err != nil {
+		t.Fatalf("ad.ResumeScheduler(): %v", err)
+	}
+	if schedCtrl.IsPaused() {
+		t.Errorf("expected scheduler to be unpaused")
+	}
+	if !ad.CheckAndResetDirty() {
+		t.Errorf("expected dirty flag set after ResumeScheduler")
+	}
+
+	vmResumed := ad.ConfigCenter()
+	schedCatResumed := vmResumed.Categories[viewmodel.CategoryScheduler]
+	if schedCatResumed.Scheduler.State != "RUNNING" {
+		t.Errorf("expected RUNNING state after resume, got %q", schedCatResumed.Scheduler.State)
+	}
+
+	// 6. Trigger cycle while running succeeds
+	if err := ad.TriggerCycleNow(); err != nil {
+		t.Fatalf("ad.TriggerCycleNow() while running failed: %v", err)
+	}
+
+	// 7. EventBus SchedulerPaused and SchedulerResumed events mark adapter dirty
+	ad.CheckAndResetDirty()
+	bus.Publish(events.SchedulerPaused{PausedAt: time.Now()})
+	deadline := time.Now().Add(500 * time.Millisecond)
+	isDirty := false
+	for time.Now().Before(deadline) {
+		if ad.CheckAndResetDirty() {
+			isDirty = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !isDirty {
+		t.Errorf("expected dirty flag set after events.SchedulerPaused")
+	}
+
+	bus.Publish(events.SchedulerResumed{ResumedAt: time.Now()})
+	deadline = time.Now().Add(500 * time.Millisecond)
+	isDirty = false
+	for time.Now().Before(deadline) {
+		if ad.CheckAndResetDirty() {
+			isDirty = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !isDirty {
+		t.Errorf("expected dirty flag set after events.SchedulerResumed")
 	}
 }

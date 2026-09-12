@@ -231,6 +231,12 @@ func (a *Adapter) handleEvent(evt any) {
 		a.lastPublishError = e.Error
 		a.publishFailCount++
 		atomic.StoreInt32(&a.dirty, 1)
+
+	case events.SchedulerPaused:
+		atomic.StoreInt32(&a.dirty, 1)
+
+	case events.SchedulerResumed:
+		atomic.StoreInt32(&a.dirty, 1)
 	}
 }
 
@@ -1296,11 +1302,46 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 			Description:     "Maximum candidates to test per cycle (0 = unlimited)",
 		},
 	}
+	var schedVM viewmodel.SchedulerViewModel
 	if schedCtrl != nil {
 		schedStatus := schedCtrl.Status()
+		stateStr := schedStatus.State.String() // "IDLE", "RUNNING", "PAUSED"
+		schedVM.State = stateStr
+		schedVM.CycleActive = schedStatus.CycleActive
+		schedVM.LastCycleStart = schedStatus.LastCycleStart
+		schedVM.LastCycleEnd = schedStatus.LastCycleEnd
+		schedVM.LastDuration = schedStatus.LastDuration
+		schedVM.CompletedCycles = schedStatus.CycleCount
+		schedVM.FetchInterval = valueOrFallback(cfg.FetchIntervalRaw, "(not set)")
+		schedVM.ProbeLimit = probeLimitStr
+
+		if schedStatus.LastDuration > 0 {
+			schedVM.LastDurationText = schedStatus.LastDuration.Round(time.Millisecond).String()
+		} else {
+			schedVM.LastDurationText = "—"
+		}
+
+		if schedStatus.State == scheduler.StatePaused {
+			schedVM.NextCycleText = "— (paused)"
+		} else if schedStatus.State == scheduler.StateIdle {
+			schedVM.NextCycleText = "Not scheduled"
+		} else if !schedStatus.NextCycleEstimate.IsZero() {
+			schedVM.NextCycleEstimate = schedStatus.NextCycleEstimate
+			remaining := time.Until(schedStatus.NextCycleEstimate)
+			if remaining > 0 {
+				schedVM.NextCycleText = fmt.Sprintf("in %s (%s)", remaining.Round(time.Second).String(), schedStatus.NextCycleEstimate.Format("15:04:05"))
+			} else {
+				schedVM.NextCycleText = fmt.Sprintf("due now (%s)", schedStatus.NextCycleEstimate.Format("15:04:05"))
+			}
+		} else {
+			schedVM.NextCycleText = "—"
+		}
+
 		daemonStatus := "Stopped"
-		if schedStatus.Running {
+		if schedStatus.State == scheduler.StateRunning {
 			daemonStatus = "Running"
+		} else if schedStatus.State == scheduler.StatePaused {
+			daemonStatus = "Paused"
 		}
 		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
 			Label:    "Daemon Status",
@@ -1318,6 +1359,12 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 			Type:     viewmodel.SettingTypeReadOnly,
 			Editable: false,
 		})
+		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
+			Label:    "Next Cycle",
+			Value:    schedVM.NextCycleText,
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
+		})
 		lastCycleStr := "Never"
 		if !schedStatus.LastCycleStart.IsZero() {
 			lastCycleStr = schedStatus.LastCycleStart.Format("15:04:05")
@@ -1328,15 +1375,19 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 			Type:     viewmodel.SettingTypeReadOnly,
 			Editable: false,
 		})
-		if schedStatus.LastDuration > 0 {
-			schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
-				Label:    "Last Duration",
-				Value:    schedStatus.LastDuration.Round(time.Millisecond).String(),
-				Type:     viewmodel.SettingTypeReadOnly,
-				Editable: false,
-			})
-		}
+		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
+			Label:    "Last Duration",
+			Value:    schedVM.LastDurationText,
+			Type:     viewmodel.SettingTypeReadOnly,
+			Editable: false,
+		})
 	} else {
+		schedVM.State = "IDLE"
+		schedVM.NextCycleText = "Not initialized"
+		schedVM.LastDurationText = "—"
+		schedVM.FetchInterval = valueOrFallback(cfg.FetchIntervalRaw, "(not set)")
+		schedVM.ProbeLimit = probeLimitStr
+
 		schedulerItems = append(schedulerItems, viewmodel.ConfigItemViewModel{
 			Label:    "Daemon Status",
 			Value:    "Not initialized",
@@ -1345,9 +1396,10 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 		})
 	}
 	categories[viewmodel.CategoryScheduler] = viewmodel.ConfigCategoryViewModel{
-		Category: viewmodel.CategoryScheduler,
-		Name:     viewmodel.CategoryScheduler.Name(),
-		Items:    schedulerItems,
+		Category:  viewmodel.CategoryScheduler,
+		Name:      viewmodel.CategoryScheduler.Name(),
+		Items:     schedulerItems,
+		Scheduler: schedVM,
 	}
 
 	// 6. Publishing Category
@@ -1871,4 +1923,52 @@ func (a *Adapter) DeleteSource(id string) error {
 	}
 	atomic.StoreInt32(&a.dirty, 1)
 	return nil
+}
+
+// PauseScheduler halts scheduled cycle execution via ControlService.
+func (a *Adapter) PauseScheduler() error {
+	a.mu.RLock()
+	schedCtrl := a.schedulerCtrl
+	a.mu.RUnlock()
+
+	if schedCtrl == nil {
+		return fmt.Errorf("scheduler service unavailable")
+	}
+	err := schedCtrl.Pause()
+	if err == nil {
+		atomic.StoreInt32(&a.dirty, 1)
+	}
+	return err
+}
+
+// ResumeScheduler restores scheduled cycle execution via ControlService.
+func (a *Adapter) ResumeScheduler() error {
+	a.mu.RLock()
+	schedCtrl := a.schedulerCtrl
+	a.mu.RUnlock()
+
+	if schedCtrl == nil {
+		return fmt.Errorf("scheduler service unavailable")
+	}
+	err := schedCtrl.Resume()
+	if err == nil {
+		atomic.StoreInt32(&a.dirty, 1)
+	}
+	return err
+}
+
+// TriggerCycleNow requests immediate cycle execution via ControlService.
+func (a *Adapter) TriggerCycleNow() error {
+	a.mu.RLock()
+	schedCtrl := a.schedulerCtrl
+	a.mu.RUnlock()
+
+	if schedCtrl == nil {
+		return fmt.Errorf("scheduler service unavailable")
+	}
+	err := schedCtrl.Trigger()
+	if err == nil {
+		atomic.StoreInt32(&a.dirty, 1)
+	}
+	return err
 }

@@ -32,6 +32,9 @@ type Controller interface {
 	UpdateSource(id string, rawURL string, name string) error
 	DeleteSource(id string) error
 	UpdateSetting(key string, value string) error
+	PauseScheduler() error
+	ResumeScheduler() error
+	TriggerCycleNow() error
 }
 
 // ActiveView represents the primary content pane currently displayed.
@@ -440,6 +443,39 @@ func (m *Model) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(items) > 0 {
 			m.configItemIndex = len(items) - 1
 		}
+
+	case "p", "P":
+		if m.configCategory == viewmodel.CategoryScheduler && m.ctrl != nil {
+			sched := m.configCenter.Scheduler()
+			if sched.State == "PAUSED" {
+				if err := m.ctrl.ResumeScheduler(); err != nil {
+					m.setStatus(fmt.Sprintf("Error: %s", err))
+				} else {
+					m.setStatus("Scheduler resumed")
+					m.refreshConfigCenter()
+				}
+			} else {
+				if err := m.ctrl.PauseScheduler(); err != nil {
+					m.setStatus(fmt.Sprintf("Error: %s", err))
+				} else {
+					m.setStatus("Scheduler paused")
+					m.refreshConfigCenter()
+				}
+			}
+			return m, nil
+		}
+
+	case "r", "R":
+		if m.configCategory == viewmodel.CategoryScheduler && m.ctrl != nil {
+			if err := m.ctrl.TriggerCycleNow(); err != nil {
+				m.setStatus(fmt.Sprintf("Error: %s", err))
+			} else {
+				m.setStatus("Test cycle triggered")
+				m.refreshConfigCenter()
+			}
+			return m, nil
+		}
+
 	case "enter", "e":
 		items := m.configCategoryItems()
 		if len(items) == 0 || m.configItemIndex >= len(items) {
@@ -1903,6 +1939,12 @@ func (m *Model) renderFooter() string {
 				} else {
 					hints = fmt.Sprintf("%s [Enter] Save  [Esc] Cancel", statusStr)
 				}
+			} else if m.configCategory == viewmodel.CategoryScheduler {
+				pauseAction := "Pause"
+				if m.configCenter.Scheduler().State == "PAUSED" {
+					pauseAction = "Resume"
+				}
+				hints = fmt.Sprintf("%s [p] %s  [r] Run Now  [Enter] Edit Setting  [Tab] Cat  [Esc] Back  [q] Quit", statusStr, pauseAction)
 			} else {
 				hints = fmt.Sprintf("%s [Enter] Edit/Toggle  [Space] Toggle/Cycle  [Tab] Cat  [Esc] Back  [q] Quit", statusStr)
 			}

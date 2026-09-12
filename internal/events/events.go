@@ -70,3 +70,13 @@ type PublishingFailed struct {
 	Branch     string        `json:"branch"`
 	Error      string        `json:"error"`
 }
+
+// SchedulerPaused is emitted when automatic timer-based cycle execution is paused.
+type SchedulerPaused struct {
+	PausedAt time.Time `json:"paused_at"`
+}
+
+// SchedulerResumed is emitted when automatic timer-based cycle execution is resumed.
+type SchedulerResumed struct {
+	ResumedAt time.Time `json:"resumed_at"`
+}

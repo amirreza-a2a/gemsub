@@ -1,5 +1,7 @@
 package viewmodel
 
+import "time"
+
 // ConfigCategory identifies a configuration section in the Config Center.
 type ConfigCategory int
 
@@ -76,12 +78,28 @@ type SourceItemViewModel struct {
 	StatusMsg      string // Last fetch status or error message (if known)
 }
 
+// SchedulerViewModel represents presentation telemetry and status for the Scheduler pane.
+type SchedulerViewModel struct {
+	State             string    // "IDLE", "RUNNING", "PAUSED"
+	CycleActive       bool      // True if probe cycle is actively in flight
+	NextCycleEstimate time.Time // Zero if paused, stopped, or not scheduled
+	NextCycleText     string    // e.g. "in 8m 32s (14:35:00)", "— (paused)", "—"
+	LastCycleStart    time.Time // Zero if no cycles have run
+	LastCycleEnd      time.Time
+	LastDuration      time.Duration
+	LastDurationText  string // Formatted duration or "—"
+	CompletedCycles   int    // Total completed test cycles
+	FetchInterval     string // Formatted interval (e.g. "10m")
+	ProbeLimit        string // Formatted probe limit (e.g. "unlimited" or "50 candidates")
+}
+
 // ConfigCategoryViewModel contains the display items for a single category tab.
 type ConfigCategoryViewModel struct {
-	Category ConfigCategory
-	Name     string
-	Items    []ConfigItemViewModel
-	Sources  []SourceItemViewModel
+	Category  ConfigCategory
+	Name      string
+	Items     []ConfigItemViewModel
+	Sources   []SourceItemViewModel
+	Scheduler SchedulerViewModel
 }
 
 // ConfigCenterViewModel bundles all category view data for the Configuration Center.
@@ -97,4 +115,14 @@ func (c ConfigCenterViewModel) Sources() []SourceItemViewModel {
 		}
 	}
 	return nil
+}
+
+// Scheduler returns the SchedulerViewModel if the Scheduler category exists.
+func (c ConfigCenterViewModel) Scheduler() SchedulerViewModel {
+	for _, cat := range c.Categories {
+		if cat.Category == CategoryScheduler {
+			return cat.Scheduler
+		}
+	}
+	return SchedulerViewModel{}
 }
