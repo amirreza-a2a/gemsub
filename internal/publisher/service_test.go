@@ -328,6 +328,50 @@ func TestService_ValidatePrerequisites_ValidGitRepository(t *testing.T) {
 	}
 }
 
+func TestService_ValidatePrerequisites_SSHandHTTPS_Equivalence(t *testing.T) {
+	tempRepo := t.TempDir()
+	// Real git repo with SSH origin
+	initGitRepo(t, tempRepo, "git@github.com:amirreza-a2a/gemsub-subscriptions.git")
+
+	// Configured with HTTPS URL for the same repository
+	pubCfg := config.PublishingConfig{
+		Enabled:    true,
+		Repository: tempRepo,
+		Branch:     "main",
+		RemoteURL:  "https://github.com/amirreza-a2a/gemsub-subscriptions.git",
+	}
+	cfgSvc, _ := setupConfigSvc(t, pubCfg)
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+	svc := publisher.NewService(cfgSvc, st, nil)
+
+	// 1. Prerequisites pass with cross-protocol equivalence
+	if err := svc.ValidatePrerequisites(context.Background()); err != nil {
+		t.Fatalf("expected SSH origin and HTTPS configured URL to pass ValidatePrerequisites, got: %v", err)
+	}
+
+	// 2. TestConnection delegates and succeeds
+	if err := svc.TestConnection(context.Background()); err != nil {
+		t.Fatalf("expected TestConnection to pass, got: %v", err)
+	}
+
+	// 3. Update to SSH URI also passes
+	if err := svc.SetRemoteURL("ssh://git@github.com/amirreza-a2a/gemsub-subscriptions.git"); err != nil {
+		t.Fatalf("SetRemoteURL failed: %v", err)
+	}
+	if err := svc.ValidatePrerequisites(context.Background()); err != nil {
+		t.Fatalf("expected SSH URI to pass ValidatePrerequisites, got: %v", err)
+	}
+
+	// 4. Update to mismatched repo fails with ErrInvalidConfiguration
+	if err := svc.SetRemoteURL("https://github.com/amirreza-a2a/another-repo.git"); err != nil {
+		t.Fatalf("SetRemoteURL failed: %v", err)
+	}
+	err := svc.ValidatePrerequisites(context.Background())
+	if !errors.Is(err, publisher.ErrInvalidConfiguration) {
+		t.Fatalf("expected ErrInvalidConfiguration on repository mismatch, got: %v", err)
+	}
+}
+
 func TestService_Publish_SuccessWithEvents(t *testing.T) {
 	pubCfg := config.PublishingConfig{
 		Enabled:    true,

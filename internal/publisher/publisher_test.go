@@ -637,6 +637,99 @@ func TestPublisher_RepositoryValidation(t *testing.T) {
 	}
 }
 
+func TestPublisher_ValidatePrerequisites_CanonicalEquivalenceAndSafety(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+
+	tests := []struct {
+		name          string
+		actualOrigin  string
+		configuredURL string
+		expectPass    bool
+	}{
+		{
+			name:          "actual SSH origin, configured HTTPS URL -> PASS",
+			actualOrigin:  "git@github.com:amirreza-a2a/gemsub-subscriptions.git",
+			configuredURL: "https://github.com/amirreza-a2a/gemsub-subscriptions.git",
+			expectPass:    true,
+		},
+		{
+			name:          "actual HTTPS origin, configured SSH URL -> PASS",
+			actualOrigin:  "https://github.com/amirreza-a2a/gemsub-subscriptions.git",
+			configuredURL: "git@github.com:amirreza-a2a/gemsub-subscriptions.git",
+			expectPass:    true,
+		},
+		{
+			name:          "actual SSH URI origin, configured SCP SSH URL -> PASS",
+			actualOrigin:  "ssh://git@github.com/amirreza-a2a/gemsub-subscriptions.git",
+			configuredURL: "git@github.com:amirreza-a2a/gemsub-subscriptions.git",
+			expectPass:    true,
+		},
+		{
+			name:          "actual SSH URI with port 22, configured HTTPS URL -> PASS",
+			actualOrigin:  "ssh://git@github.com:22/amirreza-a2a/gemsub-subscriptions.git",
+			configuredURL: "https://github.com/amirreza-a2a/gemsub-subscriptions.git",
+			expectPass:    true,
+		},
+		{
+			name:          "different repository path -> FAIL",
+			actualOrigin:  "git@github.com:amirreza-a2a/gemsub-subscriptions.git",
+			configuredURL: "https://github.com/amirreza-a2a/other-repo.git",
+			expectPass:    false,
+		},
+		{
+			name:          "different host -> FAIL",
+			actualOrigin:  "git@github.com:amirreza-a2a/gemsub-subscriptions.git",
+			configuredURL: "git@gitlab.com:amirreza-a2a/gemsub-subscriptions.git",
+			expectPass:    false,
+		},
+		{
+			name:          "mismatched custom SSH port -> FAIL",
+			actualOrigin:  "ssh://git@github.com:2222/amirreza-a2a/gemsub-subscriptions.git",
+			configuredURL: "ssh://git@github.com:22/amirreza-a2a/gemsub-subscriptions.git",
+			expectPass:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &mockGitRunner{
+				runFunc: func(ctx context.Context, dir string, args ...string) (string, error) {
+					if len(args) > 0 && args[0] == "rev-parse" {
+						return "true\n", nil
+					}
+					if len(args) > 0 && args[0] == "config" {
+						return tc.actualOrigin + "\n", nil
+					}
+					return "", nil
+				},
+			}
+			cfg := &config.PublishingConfig{
+				Enabled:    true,
+				Repository: tmpDir,
+				Branch:     "main",
+				RemoteURL:  tc.configuredURL,
+			}
+			pub := publisher.NewWithGit(cfg, st, mock)
+			err := pub.ValidatePrerequisites(context.Background())
+			if tc.expectPass && err != nil {
+				t.Fatalf("expected ValidatePrerequisites to pass, got: %v", err)
+			}
+			if !tc.expectPass {
+				if err == nil {
+					t.Fatalf("expected ValidatePrerequisites to fail on mismatch, got nil")
+				}
+				if !errors.Is(err, publisher.ErrInvalidConfiguration) {
+					t.Fatalf("expected ErrInvalidConfiguration, got: %v", err)
+				}
+				if !strings.Contains(err.Error(), "remote origin URL mismatch") {
+					t.Fatalf("expected error containing 'remote origin URL mismatch', got: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestPublisher_GitFailuresSurfaced(t *testing.T) {
 	tmpDir := t.TempDir()
 	st := store.New(filepath.Join(tmpDir, "state.json"), 2)

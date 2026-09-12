@@ -578,7 +578,7 @@ func (p *Publisher) ValidatePrerequisites(ctx context.Context) error {
 	}
 	originURL = strings.TrimSpace(originURL)
 
-	if originURL != expectedRemote {
+	if !SameRepository(originURL, expectedRemote) {
 		return fmt.Errorf("%w: publisher: remote origin URL mismatch: expected %q, got %q", ErrInvalidConfiguration, SanitizeURL(expectedRemote), SanitizeURL(originURL))
 	}
 

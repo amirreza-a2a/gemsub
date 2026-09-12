@@ -1615,6 +1615,61 @@ func updateURLPreservingCredentials(currentURL, newURL string) (string, error) {
 	return parsedNew.String(), nil
 }
 
+// updateRemoteURLPreservingCredentials validates newURL for Git remotes and preserves
+// existing credentials for HTTP(S) URLs per credential policy.
+func updateRemoteURLPreservingCredentials(currentURL, newURL string) (string, error) {
+	trimmed := strings.TrimSpace(newURL)
+	if trimmed == "" {
+		return "", fmt.Errorf("URL cannot be empty")
+	}
+
+	remote, err := publisher.ParseRemoteURL(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("invalid URL")
+	}
+
+	// For SCP syntax (e.g. "git@github.com:owner/repo.git"), return as-is.
+	if !strings.Contains(trimmed, "://") {
+		return trimmed, nil
+	}
+
+	parsedNew, err := url.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("invalid URL")
+	}
+
+	// Check for explicit credentials in userinfo
+	if parsedNew.User != nil {
+		user := parsedNew.User.Username()
+		pass, hasPass := parsedNew.User.Password()
+		// In SSH URIs, username "git" or other user without password is not a secret credential.
+		isMasked := (user == "***" && (!hasPass || pass == "***"))
+		isSSHUserOnly := (remote.Protocol == publisher.ProtocolSSH && !hasPass && user != "***")
+		if !isMasked && !isSSHUserOnly {
+			return "", fmt.Errorf("credentials must be managed separately")
+		}
+	}
+
+	// For HTTP/HTTPS URLs, preserve existing credentials if currentURL was HTTP(S) with userinfo
+	if (remote.Protocol == publisher.ProtocolHTTPS || remote.Protocol == publisher.ProtocolHTTP) &&
+		strings.TrimSpace(currentURL) != "" {
+		if parsedCurrent, err := url.Parse(currentURL); err == nil && parsedCurrent.User != nil {
+			currScheme := strings.ToLower(parsedCurrent.Scheme)
+			if currScheme == "http" || currScheme == "https" {
+				parsedNew.User = parsedCurrent.User
+				return parsedNew.String(), nil
+			}
+		}
+	}
+
+	// No existing credentials in currentURL: if user supplied presentation mask "***", strip it
+	if parsedNew.User != nil && parsedNew.User.Username() == "***" {
+		parsedNew.User = nil
+	}
+
+	return parsedNew.String(), nil
+}
+
 // buildURLSettingItem constructs a ConfigItemViewModel for a URL setting,
 // ensuring secret-bearing credentials are never placed in RawValue or presentation state.
 func buildURLSettingItem(key, label, rawURL, desc string) viewmodel.ConfigItemViewModel {
@@ -1685,7 +1740,7 @@ func (a *Adapter) UpdateSetting(key string, value string) error {
 			updateErr = pubSvc.SetBranch(trimmed)
 		case "publishing.remote_url":
 			current := pubSvc.Config().RemoteURL
-			newURL, err := updateURLPreservingCredentials(current, trimmed)
+			newURL, err := updateRemoteURLPreservingCredentials(current, trimmed)
 			if err != nil {
 				return err
 			}

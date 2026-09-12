@@ -3624,6 +3624,169 @@ func TestAdapter_UpdateSetting_RemoteURL_CredentialPolicy(t *testing.T) {
 	}
 }
 
+func TestAdapter_UpdateSetting_PublishingRemoteURL_GitFormats(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	bus := events.New()
+	defer bus.Close()
+
+	initialCfg := config.Config{
+		FetchIntervalRaw: "10m",
+		Sources: []config.SourceItem{
+			{ID: "src-1", URL: "https://example.com/feed", Name: "Source 1", Enabled: true},
+		},
+		Test: config.TestConfig{
+			TimeoutRaw:  "10s",
+			Concurrency: 5,
+			HealthURL:   "https://health.example.com/check",
+			Gemini: config.GeminiConfig{
+				URL:          "https://gemini.dev/v1",
+				BlockPhrases: []string{"blocked"},
+			},
+		},
+		Publishing: config.PublishingConfig{
+			Enabled:    true,
+			Repository: "./test-repo",
+			Branch:     "main",
+			RemoteURL:  "https://github.com/initial/repo.git",
+		},
+	}
+
+	cfgSvc, err := config.NewService(cfgPath, &initialCfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+	pubSvc := publisher.NewService(cfgSvc, nil, bus)
+	ad, _, _, _ := setupTestAdapter(t)
+	ad.SetServices(cfgSvc, nil, pubSvc, nil)
+
+	validRemotes := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "SCP SSH syntax",
+			input:    "git@github.com:owner/repo.git",
+			expected: "git@github.com:owner/repo.git",
+		},
+		{
+			name:     "SSH URI syntax",
+			input:    "ssh://git@github.com/owner/repo.git",
+			expected: "ssh://git@github.com/owner/repo.git",
+		},
+		{
+			name:     "SSH URI syntax with custom port",
+			input:    "ssh://git@gitlab.corp.net:2222/group/subgroup/project.git",
+			expected: "ssh://git@gitlab.corp.net:2222/group/subgroup/project.git",
+		},
+		{
+			name:     "HTTPS syntax",
+			input:    "https://github.com/owner/repo.git",
+			expected: "https://github.com/owner/repo.git",
+		},
+		{
+			name:     "HTTP syntax",
+			input:    "http://git.local/owner/repo.git",
+			expected: "http://git.local/owner/repo.git",
+		},
+	}
+
+	for _, tc := range validRemotes {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ad.UpdateSetting("publishing.remote_url", tc.input); err != nil {
+				t.Fatalf("UpdateSetting(publishing.remote_url, %q) unexpected error: %v", tc.input, err)
+			}
+			if got := cfgSvc.Get().Publishing.RemoteURL; got != tc.expected {
+				t.Errorf("expected RemoteURL = %q, got %q", tc.expected, got)
+			}
+		})
+	}
+
+	invalidRemotes := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "malformed URL",
+			input: "http://[invalid:host:port",
+		},
+		{
+			name:  "unsupported scheme ftp",
+			input: "ftp://github.com/owner/repo.git",
+		},
+		{
+			name:  "unsupported scheme git+ssh",
+			input: "git+ssh://git@github.com/owner/repo.git",
+		},
+		{
+			name:  "unsupported file URI",
+			input: "file:///var/git/repo.git",
+		},
+		{
+			name:  "unsupported local absolute path",
+			input: "/var/git/repo.git",
+		},
+		{
+			name:  "unsupported local relative path",
+			input: "./relative/repo.git",
+		},
+		{
+			name:  "rejected query parameter in HTTPS",
+			input: "https://github.com/owner/repo.git?evil=true",
+		},
+		{
+			name:  "rejected fragment in HTTPS",
+			input: "https://github.com/owner/repo.git#fragment",
+		},
+		{
+			name:  "rejected path traversal dot-dot in HTTPS",
+			input: "https://github.com/owner/repo/../other.git",
+		},
+		{
+			name:  "rejected path traversal dot-dot in SCP",
+			input: "git@github.com:owner/../other.git",
+		},
+		{
+			name:  "missing host",
+			input: "https:///owner/repo.git",
+		},
+		{
+			name:  "empty path",
+			input: "git@github.com:",
+		},
+		{
+			name:  "rejected encoded slash in HTTPS",
+			input: "https://github.com/owner%2Frepo.git",
+		},
+		{
+			name:  "rejected encoded traversal in HTTPS",
+			input: "https://github.com/owner/%2E%2E/repo.git",
+		},
+		{
+			name:  "rejected .git repository name",
+			input: "https://github.com/owner/.git",
+		},
+		{
+			name:  "rejected segment leading whitespace",
+			input: "https://github.com/owner/ repo.git",
+		},
+	}
+
+	for _, tc := range invalidRemotes {
+		t.Run(tc.name, func(t *testing.T) {
+			before := cfgSvc.Get().Publishing.RemoteURL
+			err := ad.UpdateSetting("publishing.remote_url", tc.input)
+			if err == nil {
+				t.Fatalf("expected error for invalid remote %q, got nil", tc.input)
+			}
+			if got := cfgSvc.Get().Publishing.RemoteURL; got != before {
+				t.Errorf("config mutated on invalid remote %q: got %q", tc.input, got)
+			}
+		})
+	}
+}
+
 func TestAdapter_UpdateSetting_CrossFieldPreservation(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "config.json")
