@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strings"
@@ -35,6 +36,8 @@ type Controller interface {
 	PauseScheduler() error
 	ResumeScheduler() error
 	TriggerCycleNow() error
+	TestPublishing(ctx context.Context) error
+	PublishNow(ctx context.Context) error
 }
 
 // ActiveView represents the primary content pane currently displayed.
@@ -112,7 +115,17 @@ type Model struct {
 	inputURL          string
 	inputName         string
 	inputFocus        int // 0 = URL, 1 = Name
+
+	// Publishing state
+	pubTesting        bool
+	pubTestingSpinner int
+	pubTestSuccess    bool
+	pubTestMsg        string
+	pubPublishing     bool
+	confirmPublish    bool
 }
+
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 type sourceInputMode int
 
@@ -159,6 +172,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case TickMsg:
+		if m.pubTesting || m.pubPublishing {
+			m.pubTestingSpinner++
+		}
 		// Background Store/ViewModel refreshes are throttled to a maximum 10 Hz rate (100 ms interval).
 		// When dirty == false, no Store snapshot or ViewModel rebuild is performed.
 		// Interactive navigation (keys, resizes) responds and renders immediately without frame drops.
@@ -175,14 +191,89 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMessage = ""
 		}
 		return m, tickCmd()
+
+	case publishingTestResultMsg:
+		m.pubTesting = false
+		if msg.err != nil {
+			m.pubTestSuccess = false
+			sanitized := publisher.SanitizeMessage(msg.err.Error())
+			m.pubTestMsg = sanitized
+			m.setStatus(fmt.Sprintf("Diagnostics failed: %s", sanitized))
+		} else {
+			m.pubTestSuccess = true
+			m.pubTestMsg = "Repository accessible, remote verified"
+			m.setStatus("Diagnostics passed: repository connection OK")
+		}
+		if m.activeView == ViewConfig {
+			m.refreshConfigCenter()
+		}
+		return m, nil
+
+	case publishingRunResultMsg:
+		m.pubPublishing = false
+		if msg.err != nil {
+			sanitized := publisher.SanitizeMessage(msg.err.Error())
+			m.setStatus(fmt.Sprintf("Publish failed: %s", sanitized))
+		} else {
+			var enabled bool
+			for _, cat := range m.configCenter.Categories {
+				if cat.Category == viewmodel.CategoryPublishing {
+					enabled = cat.Publishing.Enabled
+					break
+				}
+			}
+			if !enabled {
+				m.setStatus("Publishing is disabled; no publication performed")
+			} else {
+				m.setStatus("Publication succeeded")
+			}
+		}
+		if m.activeView == ViewConfig {
+			m.refreshConfigCenter()
+		}
+		return m, nil
 	}
 
 	return m, nil
 }
 
+type publishingTestResultMsg struct {
+	err error
+}
+
+type publishingRunResultMsg struct {
+	err error
+}
+
+func (m *Model) testPublishingCmd() tea.Cmd {
+	ctrl := m.ctrl
+	return func() tea.Msg {
+		if ctrl == nil {
+			return publishingTestResultMsg{err: fmt.Errorf("publishing service unavailable")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		err := ctrl.TestPublishing(ctx)
+		return publishingTestResultMsg{err: err}
+	}
+}
+
+func (m *Model) publishNowCmd() tea.Cmd {
+	ctrl := m.ctrl
+	return func() tea.Msg {
+		if ctrl == nil {
+			return publishingRunResultMsg{err: fmt.Errorf("publishing service unavailable")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		err := ctrl.PublishNow(ctx)
+		return publishingRunResultMsg{err: err}
+	}
+}
+
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// In Config Center with active input/modal modes, capture keys (q, esc, etc.)
-	if m.activeView == ViewConfig && (m.settingEditMode || (m.configCategory == viewmodel.CategorySources && m.sourceMode != sourceModeNormal)) {
+	if m.activeView == ViewConfig && (m.settingEditMode || m.confirmPublish || (m.configCategory == viewmodel.CategorySources && m.sourceMode != sourceModeNormal)) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
@@ -201,6 +292,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.configItemIndex = 0
 			m.sourceMode = sourceModeNormal
 			m.settingEditMode = false
+			m.confirmPublish = false
 			m.refreshConfigCenter()
 			return m, nil
 		}
@@ -211,6 +303,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.activeView = m.prevActiveView
 			m.sourceMode = sourceModeNormal
 			m.settingEditMode = false
+			m.confirmPublish = false
 			return m, nil
 		}
 	}
@@ -407,6 +500,22 @@ func (m *Model) handleLogKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.confirmPublish {
+		switch msg.String() {
+		case "y", "Y":
+			m.confirmPublish = false
+			m.pubPublishing = true
+			m.setStatus("Publishing subscriptions to remote...")
+			return m, m.publishNowCmd()
+		case "n", "N", "esc":
+			m.confirmPublish = false
+			m.setStatus("Publication canceled")
+			return m, nil
+		default:
+			return m, nil
+		}
+	}
+
 	if m.configCategory == viewmodel.CategorySources {
 		return m.handleSourceKeys(msg)
 	}
@@ -464,6 +573,38 @@ func (m *Model) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.configCategory == viewmodel.CategoryPublishing {
+			pubVM := m.configCenter.Publishing()
+			if pubVM.Running || m.pubPublishing {
+				m.setStatus("Publication already in progress")
+				return m, nil
+			}
+			if m.pubTesting {
+				m.setStatus("Cannot publish while diagnostics are in progress")
+				return m, nil
+			}
+			m.confirmPublish = true
+			m.setStatus("Publish subscriptions to remote now? (y/n)")
+			return m, nil
+		}
+
+	case "t", "T":
+		if m.configCategory == viewmodel.CategoryPublishing {
+			if m.pubTesting {
+				m.setStatus("Connection test already in progress...")
+				return m, nil
+			}
+			if m.pubPublishing {
+				m.setStatus("Cannot run diagnostics while publishing is in progress")
+				return m, nil
+			}
+			m.pubTesting = true
+			m.pubTestingSpinner = 0
+			m.pubTestSuccess = false
+			m.pubTestMsg = "Testing repository and connection..."
+			m.setStatus("Testing repository and connection...")
+			return m, m.testPublishingCmd()
+		}
 
 	case "r", "R":
 		if m.configCategory == viewmodel.CategoryScheduler && m.ctrl != nil {
@@ -475,48 +616,56 @@ func (m *Model) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.configCategory == viewmodel.CategoryPublishing {
+			items := m.configCategoryItems()
+			targetIdx := 1 // default to repository
+			if m.configItemIndex >= 1 && m.configItemIndex <= 3 {
+				targetIdx = m.configItemIndex
+			}
+			if targetIdx < len(items) {
+				m.configItemIndex = targetIdx
+				item := items[targetIdx]
+				m.settingEditMode = true
+				m.settingKey = item.Key
+				m.settingLabel = item.Label
+				m.settingInputVal = item.EditorValue
+				if m.settingInputVal == "" && item.RawValue != "" {
+					m.settingInputVal = item.RawValue
+				}
+				m.settingType = item.Type
+				m.settingEnumOptions = item.EnumOptions
+				m.settingRestartRequired = item.RestartRequired
+				m.settingDescription = item.Description
+			}
+			return m, nil
+		}
 
-	case "enter", "e":
-		items := m.configCategoryItems()
-		if len(items) == 0 || m.configItemIndex >= len(items) {
-			return m, nil
-		}
-		item := items[m.configItemIndex]
-		if !item.Editable {
-			m.setStatus(fmt.Sprintf("%s is a read-only diagnostic", item.Label))
-			return m, nil
-		}
-		if item.Type == viewmodel.SettingTypeBool {
-			boolVal := item.EditorValue
-			if boolVal == "" {
-				boolVal = item.RawValue
-			}
-			newVal := "true"
-			if strings.EqualFold(boolVal, "true") || strings.EqualFold(item.Value, "true") {
-				newVal = "false"
-			}
-			if m.ctrl != nil {
-				if err := m.ctrl.UpdateSetting(item.Key, newVal); err != nil {
-					m.setStatus(fmt.Sprintf("Error: %s", publisher.SanitizeMessage(err.Error())))
-				} else {
-					m.setStatus(fmt.Sprintf("Updated %s: %s", item.Label, newVal))
-					m.refreshConfigCenter()
+	case "e", "E":
+		if m.configCategory == viewmodel.CategoryPublishing {
+			items := m.configCategoryItems()
+			for _, item := range items {
+				if item.Key == "publishing.enabled" {
+					newVal := "true"
+					if strings.EqualFold(item.EditorValue, "true") || strings.EqualFold(item.Value, "true") {
+						newVal = "false"
+					}
+					if m.ctrl != nil {
+						if err := m.ctrl.UpdateSetting("publishing.enabled", newVal); err != nil {
+							m.setStatus(fmt.Sprintf("Error: %s", publisher.SanitizeMessage(err.Error())))
+						} else {
+							m.setStatus(fmt.Sprintf("Updated %s: %s", item.Label, newVal))
+							m.refreshConfigCenter()
+						}
+					}
+					return m, nil
 				}
 			}
 			return m, nil
 		}
-		m.settingEditMode = true
-		m.settingKey = item.Key
-		m.settingLabel = item.Label
-		m.settingInputVal = item.EditorValue
-		if m.settingInputVal == "" && item.RawValue != "" {
-			m.settingInputVal = item.RawValue
-		}
-		m.settingType = item.Type
-		m.settingEnumOptions = item.EnumOptions
-		m.settingRestartRequired = item.RestartRequired
-		m.settingDescription = item.Description
-		return m, nil
+		return m.handleConfigEditSelected()
+
+	case "enter":
+		return m.handleConfigEditSelected()
 
 	case " ", "space":
 		items := m.configCategoryItems()
@@ -572,6 +721,49 @@ func (m *Model) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+	return m, nil
+}
+
+func (m *Model) handleConfigEditSelected() (tea.Model, tea.Cmd) {
+	items := m.configCategoryItems()
+	if len(items) == 0 || m.configItemIndex >= len(items) {
+		return m, nil
+	}
+	item := items[m.configItemIndex]
+	if !item.Editable {
+		m.setStatus(fmt.Sprintf("%s is a read-only diagnostic", item.Label))
+		return m, nil
+	}
+	if item.Type == viewmodel.SettingTypeBool {
+		boolVal := item.EditorValue
+		if boolVal == "" {
+			boolVal = item.RawValue
+		}
+		newVal := "true"
+		if strings.EqualFold(boolVal, "true") || strings.EqualFold(item.Value, "true") {
+			newVal = "false"
+		}
+		if m.ctrl != nil {
+			if err := m.ctrl.UpdateSetting(item.Key, newVal); err != nil {
+				m.setStatus(fmt.Sprintf("Error: %s", publisher.SanitizeMessage(err.Error())))
+			} else {
+				m.setStatus(fmt.Sprintf("Updated %s: %s", item.Label, newVal))
+				m.refreshConfigCenter()
+			}
+		}
+		return m, nil
+	}
+	m.settingEditMode = true
+	m.settingKey = item.Key
+	m.settingLabel = item.Label
+	m.settingInputVal = item.EditorValue
+	if m.settingInputVal == "" && item.RawValue != "" {
+		m.settingInputVal = item.RawValue
+	}
+	m.settingType = item.Type
+	m.settingEnumOptions = item.EnumOptions
+	m.settingRestartRequired = item.RestartRequired
+	m.settingDescription = item.Description
 	return m, nil
 }
 
@@ -1457,6 +1649,12 @@ func (m *Model) renderConfigCenter() string {
 		return sb.String()
 	}
 
+	// Special handling for CategoryPublishing
+	if m.configCategory == viewmodel.CategoryPublishing {
+		sb.WriteString(m.renderPublishingPane())
+		return sb.String()
+	}
+
 	if m.settingEditMode {
 		sb.WriteString(m.renderSettingEditorModal())
 		return sb.String()
@@ -1475,13 +1673,16 @@ func (m *Model) renderConfigCenter() string {
 }
 
 func (m *Model) renderCategoryItems(items []viewmodel.ConfigItemViewModel) string {
+	return m.renderCategoryItemsLimit(items, m.visibleConfigRows())
+}
+
+func (m *Model) renderCategoryItemsLimit(items []viewmodel.ConfigItemViewModel, visibleItems int) string {
 	bold := lipgloss.NewStyle().Bold(true)
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	yellow := lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("236")).Bold(true)
 
 	var sb strings.Builder
-	visibleItems := m.visibleConfigRows()
 	scrollOffset := 0
 	if m.configItemIndex >= scrollOffset+visibleItems {
 		scrollOffset = m.configItemIndex - visibleItems + 1
@@ -1890,6 +2091,143 @@ func (m *Model) renderSourceManager() string {
 	return sb.String()
 }
 
+func (m *Model) renderPublishingPane() string {
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	green := lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	yellow := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	cyan := lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+
+	var sb strings.Builder
+
+	// 1. Credential Guidance Banner (formatted to fit within 80 columns)
+	bannerLine1 := "Authentication: Ambient Git credentials (SSH Agent or Git Credential Helper)."
+	bannerLine2 := "Do not store tokens in config."
+	availWidth := m.width - 2
+	if availWidth < 10 {
+		availWidth = 10
+	}
+	sb.WriteString("  " + dim.Render(truncateToWidth(bannerLine1, availWidth)) + "\n")
+	sb.WriteString("  " + dim.Render(truncateToWidth(bannerLine2, availWidth)) + "\n\n")
+
+	// 2. If settingEditMode is active, render editor modal
+	if m.settingEditMode {
+		sb.WriteString(m.renderSettingEditorModal())
+		return sb.String()
+	}
+
+	// 3. If confirmPublish is active, render confirmation dialog
+	if m.confirmPublish {
+		sb.WriteString(m.renderPublishConfirmModal())
+		return sb.String()
+	}
+
+	// 4. Diagnostics / in-flight status line
+	extraLines := 3 // 2 banner lines + 1 blank line
+	if m.pubTesting {
+		spinner := spinnerFrames[m.pubTestingSpinner%len(spinnerFrames)]
+		testLine := truncateToWidth(fmt.Sprintf("%s Testing repository and connection...", spinner), availWidth)
+		sb.WriteString("  " + cyan.Render(testLine) + "\n\n")
+		extraLines += 2
+	} else if m.pubPublishing {
+		spinner := spinnerFrames[m.pubTestingSpinner%len(spinnerFrames)]
+		pubLine := truncateToWidth(fmt.Sprintf("%s Publishing subscriptions to remote...", spinner), availWidth)
+		sb.WriteString("  " + cyan.Render(pubLine) + "\n\n")
+		extraLines += 2
+	} else if m.pubTestMsg != "" {
+		if m.pubTestSuccess {
+			msgLine := truncateToWidth("[✓ Connection OK] "+m.pubTestMsg, availWidth)
+			sb.WriteString("  " + green.Render(msgLine) + "\n\n")
+		} else {
+			msgLine := truncateToWidth("[✗ Diagnostics Failed] "+m.pubTestMsg, availWidth)
+			sb.WriteString("  " + yellow.Render(msgLine) + "\n\n")
+		}
+		extraLines += 2
+	}
+
+	// 5. Category items list
+	items := m.configCategoryItems()
+	if len(items) == 0 {
+		sb.WriteString(dim.Render("  No publishing settings available.\n"))
+		return sb.String()
+	}
+
+	itemRows := m.visibleConfigRows() - extraLines
+	if itemRows < 3 {
+		itemRows = 3
+	}
+	sb.WriteString(m.renderCategoryItemsLimit(items, itemRows))
+	return sb.String()
+}
+
+func (m *Model) renderPublishConfirmModal() string {
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	cyan := lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+	yellow := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+
+	var sb strings.Builder
+	title := "Confirm Publication"
+	boxWidth := m.width - 4
+	if boxWidth > 72 {
+		boxWidth = 72
+	}
+	if boxWidth < 40 {
+		if m.width >= 44 {
+			boxWidth = 40
+		} else {
+			boxWidth = m.width - 4
+			if boxWidth < 20 {
+				boxWidth = 20
+			}
+		}
+	}
+
+	titleWidth := lipgloss.Width(title)
+	repeatTop := boxWidth - titleWidth - 5
+	if repeatTop < 0 {
+		repeatTop = 0
+	}
+	repeatBot := boxWidth - 2
+	if repeatBot < 0 {
+		repeatBot = 0
+	}
+
+	topBar := "┌─ " + title + " " + strings.Repeat("─", repeatTop) + "┐"
+	botBar := "└" + strings.Repeat("─", repeatBot) + "┘"
+
+	fieldWidth := boxWidth - 4
+	if fieldWidth < 5 {
+		fieldWidth = 5
+	}
+
+	promptMsg := "Publish subscriptions to remote now? (y/n)"
+	if lipgloss.Width(promptMsg) > fieldWidth {
+		promptMsg = ansi.Truncate(promptMsg, fieldWidth, "…")
+	}
+	promptPad := fieldWidth - lipgloss.Width(promptMsg)
+	if promptPad < 0 {
+		promptPad = 0
+	}
+
+	hintMsg := "[y] Yes, publish now   [n/Esc] Cancel"
+	if lipgloss.Width(hintMsg) > fieldWidth {
+		hintMsg = ansi.Truncate(hintMsg, fieldWidth, "…")
+	}
+	hintPad := fieldWidth - lipgloss.Width(hintMsg)
+	if hintPad < 0 {
+		hintPad = 0
+	}
+
+	blankLine := strings.Repeat(" ", fieldWidth)
+
+	sb.WriteString("  " + dim.Render(topBar) + "\n")
+	sb.WriteString("  │ " + yellow.Render(promptMsg) + strings.Repeat(" ", promptPad) + " │\n")
+	sb.WriteString("  │ " + blankLine + " │\n")
+	sb.WriteString("  │ " + cyan.Render(hintMsg) + strings.Repeat(" ", hintPad) + " │\n")
+	sb.WriteString("  " + dim.Render(botBar) + "\n")
+
+	return sb.String()
+}
+
 // visibleConfigRows returns the number of item rows visible in the config center.
 func (m *Model) visibleConfigRows() int {
 	// Total height minus Header (3), Divider (1), Tab bar (1), Tab divider (1), Footer (1)
@@ -1945,6 +2283,12 @@ func (m *Model) renderFooter() string {
 					pauseAction = "Resume"
 				}
 				hints = fmt.Sprintf("%s [p] %s  [r] Run Now  [Enter] Edit Setting  [Tab] Cat  [Esc] Back  [q] Quit", statusStr, pauseAction)
+			} else if m.configCategory == viewmodel.CategoryPublishing {
+				if m.confirmPublish {
+					hints = fmt.Sprintf("%s Confirm publish to remote? [y] Yes  [n/Esc] Cancel", statusStr)
+				} else {
+					hints = fmt.Sprintf("%s [e] Toggle  [t] Test Conn  [p] Publish Now  [r] Edit Repo/URL  [Enter] Edit  [Tab] Cat  [Esc] Back  [q] Quit", statusStr)
+				}
 			} else {
 				hints = fmt.Sprintf("%s [Enter] Edit/Toggle  [Space] Toggle/Cycle  [Tab] Cat  [Esc] Back  [q] Quit", statusStr)
 			}

@@ -93,13 +93,29 @@ type SchedulerViewModel struct {
 	ProbeLimit        string // Formatted probe limit (e.g. "unlimited" or "50 candidates")
 }
 
+// PublishingViewModel represents presentation telemetry, diagnostics, and status for the Publishing pane.
+type PublishingViewModel struct {
+	Enabled           bool
+	Repository        string
+	Branch            string
+	RemoteURL         string // Sanitized
+	LastPublished     time.Time
+	LastPublishedText string
+	LastCommit        string
+	Running           bool
+	LastError         string
+	PublishCount      int
+	FailCount         int
+}
+
 // ConfigCategoryViewModel contains the display items for a single category tab.
 type ConfigCategoryViewModel struct {
-	Category  ConfigCategory
-	Name      string
-	Items     []ConfigItemViewModel
-	Sources   []SourceItemViewModel
-	Scheduler SchedulerViewModel
+	Category   ConfigCategory
+	Name       string
+	Items      []ConfigItemViewModel
+	Sources    []SourceItemViewModel
+	Scheduler  SchedulerViewModel
+	Publishing PublishingViewModel
 }
 
 // ConfigCenterViewModel bundles all category view data for the Configuration Center.
@@ -125,4 +141,14 @@ func (c ConfigCenterViewModel) Scheduler() SchedulerViewModel {
 		}
 	}
 	return SchedulerViewModel{}
+}
+
+// Publishing returns the PublishingViewModel if the Publishing category exists.
+func (c ConfigCenterViewModel) Publishing() PublishingViewModel {
+	for _, cat := range c.Categories {
+		if cat.Category == CategoryPublishing {
+			return cat.Publishing
+		}
+	}
+	return PublishingViewModel{}
 }

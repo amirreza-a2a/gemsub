@@ -62,6 +62,7 @@ type Status struct {
 	RemoteURL     string        `json:"remote_url"` // Sanitized
 	LastPublished time.Time     `json:"last_published,omitempty"`
 	LastDuration  time.Duration `json:"last_duration,omitempty"`
+	LastCommit    string        `json:"last_commit,omitempty"`
 	LastError     string        `json:"last_error,omitempty"` // Sanitized
 	PublishCount  int           `json:"publish_count"`
 	FailCount     int           `json:"fail_count"`
@@ -86,6 +87,7 @@ type Service struct {
 	cfg           config.PublishingConfig
 	lastPublished time.Time
 	lastDuration  time.Duration
+	lastCommit    string
 	lastError     error
 	publishCount  int
 	failCount     int
@@ -255,6 +257,12 @@ func (s *Service) ValidatePrerequisites(ctx context.Context) error {
 	return nil
 }
 
+// TestConnection validates publishing prerequisites and remote configuration.
+// It delegates directly to ValidatePrerequisites without duplicating validation logic.
+func (s *Service) TestConnection(ctx context.Context) error {
+	return s.ValidatePrerequisites(ctx)
+}
+
 // Publish executes subscription publishing, ensuring single-flight serialization and event publication.
 // When publishing is disabled in configuration, it returns nil immediately as a safe no-op.
 func (s *Service) Publish(ctx context.Context) error {
@@ -322,11 +330,23 @@ func (s *Service) Publish(ctx context.Context) error {
 		return sanitizedErr
 	}
 
+	var commitHash string
+	if lpc, ok := s.backend.(interface{ LastPublishedCommit() string }); ok {
+		commitHash = lpc.LastPublishedCommit()
+	} else if lc, ok := s.backend.(interface{ LastCommit(context.Context) string }); ok {
+		commitHash = lc.LastCommit(ctx)
+	}
+
 	s.mu.Lock()
 	s.lastPublished = time.Now()
 	s.lastDuration = dur
 	s.lastError = nil
 	s.publishCount++
+	if commitHash != "" {
+		s.lastCommit = commitHash
+	} else {
+		commitHash = s.lastCommit
+	}
 	s.mu.Unlock()
 
 	if s.bus != nil {
@@ -336,6 +356,7 @@ func (s *Service) Publish(ctx context.Context) error {
 			Duration:   dur,
 			Repository: cleanRepo,
 			Branch:     cfg.Branch,
+			Commit:     commitHash,
 		})
 	}
 
@@ -372,6 +393,7 @@ func (s *Service) Status() Status {
 		RemoteURL:     SanitizeURL(cfg.RemoteURL),
 		LastPublished: s.lastPublished,
 		LastDuration:  s.lastDuration,
+		LastCommit:    s.lastCommit,
 		LastError:     lastErrStr,
 		PublishCount:  s.publishCount,
 		FailCount:     s.failCount,

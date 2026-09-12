@@ -1,6 +1,7 @@
 package tui_test
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -1334,6 +1335,14 @@ func (c *testDecoupledController) TriggerCycleNow() error {
 	return nil
 }
 
+func (c *testDecoupledController) TestPublishing(ctx context.Context) error {
+	return nil
+}
+
+func (c *testDecoupledController) PublishNow(ctx context.Context) error {
+	return nil
+}
+
 func TestModel_ConfigCenterDecoupledController(t *testing.T) {
 	mock := &testDecoupledController{
 		configCenter: viewmodel.ConfigCenterViewModel{
@@ -1562,6 +1571,12 @@ type testSourceMockController struct {
 	resumeSchedulerErr error
 	triggerCycleErr    error
 
+	testPublishCalls int
+	publishNowCalls  int
+	testPublishErr   error
+	publishNowErr    error
+	pubDisabled      bool
+
 	toggleErr        error
 	addErr           error
 	updateErr        error
@@ -1631,8 +1646,13 @@ func (c *testSourceMockController) syncConfigCenter() {
 	if len(c.publishingItems) == 0 {
 		c.publishingItems = []viewmodel.ConfigItemViewModel{
 			{Key: "publishing.enabled", Label: "Publishing Enabled", Value: "true", EditorValue: "true", RawValue: "true", Type: viewmodel.SettingTypeBool, Editable: true},
-			{Key: "publishing.remote_url", Label: "Remote URL", Value: "https://github.com/example/repo.git", EditorValue: "https://github.com/example/repo.git", RawValue: "https://github.com/example/repo.git", Type: viewmodel.SettingTypeURL, Editable: true},
+			{Key: "publishing.repository", Label: "Target Repository", Value: "/data/git/repo", EditorValue: "/data/git/repo", RawValue: "/data/git/repo", Type: viewmodel.SettingTypeString, Editable: true},
+			{Key: "publishing.branch", Label: "Target Branch", Value: "main", EditorValue: "main", RawValue: "main", Type: viewmodel.SettingTypeString, Editable: true},
+			{Key: "publishing.remote_url", Label: "Remote URL", Value: "https://***@github.com/example/repo.git", EditorValue: "https://***@github.com/example/repo.git", RawValue: "", HasSecret: true, Type: viewmodel.SettingTypeURL, Editable: true},
 			{Label: "Publish Status", Value: "Idle", Type: viewmodel.SettingTypeReadOnly, Editable: false},
+			{Label: "Last Published", Value: "Never", Type: viewmodel.SettingTypeReadOnly, Editable: false},
+			{Label: "Last Commit", Value: "None", Type: viewmodel.SettingTypeReadOnly, Editable: false},
+			{Label: "Publish Count", Value: "0 succeeded, 0 failed", Type: viewmodel.SettingTypeReadOnly, Editable: false},
 		}
 	}
 
@@ -1654,9 +1674,33 @@ func (c *testSourceMockController) syncConfigCenter() {
 					ProbeLimit:       "0",
 				},
 			},
-			{Category: viewmodel.CategoryPublishing, Name: "Publishing", Items: c.publishingItems},
+			{
+				Category: viewmodel.CategoryPublishing,
+				Name:     "Publishing",
+				Items:    c.publishingItems,
+				Publishing: viewmodel.PublishingViewModel{
+					Enabled:           !c.pubDisabled,
+					Repository:        "/data/git/repo",
+					Branch:            "main",
+					RemoteURL:         "https://***@github.com/example/repo.git",
+					LastPublishedText: "Never",
+					LastCommit:        "None",
+					PublishCount:      0,
+					FailCount:         0,
+				},
+			},
 		},
 	}
+}
+
+func (c *testSourceMockController) TestPublishing(ctx context.Context) error {
+	c.testPublishCalls++
+	return c.testPublishErr
+}
+
+func (c *testSourceMockController) PublishNow(ctx context.Context) error {
+	c.publishNowCalls++
+	return c.publishNowErr
 }
 
 func (c *testSourceMockController) PauseScheduler() error {
@@ -3659,5 +3703,569 @@ func TestModel_SchedulerControls_CategoryIsolation(t *testing.T) {
 	m = updated.(*tui.Model)
 	if mock.triggerCalls != 0 {
 		t.Fatalf("r key in Publishing category must not trigger cycle")
+	}
+}
+
+func TestModel_Publishing_TabNavigationAndTelemetry(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// Navigate to Publishing category (index 5)
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryPublishing))
+	m.SetConfigItemIndexForTest(0)
+
+	view := stripANSI(m.View())
+
+	// 1. Guidance banner
+	if !strings.Contains(view, "Authentication: Ambient Git credentials") {
+		t.Errorf("missing guidance banner in view: %s", view)
+	}
+	if !strings.Contains(view, "SSH Agent or Git Credential Helper") {
+		t.Errorf("missing SSH Agent text in view: %s", view)
+	}
+	if !strings.Contains(view, "Do not store tokens in config") {
+		t.Errorf("missing 'Do not store tokens in config' text in view: %s", view)
+	}
+
+	// 2. Telemetry items
+	if !strings.Contains(view, "Target Repository") || !strings.Contains(view, "/data/git/repo") {
+		t.Errorf("missing Target Repository in view: %s", view)
+	}
+	if !strings.Contains(view, "Target Branch") || !strings.Contains(view, "main") {
+		t.Errorf("missing Target Branch in view: %s", view)
+	}
+	if !strings.Contains(view, "Remote URL") || !strings.Contains(view, "https://***@github.com/example/repo.git") {
+		t.Errorf("missing Remote URL with masked credentials in view: %s", view)
+	}
+	if !strings.Contains(view, "Publish Status") || !strings.Contains(view, "Idle") {
+		t.Errorf("missing Publish Status Idle in view: %s", view)
+	}
+	if !strings.Contains(view, "Last Published") || !strings.Contains(view, "Never") {
+		t.Errorf("missing Last Published in view: %s", view)
+	}
+	if !strings.Contains(view, "Last Commit") || !strings.Contains(view, "None") {
+		t.Errorf("missing Last Commit in view: %s", view)
+	}
+	if !strings.Contains(view, "Publish Count") || !strings.Contains(view, "0 succeeded, 0 failed") {
+		t.Errorf("missing Publish Count in view: %s", view)
+	}
+
+	// 3. Footer hints
+	footer := stripANSI(m.RenderFooterForTest())
+	if !strings.Contains(footer, "[e] Toggle") || !strings.Contains(footer, "[t] Test Conn") || !strings.Contains(footer, "[p] Publish Now") {
+		t.Errorf("missing publishing action hints in footer: %s", footer)
+	}
+}
+
+func TestModel_Publishing_ToggleEnabled(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// In Publishing category
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryPublishing))
+	m.SetConfigItemIndexForTest(1) // Cursor on "Target Repository", NOT on enabled
+
+	// Pressing 'e' should toggle publishing.enabled regardless of cursor position
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	m = updated.(*tui.Model)
+
+	if mock.updatedSettingKey != "publishing.enabled" {
+		t.Fatalf("expected updatedSettingKey=publishing.enabled, got %q", mock.updatedSettingKey)
+	}
+	if mock.updatedSettingVal != "false" {
+		t.Fatalf("expected updatedSettingVal=false, got %q", mock.updatedSettingVal)
+	}
+	if !strings.Contains(m.StatusMessageForTest(), "Updated Publishing Enabled: false") {
+		t.Errorf("unexpected status message: %q", m.StatusMessageForTest())
+	}
+
+	// Update mock item to false and press 'e' again
+	for i := range mock.publishingItems {
+		if mock.publishingItems[i].Key == "publishing.enabled" {
+			mock.publishingItems[i].Value = "false"
+			mock.publishingItems[i].EditorValue = "false"
+			mock.publishingItems[i].RawValue = "false"
+		}
+	}
+	mock.syncConfigCenter()
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	m = updated.(*tui.Model)
+
+	if mock.updatedSettingVal != "true" {
+		t.Fatalf("expected updatedSettingVal=true, got %q", mock.updatedSettingVal)
+	}
+}
+
+func TestModel_Publishing_ConnectionDiagnostics_Success(t *testing.T) {
+	mock := newTestSourceMockController()
+	mock.testPublishErr = nil
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	// In Publishing category
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryPublishing))
+
+	// Press 't' to initiate diagnostics
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	m = updated.(*tui.Model)
+
+	if !m.PubTestingForTest() {
+		t.Fatalf("expected pubTesting=true after pressing 't'")
+	}
+	if cmd == nil {
+		t.Fatalf("expected non-nil tea.Cmd returned after pressing 't'")
+	}
+
+	// Verify in-flight display
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "Testing repository and connection...") {
+		t.Errorf("expected in-flight testing message in view: %s", view)
+	}
+
+	// Execute command to produce result message
+	msg := cmd()
+	updated, _ = m.Update(msg)
+	m = updated.(*tui.Model)
+
+	if m.PubTestingForTest() {
+		t.Errorf("expected pubTesting=false after diagnostics completed")
+	}
+	if !strings.Contains(m.StatusMessageForTest(), "Diagnostics passed: repository connection OK") {
+		t.Errorf("unexpected status message after success: %q", m.StatusMessageForTest())
+	}
+
+	// Verify view updated with success indicator
+	view = stripANSI(m.View())
+	if !strings.Contains(view, "[✓ Connection OK]") {
+		t.Errorf("expected [✓ Connection OK] in view, got: %s", view)
+	}
+}
+
+func TestModel_Publishing_ConnectionDiagnostics_Failure_Sanitized(t *testing.T) {
+	mock := newTestSourceMockController()
+	secretToken := "super_secret_github_pat_987654321"
+	mock.testPublishErr = fmt.Errorf("remote authentication failed for https://%s@github.com/my-org/private-repo.git", secretToken)
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryPublishing))
+
+	// Press 't' to run diagnostics
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	m = updated.(*tui.Model)
+
+	if cmd == nil {
+		t.Fatalf("expected non-nil cmd")
+	}
+
+	// Execute cmd and feed result message
+	msg := cmd()
+	updated, _ = m.Update(msg)
+	m = updated.(*tui.Model)
+
+	if m.PubTestingForTest() {
+		t.Errorf("expected pubTesting=false after diagnostics failure")
+	}
+
+	// Verify error is sanitized: no leaked secret token
+	status := m.StatusMessageForTest()
+	if strings.Contains(status, secretToken) {
+		t.Fatalf("leaked secret token in status message: %q", status)
+	}
+	if !strings.Contains(status, "***") {
+		t.Errorf("expected masked URL in status message: %q", status)
+	}
+
+	view := stripANSI(m.View())
+	if strings.Contains(view, secretToken) {
+		t.Fatalf("leaked secret token in rendered view: %s", view)
+	}
+	if !strings.Contains(view, "[✗ Diagnostics Failed]") {
+		t.Errorf("expected [✗ Diagnostics Failed] indicator in view: %s", view)
+	}
+}
+
+func TestModel_Publishing_PublishNow_ConfirmationAndCancel(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryPublishing))
+
+	// 1. Press 'p' -> confirmation prompt
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+
+	if !m.ConfirmPublishForTest() {
+		t.Fatalf("expected confirmPublish=true after pressing 'p'")
+	}
+	if cmd != nil {
+		t.Fatalf("expected nil cmd while awaiting confirmation")
+	}
+
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "Publish subscriptions to remote now? (y/n)") {
+		t.Errorf("missing confirmation prompt in view: %s", view)
+	}
+
+	// 2. Press 'n' -> cancel
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	m = updated.(*tui.Model)
+
+	if m.ConfirmPublishForTest() {
+		t.Errorf("expected confirmPublish=false after pressing 'n'")
+	}
+	if m.PubPublishingForTest() {
+		t.Errorf("expected pubPublishing=false after cancel")
+	}
+	if mock.publishNowCalls != 0 {
+		t.Errorf("expected 0 publishNowCalls after cancel, got %d", mock.publishNowCalls)
+	}
+	if !strings.Contains(m.StatusMessageForTest(), "Publication canceled") {
+		t.Errorf("unexpected status message: %q", m.StatusMessageForTest())
+	}
+
+	// 3. Press 'p' then 'esc' -> cancel
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+	if !m.ConfirmPublishForTest() {
+		t.Fatalf("expected confirmPublish=true")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(*tui.Model)
+	if m.ConfirmPublishForTest() {
+		t.Errorf("expected confirmPublish=false after esc")
+	}
+	if mock.publishNowCalls != 0 {
+		t.Errorf("expected 0 publishNowCalls after esc, got %d", mock.publishNowCalls)
+	}
+}
+
+func TestModel_Publishing_PublishNow_ConfirmAndRun_Success(t *testing.T) {
+	mock := newTestSourceMockController()
+	mock.publishNowErr = nil
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryPublishing))
+
+	// Press 'p' -> prompt
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+
+	// Press 'y' -> confirm
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = updated.(*tui.Model)
+
+	if m.ConfirmPublishForTest() {
+		t.Errorf("expected confirmPublish=false after confirming with 'y'")
+	}
+	if !m.PubPublishingForTest() {
+		t.Errorf("expected pubPublishing=true after confirming with 'y'")
+	}
+	if cmd == nil {
+		t.Fatalf("expected non-nil tea.Cmd for async publish")
+	}
+
+	// In-flight display check
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "Publishing subscriptions to remote...") {
+		t.Errorf("expected in-flight publishing indicator in view: %s", view)
+	}
+
+	// Run command and update
+	msg := cmd()
+	if mock.publishNowCalls != 1 {
+		t.Errorf("expected publishNowCalls=1, got %d", mock.publishNowCalls)
+	}
+
+	updated, _ = m.Update(msg)
+	m = updated.(*tui.Model)
+
+	if m.PubPublishingForTest() {
+		t.Errorf("expected pubPublishing=false after publish completed")
+	}
+	if !strings.Contains(m.StatusMessageForTest(), "Publication succeeded") {
+		t.Errorf("unexpected status message: %q", m.StatusMessageForTest())
+	}
+}
+
+func TestModel_Publishing_PublishNow_Failure_Sanitized(t *testing.T) {
+	mock := newTestSourceMockController()
+	secretToken := "github_pat_classified_secret_xyz"
+	mock.publishNowErr = fmt.Errorf("git push origin main failed for https://%s@github.com/company/repo.git: 403 Forbidden", secretToken)
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryPublishing))
+
+	// Press 'p' then 'y'
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = updated.(*tui.Model)
+
+	msg := cmd()
+	updated, _ = m.Update(msg)
+	m = updated.(*tui.Model)
+
+	status := m.StatusMessageForTest()
+	if strings.Contains(status, secretToken) {
+		t.Fatalf("leaked secret token in publish error message: %q", status)
+	}
+	if !strings.Contains(status, "***") {
+		t.Errorf("expected masked URL in publish error status: %q", status)
+	}
+}
+
+func TestModel_Publishing_EditRepoShortcut(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryPublishing))
+	m.SetConfigItemIndexForTest(0) // On enabled
+
+	// Press 'r' to open repo editor
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m = updated.(*tui.Model)
+
+	if !m.SettingEditModeForTest() {
+		t.Fatalf("expected settingEditMode=true after pressing 'r'")
+	}
+	if m.SettingKeyForTest() != "publishing.repository" {
+		t.Fatalf("expected settingKey=publishing.repository, got %q", m.SettingKeyForTest())
+	}
+
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "Edit Target Repository") {
+		t.Errorf("expected 'Edit Target Repository' modal in view: %s", view)
+	}
+
+	// Press 'esc' to close modal
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(*tui.Model)
+
+	if m.SettingEditModeForTest() {
+		t.Fatalf("expected settingEditMode=false after esc")
+	}
+}
+
+func TestModel_Publishing_KeyIsolation_OtherCategories(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+
+	categoriesToTest := []viewmodel.ConfigCategory{
+		viewmodel.CategoryGeneral,
+		viewmodel.CategoryTesting,
+		viewmodel.CategoryGemini,
+	}
+
+	for _, cat := range categoriesToTest {
+		m.SetConfigCategoryForTest(int(cat))
+		m.SetConfigItemIndexForTest(0)
+
+		// 1. Press 't': should NOT trigger publishing diagnostics
+		updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+		m = updated.(*tui.Model)
+		if m.PubTestingForTest() {
+			t.Errorf("category %s: 't' must not trigger pubTesting", cat.Name())
+		}
+		if cmd != nil {
+			t.Errorf("category %s: 't' returned unexpected cmd", cat.Name())
+		}
+		if mock.testPublishCalls != 0 {
+			t.Errorf("category %s: 't' called TestPublishing", cat.Name())
+		}
+
+		// 2. Press 'p': should NOT trigger publish confirmation
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+		m = updated.(*tui.Model)
+		if m.ConfirmPublishForTest() {
+			t.Errorf("category %s: 'p' must not trigger confirmPublish", cat.Name())
+		}
+		if mock.publishNowCalls != 0 {
+			t.Errorf("category %s: 'p' called PublishNow", cat.Name())
+		}
+
+		// 3. Press 'r': should NOT open repo editor modal
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+		m = updated.(*tui.Model)
+		if m.SettingEditModeForTest() {
+			t.Errorf("category %s: 'r' opened setting editor modal", cat.Name())
+		}
+	}
+}
+
+func TestModel_Publishing_AsyncCommandsNonBlockingArchitecturalProperty(t *testing.T) {
+	mock := newTestSourceMockController()
+	m := tui.New(mock)
+
+	// Enter Config Center and navigate to Publishing category
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryPublishing))
+	m.SetConfigItemIndexForTest(0)
+
+	// --- 1. Test connection with 't' ---
+	if mock.testPublishCalls != 0 {
+		t.Fatalf("expected 0 testPublishCalls before pressing 't', got %d", mock.testPublishCalls)
+	}
+
+	// Pressing 't' must return immediately from Update() with a non-nil tea.Cmd
+	// without synchronously calling TestPublishing.
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	m = updated.(*tui.Model)
+
+	if !m.PubTestingForTest() {
+		t.Fatalf("expected pubTesting=true immediately after pressing 't'")
+	}
+	if cmd == nil {
+		t.Fatalf("expected non-nil tea.Cmd returned from Update('t')")
+	}
+	if mock.testPublishCalls != 0 {
+		t.Fatalf("architectural violation: Update('t') synchronously called TestPublishing! calls=%d", mock.testPublishCalls)
+	}
+
+	// Executing cmd() invokes the actual controller method asynchronously
+	msg := cmd()
+	if mock.testPublishCalls != 1 {
+		t.Fatalf("expected TestPublishing to be invoked once when cmd() runs; got %d", mock.testPublishCalls)
+	}
+	if msg == nil {
+		t.Fatalf("expected non-nil message returned from cmd()")
+	}
+
+	// Delivering the message to Update() clears the testing state
+	updated, _ = m.Update(msg)
+	m = updated.(*tui.Model)
+	if m.PubTestingForTest() {
+		t.Fatalf("expected pubTesting=false after test completion message is processed")
+	}
+
+	// --- 2. Publish now with 'p' followed by confirmation 'y' ---
+	if mock.publishNowCalls != 0 {
+		t.Fatalf("expected 0 publishNowCalls before pressing 'p', got %d", mock.publishNowCalls)
+	}
+
+	// Pressing 'p' prompts for confirmation and returns nil cmd
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+
+	if !m.ConfirmPublishForTest() {
+		t.Fatalf("expected confirmPublish=true after pressing 'p'")
+	}
+	if cmd != nil {
+		t.Fatalf("expected nil cmd on prompt; got non-nil")
+	}
+	if mock.publishNowCalls != 0 {
+		t.Fatalf("architectural violation: Update('p') called PublishNow before confirmation! calls=%d", mock.publishNowCalls)
+	}
+
+	// Pressing 'y' confirms publication and returns immediately from Update() with a tea.Cmd
+	// without synchronously calling PublishNow.
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = updated.(*tui.Model)
+
+	if m.ConfirmPublishForTest() {
+		t.Fatalf("expected confirmPublish=false after confirming with 'y'")
+	}
+	if cmd == nil {
+		t.Fatalf("expected non-nil tea.Cmd returned from Update('y')")
+	}
+	if mock.publishNowCalls != 0 {
+		t.Fatalf("architectural violation: Update('y') synchronously called PublishNow! calls=%d", mock.publishNowCalls)
+	}
+
+	// Executing cmd() invokes the actual controller method asynchronously
+	msg = cmd()
+	if mock.publishNowCalls != 1 {
+		t.Fatalf("expected PublishNow to be invoked once when cmd() runs; got %d", mock.publishNowCalls)
+	}
+	if msg == nil {
+		t.Fatalf("expected non-nil message returned from cmd()")
+	}
+
+	// Delivering the message to Update() completes the cycle
+	updated, _ = m.Update(msg)
+	m = updated.(*tui.Model)
+}
+
+func TestModel_Publishing_DisabledPublishNow_DisplaysDisabledNoticeNotSuccess(t *testing.T) {
+	mock := newTestSourceMockController()
+	mock.pubDisabled = true
+	mock.syncConfigCenter()
+
+	m := tui.New(mock)
+
+	// Enter Config Center and navigate to Publishing category
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(*tui.Model)
+	m.SetConfigCategoryForTest(int(viewmodel.CategoryPublishing))
+	m.SetConfigItemIndexForTest(0)
+
+	// Press 'p' to prompt for publish
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = updated.(*tui.Model)
+	if !m.ConfirmPublishForTest() {
+		t.Fatalf("expected confirmPublish=true after pressing 'p'")
+	}
+
+	// Press 'y' to confirm publish -> triggers publishNowCmd
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = updated.(*tui.Model)
+	if cmd == nil {
+		t.Fatalf("expected non-nil tea.Cmd returned on confirm")
+	}
+
+	// Execute cmd() -> returns publishingRunResultMsg{err: nil} (disabled no-op)
+	msg := cmd()
+	if mock.publishNowCalls != 1 {
+		t.Fatalf("expected PublishNow to be called once, got %d", mock.publishNowCalls)
+	}
+
+	// Deliver message to Update()
+	updated, _ = m.Update(msg)
+	m = updated.(*tui.Model)
+
+	status := m.StatusMessageForTest()
+	if strings.Contains(status, "Publication succeeded") {
+		t.Fatalf("TUI must not claim 'Publication succeeded' when publishing is disabled; got: %q", status)
+	}
+	if !strings.Contains(status, "Publishing is disabled") {
+		t.Fatalf("expected notice indicating publishing is disabled; got: %q", status)
 	}
 }

@@ -164,3 +164,48 @@ func (m *Model) ConfigCategoryForTest() int {
 func (m *Model) SetConfigCategoryForTest(cat int) {
 	m.configCategory = viewmodel.ConfigCategory(cat)
 }
+
+// PubTestingForTest returns pubTesting for tests.
+func (m *Model) PubTestingForTest() bool {
+	return m.pubTesting
+}
+
+// PubPublishingForTest returns pubPublishing for tests.
+func (m *Model) PubPublishingForTest() bool {
+	return m.pubPublishing
+}
+
+// ConfirmPublishForTest returns confirmPublish for tests.
+func (m *Model) ConfirmPublishForTest() bool {
+	return m.confirmPublish
+}
+
+// PubTestMsgForTest returns pubTestMsg for tests.
+func (m *Model) PubTestMsgForTest() string {
+	return m.pubTestMsg
+}
+
+// SetPubTestingForTest sets pubTesting for tests.
+func (m *Model) SetPubTestingForTest(testing bool) {
+	m.pubTesting = testing
+}
+
+// SetPubPublishingForTest sets pubPublishing for tests.
+func (m *Model) SetPubPublishingForTest(pub bool) {
+	m.pubPublishing = pub
+}
+
+// SetConfirmPublishForTest sets confirmPublish for tests.
+func (m *Model) SetConfirmPublishForTest(confirm bool) {
+	m.confirmPublish = confirm
+}
+
+// RenderPublishingPaneForTest exposes renderPublishingPane for tests.
+func (m *Model) RenderPublishingPaneForTest() string {
+	return m.renderPublishingPane()
+}
+
+// RenderPublishConfirmModalForTest exposes renderPublishConfirmModal for tests.
+func (m *Model) RenderPublishConfirmModalForTest() string {
+	return m.renderPublishConfirmModal()
+}

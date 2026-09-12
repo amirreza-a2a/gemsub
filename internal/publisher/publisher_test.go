@@ -2238,3 +2238,106 @@ func TestPublisher_RollbackFailure_SurfacesBothErrors(t *testing.T) {
 		t.Errorf("expected secondary rollback git failure in error: %v", err)
 	}
 }
+
+func TestPublisher_Publish_CapturesExactCommitBeforePush_ImmuneToLaterHEADChanges(t *testing.T) {
+	bareRemoteDir := t.TempDir()
+	initBare := exec.Command("git", "init", "--bare", "-b", "main")
+	initBare.Dir = bareRemoteDir
+	if out, err := initBare.CombinedOutput(); err != nil {
+		t.Fatalf("git init bare failed: %v: %s", err, string(out))
+	}
+
+	repoDir := t.TempDir()
+	runGit := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s failed: %v: %s", strings.Join(args, " "), err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init", "-b", "main")
+	runGit("config", "user.name", "Gemsub Test")
+	runGit("config", "user.email", "test@example.com")
+	runGit("remote", "add", "origin", bareRemoteDir)
+
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# gemsub\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "README.md")
+	runGit("commit", "-m", "initial commit")
+	runGit("push", "origin", "main")
+
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+	st.PutWithTransition(store.Result{Link: "vless://user@1.1.1.1:443", Status: store.StatusPassed})
+	st.FinishCycle()
+
+	cfg := &config.PublishingConfig{
+		Enabled:    true,
+		Repository: repoDir,
+		Branch:     "main",
+		RemoteURL:  bareRemoteDir,
+	}
+
+	pub := publisher.New(cfg, st)
+
+	// Before publication, LastPublishedCommit is empty
+	if lpc := pub.LastPublishedCommit(); lpc != "" {
+		t.Fatalf("expected empty initial LastPublishedCommit, got %q", lpc)
+	}
+
+	// 1. First publication creates a commit and pushes it
+	if err := pub.Publish(context.Background()); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+
+	pubSHA := pub.LastPublishedCommit()
+	if pubSHA == "" {
+		t.Fatal("expected non-empty LastPublishedCommit after successful publish")
+	}
+
+	// Disk HEAD immediately matches published commit
+	currentHead := pub.LastCommit(context.Background())
+	if currentHead != pubSHA {
+		t.Fatalf("expected LastCommit %q == LastPublishedCommit %q", currentHead, pubSHA)
+	}
+
+	// 2. Simulate an external commit made and pushed to the repository
+	runGit("commit", "--allow-empty", "-m", "unrelated external commit")
+	runGit("push", "origin", "main")
+
+	newDiskHead := pub.LastCommit(context.Background())
+	if newDiskHead == pubSHA {
+		t.Fatalf("expected LastCommit to change after external commit, but got %q", newDiskHead)
+	}
+
+	// LastPublishedCommit must remain strictly immutable to subsequent external HEAD changes!
+	if lpc := pub.LastPublishedCommit(); lpc != pubSHA {
+		t.Fatalf("LastPublishedCommit mutated by external commit! expected %q, got %q", pubSHA, lpc)
+	}
+
+	// 3. Subsequent publish with identical content (no-op) must preserve pubSHA
+	if err := pub.Publish(context.Background()); err != nil {
+		t.Fatalf("no-op Publish failed: %v", err)
+	}
+	if lpc := pub.LastPublishedCommit(); lpc != pubSHA {
+		t.Fatalf("no-op Publish mutated LastPublishedCommit! expected %q, got %q", pubSHA, lpc)
+	}
+
+	// 4. Publication with new content produces and records a new exact published commit
+	st.PutWithTransition(store.Result{Link: "vmess://user@2.2.2.2:443", Status: store.StatusPassed})
+	st.FinishCycle()
+
+	if err := pub.Publish(context.Background()); err != nil {
+		t.Fatalf("second Publish failed: %v", err)
+	}
+	secondPubSHA := pub.LastPublishedCommit()
+	if secondPubSHA == "" || secondPubSHA == pubSHA {
+		t.Fatalf("expected new distinct LastPublishedCommit after second publish; got %q", secondPubSHA)
+	}
+	if pub.LastCommit(context.Background()) != secondPubSHA {
+		t.Fatalf("expected disk HEAD to match new published commit %q", secondPubSHA)
+	}
+}

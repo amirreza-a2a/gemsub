@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -86,12 +87,13 @@ type Adapter struct {
 	schedulerCtrl *scheduler.ControlService
 
 	// Event-driven configuration/publishing cache (used when services are nil or as event fallback)
-	lastCfg          config.Config
-	pubRunning       bool
-	lastPublished    time.Time
-	lastPublishError string
-	publishCount     int
-	publishFailCount int
+	lastCfg           config.Config
+	pubRunning        bool
+	lastPublished     time.Time
+	lastPublishCommit string
+	lastPublishError  string
+	publishCount      int
+	publishFailCount  int
 }
 
 // New creates an unstarted Adapter.
@@ -223,6 +225,7 @@ func (a *Adapter) handleEvent(evt any) {
 	case events.PublishingFinished:
 		a.pubRunning = false
 		a.lastPublished = e.FinishedAt
+		a.lastPublishCommit = e.Commit
 		a.publishCount++
 		atomic.StoreInt32(&a.dirty, 1)
 
@@ -981,6 +984,7 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 	eventCfg := a.lastCfg
 	eventPubRunning := a.pubRunning
 	eventLastPublished := a.lastPublished
+	eventLastPublishCommit := a.lastPublishCommit
 	eventLastPublishError := a.lastPublishError
 	eventPublishCount := a.publishCount
 	eventPublishFailCount := a.publishFailCount
@@ -1403,13 +1407,57 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 	}
 
 	// 6. Publishing Category
+	var pubVM viewmodel.PublishingViewModel
+	pubVM.Enabled = cfg.Publishing.Enabled
+	pubVM.Repository = publisher.SanitizeMessage(cfg.Publishing.Repository)
+	pubVM.Branch = cfg.Publishing.Branch
+	pubVM.RemoteURL = publisher.SanitizeURL(cfg.Publishing.RemoteURL)
+
+	if pubSvc != nil {
+		pStatus := pubSvc.Status()
+		pubVM.Running = pStatus.Running || eventPubRunning
+		pubVM.LastPublished = pStatus.LastPublished
+		if pubVM.LastPublished.IsZero() {
+			pubVM.LastPublished = eventLastPublished
+		}
+		pubVM.LastCommit = pStatus.LastCommit
+		if pubVM.LastCommit == "" {
+			pubVM.LastCommit = eventLastPublishCommit
+		}
+		pubVM.LastError = publisher.SanitizeMessage(pStatus.LastError)
+		if pubVM.LastError == "" {
+			pubVM.LastError = publisher.SanitizeMessage(eventLastPublishError)
+		}
+		pubVM.PublishCount = pStatus.PublishCount
+		if pubVM.PublishCount == 0 && eventPublishCount > 0 {
+			pubVM.PublishCount = eventPublishCount
+		}
+		pubVM.FailCount = pStatus.FailCount
+		if pubVM.FailCount == 0 && eventPublishFailCount > 0 {
+			pubVM.FailCount = eventPublishFailCount
+		}
+	} else if eventPublishCount > 0 || eventPublishFailCount > 0 || eventPubRunning || eventLastPublishError != "" || !eventLastPublished.IsZero() || eventLastPublishCommit != "" {
+		pubVM.Running = eventPubRunning
+		pubVM.LastPublished = eventLastPublished
+		pubVM.LastCommit = eventLastPublishCommit
+		pubVM.LastError = publisher.SanitizeMessage(eventLastPublishError)
+		pubVM.PublishCount = eventPublishCount
+		pubVM.FailCount = eventPublishFailCount
+	}
+
+	if pubVM.LastPublished.IsZero() {
+		pubVM.LastPublishedText = "Never"
+	} else {
+		pubVM.LastPublishedText = pubVM.LastPublished.Format("15:04:05")
+	}
+
 	publishingItems := []viewmodel.ConfigItemViewModel{
 		{
 			Key:             "publishing.enabled",
 			Label:           "Publishing Enabled",
-			Value:           fmt.Sprintf("%t", cfg.Publishing.Enabled),
-			EditorValue:     fmt.Sprintf("%t", cfg.Publishing.Enabled),
-			RawValue:        fmt.Sprintf("%t", cfg.Publishing.Enabled),
+			Value:           fmt.Sprintf("%t", pubVM.Enabled),
+			EditorValue:     fmt.Sprintf("%t", pubVM.Enabled),
+			RawValue:        fmt.Sprintf("%t", pubVM.Enabled),
 			Type:            viewmodel.SettingTypeBool,
 			Editable:        true,
 			RestartRequired: false,
@@ -1418,9 +1466,9 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 		{
 			Key:             "publishing.repository",
 			Label:           "Target Repository",
-			Value:           valueOrFallback(cfg.Publishing.Repository, "(none)"),
-			EditorValue:     cfg.Publishing.Repository,
-			RawValue:        cfg.Publishing.Repository,
+			Value:           valueOrFallback(pubVM.Repository, "(none)"),
+			EditorValue:     pubVM.Repository,
+			RawValue:        pubVM.Repository,
 			Type:            viewmodel.SettingTypeString,
 			Editable:        true,
 			RestartRequired: false,
@@ -1429,9 +1477,9 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 		{
 			Key:             "publishing.branch",
 			Label:           "Target Branch",
-			Value:           valueOrFallback(cfg.Publishing.Branch, "(default)"),
-			EditorValue:     cfg.Publishing.Branch,
-			RawValue:        cfg.Publishing.Branch,
+			Value:           valueOrFallback(pubVM.Branch, "(default)"),
+			EditorValue:     pubVM.Branch,
+			RawValue:        pubVM.Branch,
 			Type:            viewmodel.SettingTypeString,
 			Editable:        true,
 			RestartRequired: false,
@@ -1439,89 +1487,53 @@ func (a *Adapter) ConfigCenter() viewmodel.ConfigCenterViewModel {
 		},
 		buildURLSettingItem("publishing.remote_url", "Remote URL", cfg.Publishing.RemoteURL, "Git remote origin URL (credentials masked)"),
 	}
-	if pubSvc != nil {
-		pStatus := pubSvc.Status()
-		pubRun := "Idle"
-		if pStatus.Running {
-			pubRun = "Publishing..."
-		}
+
+	pubRun := "Idle"
+	if pubVM.Running {
+		pubRun = "Publishing..."
+	}
+	publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+		Label:    "Publish Status",
+		Value:    pubRun,
+		Type:     viewmodel.SettingTypeReadOnly,
+		Editable: false,
+	})
+	publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+		Label:    "Last Published",
+		Value:    pubVM.LastPublishedText,
+		Type:     viewmodel.SettingTypeReadOnly,
+		Editable: false,
+	})
+	lastCommit := "None"
+	if pubVM.LastCommit != "" {
+		lastCommit = pubVM.LastCommit
+	}
+	publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+		Label:    "Last Commit",
+		Value:    lastCommit,
+		Type:     viewmodel.SettingTypeReadOnly,
+		Editable: false,
+	})
+	publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
+		Label:    "Publish Count",
+		Value:    fmt.Sprintf("%d succeeded, %d failed", pubVM.PublishCount, pubVM.FailCount),
+		Type:     viewmodel.SettingTypeReadOnly,
+		Editable: false,
+	})
+	if pubVM.LastError != "" {
 		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label:    "Publish Status",
-			Value:    pubRun,
-			Type:     viewmodel.SettingTypeReadOnly,
-			Editable: false,
-		})
-		lastPub := "Never"
-		if !pStatus.LastPublished.IsZero() {
-			lastPub = pStatus.LastPublished.Format("15:04:05")
-		}
-		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label:    "Last Published",
-			Value:    lastPub,
-			Type:     viewmodel.SettingTypeReadOnly,
-			Editable: false,
-		})
-		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label:    "Publish Count",
-			Value:    fmt.Sprintf("%d succeeded, %d failed", pStatus.PublishCount, pStatus.FailCount),
-			Type:     viewmodel.SettingTypeReadOnly,
-			Editable: false,
-		})
-		if pStatus.LastError != "" {
-			publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-				Label:    "Last Error",
-				Value:    publisher.SanitizeMessage(pStatus.LastError),
-				Type:     viewmodel.SettingTypeReadOnly,
-				Editable: false,
-			})
-		}
-	} else if eventPublishCount > 0 || eventPublishFailCount > 0 || eventPubRunning || eventLastPublishError != "" || !eventLastPublished.IsZero() {
-		pubRun := "Idle"
-		if eventPubRunning {
-			pubRun = "Publishing..."
-		}
-		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label:    "Publish Status",
-			Value:    pubRun,
-			Type:     viewmodel.SettingTypeReadOnly,
-			Editable: false,
-		})
-		lastPub := "Never"
-		if !eventLastPublished.IsZero() {
-			lastPub = eventLastPublished.Format("15:04:05")
-		}
-		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label:    "Last Published",
-			Value:    lastPub,
-			Type:     viewmodel.SettingTypeReadOnly,
-			Editable: false,
-		})
-		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label:    "Publish Count",
-			Value:    fmt.Sprintf("%d succeeded, %d failed", eventPublishCount, eventPublishFailCount),
-			Type:     viewmodel.SettingTypeReadOnly,
-			Editable: false,
-		})
-		if eventLastPublishError != "" {
-			publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-				Label:    "Last Error",
-				Value:    publisher.SanitizeMessage(eventLastPublishError),
-				Type:     viewmodel.SettingTypeReadOnly,
-				Editable: false,
-			})
-		}
-	} else {
-		publishingItems = append(publishingItems, viewmodel.ConfigItemViewModel{
-			Label:    "Publish Status",
-			Value:    "Not initialized",
+			Label:    "Last Error",
+			Value:    pubVM.LastError,
 			Type:     viewmodel.SettingTypeReadOnly,
 			Editable: false,
 		})
 	}
+
 	categories[viewmodel.CategoryPublishing] = viewmodel.ConfigCategoryViewModel{
-		Category: viewmodel.CategoryPublishing,
-		Name:     viewmodel.CategoryPublishing.Name(),
-		Items:    publishingItems,
+		Category:   viewmodel.CategoryPublishing,
+		Name:       viewmodel.CategoryPublishing.Name(),
+		Items:      publishingItems,
+		Publishing: pubVM,
 	}
 
 	return viewmodel.ConfigCenterViewModel{
@@ -1967,6 +1979,34 @@ func (a *Adapter) TriggerCycleNow() error {
 		return fmt.Errorf("scheduler service unavailable")
 	}
 	err := schedCtrl.Trigger()
+	if err == nil {
+		atomic.StoreInt32(&a.dirty, 1)
+	}
+	return err
+}
+
+// TestPublishing runs asynchronous pre-flight repository and remote checks via PublishingService.
+func (a *Adapter) TestPublishing(ctx context.Context) error {
+	a.mu.RLock()
+	pubSvc := a.publishSvc
+	a.mu.RUnlock()
+
+	if pubSvc == nil {
+		return fmt.Errorf("publishing service unavailable")
+	}
+	return pubSvc.TestConnection(ctx)
+}
+
+// PublishNow triggers an immediate out-of-band publication via PublishingService.
+func (a *Adapter) PublishNow(ctx context.Context) error {
+	a.mu.RLock()
+	pubSvc := a.publishSvc
+	a.mu.RUnlock()
+
+	if pubSvc == nil {
+		return fmt.Errorf("publishing service unavailable")
+	}
+	err := pubSvc.Publish(ctx)
 	if err == nil {
 		atomic.StoreInt32(&a.dirty, 1)
 	}

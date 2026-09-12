@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -674,5 +675,586 @@ func TestService_StandaloneMode_UsesLocalConfiguration(t *testing.T) {
 	}
 	if mock.publishCount != 1 {
 		t.Fatalf("expected backend not called after disable, count remained %d", mock.publishCount)
+	}
+}
+
+type mockBackendWithLastCommit struct {
+	mockBackend
+	lastCommitFn    func(ctx context.Context) string
+	lastCommitCount int
+}
+
+func (m *mockBackendWithLastCommit) LastCommit(ctx context.Context) string {
+	m.mu.Lock()
+	m.lastCommitCount++
+	fn := m.lastCommitFn
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx)
+	}
+	return "abc1234"
+}
+
+func TestService_Status_InMemory_NeverCallsLastCommit(t *testing.T) {
+	tempRepo := t.TempDir()
+	initGitRepo(t, tempRepo, "https://github.com/user/repo.git")
+
+	pubCfg := config.PublishingConfig{
+		Enabled:    true,
+		Repository: tempRepo,
+		Branch:     "main",
+		RemoteURL:  "https://github.com/user/repo.git",
+	}
+	cfgSvc, _ := setupConfigSvc(t, pubCfg)
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+
+	mock := &mockBackendWithLastCommit{}
+	mock.lastCommitFn = func(ctx context.Context) string {
+		return "7b3fa10"
+	}
+	svc := publisher.NewService(cfgSvc, st, nil, mock)
+
+	// Status() must NEVER invoke LastCommit on backend (strictly in-memory)
+	for i := 0; i < 5; i++ {
+		status := svc.Status()
+		if status.LastCommit != "" {
+			t.Fatalf("expected empty initial LastCommit in memory, got %q", status.LastCommit)
+		}
+	}
+	mock.mu.Lock()
+	calls := mock.lastCommitCount
+	mock.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("Status() must never invoke LastCommit; got %d calls", calls)
+	}
+}
+
+func TestService_ValidatePrerequisites_DoesNotQueryOrModifyLastCommit(t *testing.T) {
+	tempRepo := t.TempDir()
+	initGitRepo(t, tempRepo, "https://github.com/user/repo.git")
+
+	pubCfg := config.PublishingConfig{
+		Enabled:    true,
+		Repository: tempRepo,
+		Branch:     "main",
+		RemoteURL:  "https://github.com/user/repo.git",
+	}
+	cfgSvc, _ := setupConfigSvc(t, pubCfg)
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+
+	mock := &mockBackendWithLastCommit{}
+	mock.lastCommitFn = func(ctx context.Context) string {
+		return "7b3fa10"
+	}
+	svc := publisher.NewService(cfgSvc, st, nil, mock)
+
+	// 1. Initial Status() has empty LastCommit
+	if st := svc.Status(); st.LastCommit != "" {
+		t.Fatalf("expected empty initial LastCommit, got %q", st.LastCommit)
+	}
+
+	// 2. ValidatePrerequisites executes successfully
+	if err := svc.ValidatePrerequisites(context.Background()); err != nil {
+		t.Fatalf("ValidatePrerequisites failed: %v", err)
+	}
+
+	// 3. TestConnection delegates to ValidatePrerequisites
+	if err := svc.TestConnection(context.Background()); err != nil {
+		t.Fatalf("TestConnection failed: %v", err)
+	}
+
+	// 4. Assert LastCommit was NEVER called by ValidatePrerequisites or TestConnection
+	mock.mu.Lock()
+	calls := mock.lastCommitCount
+	mock.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("ValidatePrerequisites/TestConnection must NOT call LastCommit; got %d calls", calls)
+	}
+
+	// 5. Assert publication-history telemetry is NOT mutated
+	if st := svc.Status(); st.LastCommit != "" {
+		t.Fatalf("ValidatePrerequisites/TestConnection must NOT mutate LastCommit telemetry; got %q", st.LastCommit)
+	}
+}
+
+func TestService_Publish_AuthoritativeLastCommit_Lifecycle(t *testing.T) {
+	tempRepo := t.TempDir()
+	initGitRepo(t, tempRepo, "https://github.com/user/repo.git")
+
+	pubCfg := config.PublishingConfig{
+		Enabled:    true,
+		Repository: tempRepo,
+		Branch:     "main",
+		RemoteURL:  "https://github.com/user/repo.git",
+	}
+	cfgSvc, _ := setupConfigSvc(t, pubCfg)
+	bus := events.New()
+	defer bus.Close()
+	subCh := bus.Subscribe()
+	defer bus.Unsubscribe(subCh)
+
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+
+	var finishedEvents []events.PublishingFinished
+	var evMu sync.Mutex
+	go func() {
+		for raw := range subCh {
+			if evt, ok := raw.(events.PublishingFinished); ok {
+				evMu.Lock()
+				finishedEvents = append(finishedEvents, evt)
+				evMu.Unlock()
+			}
+		}
+	}()
+
+	mock := &mockBackendWithLastCommit{}
+	currentCommit := "commit-A"
+	mock.lastCommitFn = func(ctx context.Context) string {
+		return currentCommit
+	}
+	svc := publisher.NewService(cfgSvc, st, bus, mock)
+
+	// Step 0: Before publish, LastCommit is empty
+	if st := svc.Status(); st.LastCommit != "" {
+		t.Fatalf("expected empty initial LastCommit, got %q", st.LastCommit)
+	}
+
+	// Step 1: Successful Publish A
+	if err := svc.Publish(context.Background()); err != nil {
+		t.Fatalf("Publish A failed: %v", err)
+	}
+	mock.mu.Lock()
+	callsAfterA := mock.lastCommitCount
+	mock.mu.Unlock()
+	if callsAfterA != 1 {
+		t.Fatalf("expected LastCommit called once after Publish A; got %d", callsAfterA)
+	}
+	if st := svc.Status(); st.LastCommit != "commit-A" {
+		t.Fatalf("expected Status().LastCommit = commit-A; got %q", st.LastCommit)
+	}
+
+	// Verify PublishingFinished event contains commit-A
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		evMu.Lock()
+		count := len(finishedEvents)
+		evMu.Unlock()
+		if count == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	evMu.Lock()
+	if len(finishedEvents) != 1 || finishedEvents[0].Commit != "commit-A" {
+		t.Fatalf("expected 1 PublishingFinished event with Commit=commit-A; got %+v", finishedEvents)
+	}
+	evMu.Unlock()
+
+	// Step 2: Failed publish must NOT replace previous successful LastCommit
+	mock.mu.Lock()
+	mock.publishFn = func(ctx context.Context) error {
+		return errors.New("remote rejected push")
+	}
+	currentCommit = "should-not-be-used"
+	mock.mu.Unlock()
+
+	if err := svc.Publish(context.Background()); err == nil {
+		t.Fatalf("expected error from failed publish, got nil")
+	}
+
+	mock.mu.Lock()
+	callsAfterFail := mock.lastCommitCount
+	mock.mu.Unlock()
+	if callsAfterFail != 1 {
+		t.Fatalf("LastCommit must NOT be queried on failed publish; got %d calls", callsAfterFail)
+	}
+	if st := svc.Status(); st.LastCommit != "commit-A" {
+		t.Fatalf("LastCommit must remain commit-A after failure; got %q", st.LastCommit)
+	}
+
+	// Step 3: TestConnection after failed publish must NOT mutate LastCommit
+	mock.mu.Lock()
+	mock.publishFn = nil
+	mock.mu.Unlock()
+
+	if err := svc.TestConnection(context.Background()); err != nil {
+		t.Fatalf("TestConnection failed: %v", err)
+	}
+	mock.mu.Lock()
+	callsAfterTestConn := mock.lastCommitCount
+	mock.mu.Unlock()
+	if callsAfterTestConn != 1 {
+		t.Fatalf("TestConnection must NOT query LastCommit; calls changed to %d", callsAfterTestConn)
+	}
+	if st := svc.Status(); st.LastCommit != "commit-A" {
+		t.Fatalf("LastCommit must remain commit-A after TestConnection; got %q", st.LastCommit)
+	}
+
+	// Step 4: Disabled publish (no-op) must NOT replace LastCommit
+	if err := svc.SetEnabled(false); err != nil {
+		t.Fatalf("SetEnabled(false) failed: %v", err)
+	}
+	if err := svc.Publish(context.Background()); err != nil {
+		t.Fatalf("disabled publish failed: %v", err)
+	}
+	mock.mu.Lock()
+	callsAfterDisabled := mock.lastCommitCount
+	mock.mu.Unlock()
+	if callsAfterDisabled != 1 {
+		t.Fatalf("disabled publish must not query LastCommit; got %d calls", callsAfterDisabled)
+	}
+	if st := svc.Status(); st.LastCommit != "commit-A" {
+		t.Fatalf("LastCommit must remain commit-A after disabled publish; got %q", st.LastCommit)
+	}
+	if err := svc.SetEnabled(true); err != nil {
+		t.Fatalf("SetEnabled(true) failed: %v", err)
+	}
+
+	// Step 5: Successful Publish B updates LastCommit to commit-B
+	mock.mu.Lock()
+	currentCommit = "commit-B"
+	mock.mu.Unlock()
+
+	if err := svc.Publish(context.Background()); err != nil {
+		t.Fatalf("Publish B failed: %v", err)
+	}
+	mock.mu.Lock()
+	callsAfterB := mock.lastCommitCount
+	mock.mu.Unlock()
+	if callsAfterB != 2 {
+		t.Fatalf("expected LastCommit called twice after Publish B; got %d", callsAfterB)
+	}
+	if st := svc.Status(); st.LastCommit != "commit-B" {
+		t.Fatalf("expected Status().LastCommit = commit-B; got %q", st.LastCommit)
+	}
+
+	// Verify second PublishingFinished event contains commit-B
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		evMu.Lock()
+		count := len(finishedEvents)
+		evMu.Unlock()
+		if count == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	evMu.Lock()
+	if len(finishedEvents) != 2 || finishedEvents[1].Commit != "commit-B" {
+		t.Fatalf("expected second PublishingFinished event with Commit=commit-B; got %+v", finishedEvents)
+	}
+	evMu.Unlock()
+}
+
+func TestService_Publish_MutexNotHeldDuringLastCommit(t *testing.T) {
+	tempRepo := t.TempDir()
+	initGitRepo(t, tempRepo, "https://github.com/user/repo.git")
+
+	pubCfg := config.PublishingConfig{
+		Enabled:    true,
+		Repository: tempRepo,
+		Branch:     "main",
+		RemoteURL:  "https://github.com/user/repo.git",
+	}
+	cfgSvc, _ := setupConfigSvc(t, pubCfg)
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+
+	var svc *publisher.Service
+	mock := &mockBackendWithLastCommit{}
+	inLastCommit := make(chan struct{})
+	statusDone := make(chan struct{})
+
+	mock.lastCommitFn = func(ctx context.Context) string {
+		close(inLastCommit)
+		// Calling Status() while in LastCommit: must succeed and not deadlock
+		status := svc.Status()
+		if !status.Running {
+			t.Errorf("expected Running=true while publishing and querying LastCommit")
+		}
+
+		select {
+		case <-statusDone:
+		case <-time.After(500 * time.Millisecond):
+		}
+		return "fedcba9"
+	}
+	svc = publisher.NewService(cfgSvc, st, nil, mock)
+
+	go func() {
+		<-inLastCommit
+		// Concurrent Status() must not block
+		_ = svc.Status()
+		close(statusDone)
+	}()
+
+	if err := svc.Publish(context.Background()); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+
+	status := svc.Status()
+	if status.LastCommit != "fedcba9" {
+		t.Fatalf("expected LastCommit %q after publish, got %q", "fedcba9", status.LastCommit)
+	}
+}
+
+func TestService_Publish_SingleFlightSerializesLastCommit(t *testing.T) {
+	tempRepo := t.TempDir()
+	initGitRepo(t, tempRepo, "https://github.com/user/repo.git")
+
+	pubCfg := config.PublishingConfig{
+		Enabled:    true,
+		Repository: tempRepo,
+		Branch:     "main",
+		RemoteURL:  "https://github.com/user/repo.git",
+	}
+	cfgSvc, _ := setupConfigSvc(t, pubCfg)
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+
+	mock := &mockBackendWithLastCommit{}
+	var concurrentInLastCommit int32
+	var maxConcurrentInLastCommit int32
+
+	mock.publishFn = func(ctx context.Context) error {
+		// Simulate publication duration
+		time.Sleep(20 * time.Millisecond)
+		return nil
+	}
+
+	mock.lastCommitFn = func(ctx context.Context) string {
+		curr := atomic.AddInt32(&concurrentInLastCommit, 1)
+		defer atomic.AddInt32(&concurrentInLastCommit, -1)
+
+		// Record maximum concurrent executions of LastCommit
+		for {
+			oldMax := atomic.LoadInt32(&maxConcurrentInLastCommit)
+			if curr <= oldMax || atomic.CompareAndSwapInt32(&maxConcurrentInLastCommit, oldMax, curr) {
+				break
+			}
+		}
+
+		time.Sleep(20 * time.Millisecond)
+		return "singleflight-commit"
+	}
+
+	svc := publisher.NewService(cfgSvc, st, nil, mock)
+
+	const concurrency = 10
+	var wg sync.WaitGroup
+	errs := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = svc.Publish(context.Background())
+		}(i)
+	}
+	wg.Wait()
+
+	var successCount, rejectedCount int
+	for _, err := range errs {
+		if err == nil {
+			successCount++
+		} else if errors.Is(err, publisher.ErrPublishingAlreadyRunning) {
+			rejectedCount++
+		} else {
+			t.Fatalf("unexpected error from Publish: %v", err)
+		}
+	}
+
+	// Proves single-flight guarantees exactly one execution succeeded and rejected the rest
+	if successCount != 1 {
+		t.Fatalf("expected exactly 1 successful Publish call, got %d", successCount)
+	}
+	if rejectedCount != concurrency-1 {
+		t.Fatalf("expected %d calls rejected with ErrPublishingAlreadyRunning, got %d", concurrency-1, rejectedCount)
+	}
+
+	// Proves LastCommit was invoked exactly once and never concurrently
+	if maxVal := atomic.LoadInt32(&maxConcurrentInLastCommit); maxVal != 1 {
+		t.Fatalf("expected max concurrent LastCommit calls to be 1, got %d", maxVal)
+	}
+	mock.mu.Lock()
+	calls := mock.lastCommitCount
+	mock.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 LastCommit call, got %d", calls)
+	}
+
+	// Status reflects the publication commit
+	if st := svc.Status(); st.LastCommit != "singleflight-commit" {
+		t.Fatalf("expected Status().LastCommit = singleflight-commit, got %q", st.LastCommit)
+	}
+}
+
+type mockBackendWithLastPublishedCommit struct {
+	mockBackend
+	lastPublishedCommitFn func() string
+	lastCommitFn          func(ctx context.Context) string
+	lastPublishedCalls    int
+	lastCommitCalls       int
+}
+
+func (m *mockBackendWithLastPublishedCommit) LastPublishedCommit() string {
+	m.mu.Lock()
+	m.lastPublishedCalls++
+	fn := m.lastPublishedCommitFn
+	m.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
+	return ""
+}
+
+func (m *mockBackendWithLastPublishedCommit) LastCommit(ctx context.Context) string {
+	m.mu.Lock()
+	m.lastCommitCalls++
+	fn := m.lastCommitFn
+	m.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
+	}
+	return ""
+}
+
+func TestService_Publish_UsesLastPublishedCommit_PrecedenceAndImmunity(t *testing.T) {
+	tempRepo := t.TempDir()
+	initGitRepo(t, tempRepo, "https://github.com/user/repo.git")
+
+	pubCfg := config.PublishingConfig{
+		Enabled:    true,
+		Repository: tempRepo,
+		Branch:     "main",
+		RemoteURL:  "https://github.com/user/repo.git",
+	}
+	cfgSvc, _ := setupConfigSvc(t, pubCfg)
+	bus := events.New()
+	defer bus.Close()
+	subCh := bus.Subscribe()
+	defer bus.Unsubscribe(subCh)
+
+	st := store.New(filepath.Join(t.TempDir(), "state.json"), 2)
+
+	var finishedEvents []events.PublishingFinished
+	var evMu sync.Mutex
+	go func() {
+		for raw := range subCh {
+			if evt, ok := raw.(events.PublishingFinished); ok {
+				evMu.Lock()
+				finishedEvents = append(finishedEvents, evt)
+				evMu.Unlock()
+			}
+		}
+	}()
+
+	mock := &mockBackendWithLastPublishedCommit{}
+	publishedSHA := "pub-commit-111"
+	diskHEAD := "disk-head-999"
+
+	mock.lastPublishedCommitFn = func() string {
+		return publishedSHA
+	}
+	mock.lastCommitFn = func(ctx context.Context) string {
+		return diskHEAD
+	}
+
+	svc := publisher.NewService(cfgSvc, st, bus, mock)
+
+	// Step 0: Before publish, LastCommit in Status is empty
+	if st := svc.Status(); st.LastCommit != "" {
+		t.Fatalf("expected empty initial LastCommit, got %q", st.LastCommit)
+	}
+
+	// Step 1: Successful publish
+	if err := svc.Publish(context.Background()); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+
+	// Verify LastPublishedCommit was used, NOT LastCommit
+	mock.mu.Lock()
+	lpcCalls := mock.lastPublishedCalls
+	lcCalls := mock.lastCommitCalls
+	mock.mu.Unlock()
+
+	if lpcCalls != 1 {
+		t.Fatalf("expected LastPublishedCommit called once; got %d", lpcCalls)
+	}
+	if lcCalls != 0 {
+		t.Fatalf("expected LastCommit NEVER called when LastPublishedCommit is implemented; got %d", lcCalls)
+	}
+
+	// Verify Status().LastCommit reflects exact published commit
+	if st := svc.Status(); st.LastCommit != "pub-commit-111" {
+		t.Fatalf("expected Status().LastCommit = %q; got %q", "pub-commit-111", st.LastCommit)
+	}
+
+	// Verify PublishingFinished event contains exact published commit
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		evMu.Lock()
+		count := len(finishedEvents)
+		evMu.Unlock()
+		if count == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	evMu.Lock()
+	if len(finishedEvents) != 1 || finishedEvents[0].Commit != "pub-commit-111" {
+		t.Fatalf("expected 1 PublishingFinished event with Commit=pub-commit-111; got %+v", finishedEvents)
+	}
+	evMu.Unlock()
+
+	// Step 2: Simulate an external process mutating disk HEAD
+	mock.mu.Lock()
+	diskHEAD = "external-process-head-777"
+	mock.mu.Unlock()
+
+	// Status() is strictly in-memory and remains immune to disk HEAD changes
+	if st := svc.Status(); st.LastCommit != "pub-commit-111" {
+		t.Fatalf("Status().LastCommit was corrupted by disk HEAD! expected %q, got %q", "pub-commit-111", st.LastCommit)
+	}
+
+	// Step 3: Disabled publish does not alter LastCommit
+	if err := svc.SetEnabled(false); err != nil {
+		t.Fatalf("SetEnabled failed: %v", err)
+	}
+	if err := svc.Publish(context.Background()); err != nil {
+		t.Fatalf("disabled Publish failed: %v", err)
+	}
+	if st := svc.Status(); st.LastCommit != "pub-commit-111" {
+		t.Fatalf("disabled Publish altered LastCommit; expected %q, got %q", "pub-commit-111", st.LastCommit)
+	}
+	if err := svc.SetEnabled(true); err != nil {
+		t.Fatalf("SetEnabled failed: %v", err)
+	}
+
+	// Step 4: Failed publish does not alter LastCommit
+	mock.mu.Lock()
+	mock.publishFn = func(ctx context.Context) error {
+		return errors.New("network dropped")
+	}
+	publishedSHA = "failed-sha-never-pushed"
+	mock.mu.Unlock()
+
+	if err := svc.Publish(context.Background()); err == nil {
+		t.Fatal("expected error on failed publish, got nil")
+	}
+	if st := svc.Status(); st.LastCommit != "pub-commit-111" {
+		t.Fatalf("failed Publish altered LastCommit; expected %q, got %q", "pub-commit-111", st.LastCommit)
+	}
+
+	// Step 5: Second successful publish updates LastCommit to new exact published SHA
+	mock.mu.Lock()
+	mock.publishFn = nil
+	publishedSHA = "pub-commit-222"
+	mock.mu.Unlock()
+
+	if err := svc.Publish(context.Background()); err != nil {
+		t.Fatalf("second Publish failed: %v", err)
+	}
+	if st := svc.Status(); st.LastCommit != "pub-commit-222" {
+		t.Fatalf("expected Status().LastCommit = %q; got %q", "pub-commit-222", st.LastCommit)
 	}
 }

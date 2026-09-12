@@ -4038,3 +4038,228 @@ func TestAdapter_Scheduler_ViewModelAndControls(t *testing.T) {
 		t.Errorf("expected dirty flag set after events.SchedulerResumed")
 	}
 }
+
+func TestAdapter_Publishing_ViewModelAndControls(t *testing.T) {
+	bus := events.New()
+	defer bus.Close()
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	initialCfg := config.Config{
+		FetchIntervalRaw: "10m",
+		Sources: []config.SourceItem{
+			{ID: "src-1", URL: "https://example.com/feed1", Name: "Source 1", Enabled: true},
+		},
+		Test: config.TestConfig{
+			TimeoutRaw:            "10s",
+			Concurrency:           5,
+			HealthURL:             "https://www.gstatic.com/generate_204",
+			DialTimeoutRaw:        "4s",
+			MaxInconclusiveCycles: 2,
+			Gemini: config.GeminiConfig{
+				URL:          "https://gemini.google.com/",
+				BlockPhrases: []string{"blocked"},
+			},
+		},
+		Serve: config.ServeConfig{
+			Listen: "127.0.0.1:8765",
+			Path:   "/sub",
+			Format: "base64",
+		},
+		Publishing: config.PublishingConfig{
+			Enabled:    true,
+			Repository: "/tmp/test-repo",
+			Branch:     "gh-pages",
+			RemoteURL:  "https://secret_token_abc@github.com/example/repo.git",
+		},
+		StateFile: "./gemsub_state.json",
+	}
+
+	cfgSvc, err := config.NewService(cfgPath, &initialCfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+
+	st := store.New(filepath.Join(tmpDir, "store.json"), 2)
+	pubSvc := publisher.NewService(cfgSvc, st, bus)
+	ring := logging.NewRingLogHandler(50)
+	ad := adapter.New(st, bus, ring)
+	ad.Subscribe()
+	defer ad.Close()
+
+	// 1. Without services injected, TestPublishing and PublishNow return errors
+	ctx := context.Background()
+	if err := ad.TestPublishing(ctx); err == nil {
+		t.Errorf("expected error from TestPublishing when pubSvc is nil")
+	}
+	if err := ad.PublishNow(ctx); err == nil {
+		t.Errorf("expected error from PublishNow when pubSvc is nil")
+	}
+
+	// 2. Inject services
+	ad.SetServices(cfgSvc, nil, pubSvc, nil)
+
+	// 3. Verify Publishing ViewModel and Category items
+	vm := ad.ConfigCenter()
+	pubVM := vm.Publishing()
+	if !pubVM.Enabled {
+		t.Errorf("expected pubVM.Enabled=true, got false")
+	}
+	if pubVM.Repository != "/tmp/test-repo" {
+		t.Errorf("expected pubVM.Repository=/tmp/test-repo, got %q", pubVM.Repository)
+	}
+	if pubVM.Branch != "gh-pages" {
+		t.Errorf("expected pubVM.Branch=gh-pages, got %q", pubVM.Branch)
+	}
+	// Verify URL credential masking in pubVM
+	if strings.Contains(pubVM.RemoteURL, "secret_token_abc") {
+		t.Fatalf("leaked secret token in pubVM.RemoteURL: %q", pubVM.RemoteURL)
+	}
+	if !strings.Contains(pubVM.RemoteURL, "***") {
+		t.Errorf("expected masked URL in pubVM.RemoteURL, got %q", pubVM.RemoteURL)
+	}
+
+	// Verify items list in CategoryPublishing
+	pubCat := vm.Categories[viewmodel.CategoryPublishing]
+	var foundRepo, foundBranch, foundURL, foundStatus, foundCommit bool
+	for _, item := range pubCat.Items {
+		if strings.Contains(item.Value, "secret_token_abc") || strings.Contains(item.EditorValue, "secret_token_abc") {
+			t.Fatalf("leaked secret token in ConfigItemViewModel: %+v", item)
+		}
+		switch item.Label {
+		case "Target Repository":
+			foundRepo = true
+			if item.Value != "/tmp/test-repo" {
+				t.Errorf("unexpected repository value: %q", item.Value)
+			}
+		case "Target Branch":
+			foundBranch = true
+			if item.Value != "gh-pages" {
+				t.Errorf("unexpected branch value: %q", item.Value)
+			}
+		case "Remote URL":
+			foundURL = true
+			if !strings.Contains(item.Value, "***") {
+				t.Errorf("expected masked URL in item value, got %q", item.Value)
+			}
+		case "Publish Status":
+			foundStatus = true
+			if item.Value != "Idle" {
+				t.Errorf("expected status Idle, got %q", item.Value)
+			}
+		case "Last Commit":
+			foundCommit = true
+			if item.Value != "None" {
+				t.Errorf("expected commit None, got %q", item.Value)
+			}
+		}
+	}
+	if !foundRepo || !foundBranch || !foundURL || !foundStatus || !foundCommit {
+		t.Errorf("missing expected items in CategoryPublishing: repo=%v branch=%v url=%v status=%v commit=%v",
+			foundRepo, foundBranch, foundURL, foundStatus, foundCommit)
+	}
+
+	// 4. TestPublishing delegates to pubSvc.TestConnection
+	// In a non-git dir, TestPublishing should fail cleanly with a sanitized error
+	diagErr := ad.TestPublishing(ctx)
+	if diagErr == nil {
+		t.Logf("TestPublishing succeeded (prerequisites satisfied)")
+	} else {
+		if strings.Contains(diagErr.Error(), "secret_token_abc") {
+			t.Fatalf("diagnostics leaked secret token: %v", diagErr)
+		}
+	}
+
+	// 5. UpdateSetting: toggle publishing.enabled
+	if err := ad.UpdateSetting("publishing.enabled", "false"); err != nil {
+		t.Fatalf("UpdateSetting(publishing.enabled, false): %v", err)
+	}
+	vm = ad.ConfigCenter()
+	if vm.Publishing().Enabled {
+		t.Errorf("expected publishing disabled after update, got true")
+	}
+
+	// 6. UpdateSetting: update branch
+	if err := ad.UpdateSetting("publishing.branch", "release"); err != nil {
+		t.Fatalf("UpdateSetting(publishing.branch, release): %v", err)
+	}
+	vm = ad.ConfigCenter()
+	if vm.Publishing().Branch != "release" {
+		t.Errorf("expected branch=release, got %q", vm.Publishing().Branch)
+	}
+
+	// 7. UpdateSetting: update remote_url preserving credentials
+	if err := ad.UpdateSetting("publishing.remote_url", "https://***@github.com/example/new-repo.git"); err != nil {
+		t.Fatalf("UpdateSetting(publishing.remote_url): %v", err)
+	}
+	newCfg := cfgSvc.Get()
+	if !strings.Contains(newCfg.Publishing.RemoteURL, "secret_token_abc") {
+		t.Errorf("expected preserved credentials in cfgSvc, got %q", newCfg.Publishing.RemoteURL)
+	}
+	if !strings.Contains(newCfg.Publishing.RemoteURL, "new-repo.git") {
+		t.Errorf("expected updated repo path in cfgSvc, got %q", newCfg.Publishing.RemoteURL)
+	}
+
+	// 8. EventBus PublishingFinished event updates telemetry and sets dirty
+	ad.CheckAndResetDirty()
+	finishTime := time.Now().Truncate(time.Second)
+	bus.Publish(events.PublishingFinished{
+		FinishedAt: finishTime,
+		Commit:     "fedcba9",
+		Duration:   250 * time.Millisecond,
+	})
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	isDirty := false
+	for time.Now().Before(deadline) {
+		if ad.CheckAndResetDirty() {
+			isDirty = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !isDirty {
+		t.Errorf("expected dirty flag set after events.PublishingFinished")
+	}
+
+	vm = ad.ConfigCenter()
+	pubVM = vm.Publishing()
+	if pubVM.LastCommit != "fedcba9" {
+		t.Errorf("expected LastCommit=fedcba9, got %q", pubVM.LastCommit)
+	}
+	if pubVM.LastPublishedText != finishTime.Format("15:04:05") {
+		t.Errorf("expected LastPublishedText=%q, got %q", finishTime.Format("15:04:05"), pubVM.LastPublishedText)
+	}
+	if pubVM.PublishCount != 1 {
+		t.Errorf("expected PublishCount=1, got %d", pubVM.PublishCount)
+	}
+
+	// 9. EventBus PublishingFailed event updates error telemetry
+	ad.CheckAndResetDirty()
+	bus.Publish(events.PublishingFailed{
+		FailedAt: time.Now(),
+		Error:    "failed to push to https://secret_token_abc@github.com/example/repo.git: network timeout",
+	})
+	deadline = time.Now().Add(500 * time.Millisecond)
+	isDirty = false
+	for time.Now().Before(deadline) {
+		if ad.CheckAndResetDirty() {
+			isDirty = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !isDirty {
+		t.Errorf("expected dirty flag set after events.PublishingFailed")
+	}
+	vm = ad.ConfigCenter()
+	pubVM = vm.Publishing()
+	if strings.Contains(pubVM.LastError, "secret_token_abc") {
+		t.Fatalf("leaked secret in pubVM.LastError: %q", pubVM.LastError)
+	}
+	if !strings.Contains(pubVM.LastError, "***") {
+		t.Errorf("expected masked URL in pubVM.LastError, got %q", pubVM.LastError)
+	}
+	if pubVM.FailCount != 1 {
+		t.Errorf("expected FailCount=1, got %d", pubVM.FailCount)
+	}
+}

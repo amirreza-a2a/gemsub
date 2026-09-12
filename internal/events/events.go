@@ -59,6 +59,7 @@ type PublishingFinished struct {
 	Duration   time.Duration `json:"duration"`
 	Repository string        `json:"repository"`
 	Branch     string        `json:"branch"`
+	Commit     string        `json:"commit,omitempty"`
 }
 
 // PublishingFailed is emitted when subscription publication fails.

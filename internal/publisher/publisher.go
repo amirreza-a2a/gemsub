@@ -129,10 +129,11 @@ func ExpandHome(path string) string {
 
 // Publisher coordinates rendering subscription files and committing/pushing them.
 type Publisher struct {
-	mu  sync.RWMutex
-	cfg config.PublishingConfig
-	st  *store.Store
-	git GitRunner
+	mu                  sync.RWMutex
+	cfg                 config.PublishingConfig
+	st                  *store.Store
+	git                 GitRunner
+	lastPublishedCommit string
 
 	writeFileFn  func(targetPath string, content []byte, perm os.FileMode) error
 	removeFileFn func(path string) error
@@ -248,6 +249,35 @@ func (p *Publisher) removeFile(path string) error {
 func (p *Publisher) hasHEAD(ctx context.Context, repoDir string) bool {
 	_, err := p.git.Run(ctx, repoDir, "rev-parse", "--verify", "HEAD")
 	return err == nil
+}
+
+// LastPublishedCommit returns the exact commit SHA captured from the most recent successful publication.
+func (p *Publisher) LastPublishedCommit() string {
+	if p == nil {
+		return ""
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.lastPublishedCommit
+}
+
+// LastCommit returns the short commit hash of HEAD if available.
+func (p *Publisher) LastCommit(ctx context.Context) string {
+	if p == nil {
+		return ""
+	}
+	p.mu.RLock()
+	cfg := p.cfg
+	p.mu.RUnlock()
+	repoDir := ExpandHome(cfg.Repository)
+	if strings.TrimSpace(repoDir) == "" {
+		return ""
+	}
+	out, err := p.git.Run(ctx, repoDir, "rev-parse", "--short", "HEAD")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
 }
 
 type pathSnapshot struct {
@@ -721,11 +751,22 @@ func (p *Publisher) Publish(ctx context.Context) (err error) {
 
 		committedOrClean = true
 
+		// Capture exact commit SHA belonging to this publication before push
+		shaOut, err := p.git.Run(ctx, repoDir, "rev-parse", "--short", "HEAD")
+		if err != nil {
+			return fmt.Errorf("publisher: capture commit SHA: %w", err)
+		}
+		publishedSHA := strings.TrimSpace(shaOut)
+
 		// Push to branch
 		slog.Info("publisher: pushing to origin", "branch", branch)
 		if _, err := p.git.Run(ctx, repoDir, "push", "origin", branch); err != nil {
 			return fmt.Errorf("publisher: git push failed: %w", err)
 		}
+
+		p.mu.Lock()
+		p.lastPublishedCommit = publishedSHA
+		p.mu.Unlock()
 
 		slog.Info("publisher: publish completed")
 		return nil
@@ -744,11 +785,22 @@ func (p *Publisher) Publish(ctx context.Context) (err error) {
 		return nil
 	}
 
+	// Capture exact commit SHA belonging to unpushed publication before push
+	shaOut, err := p.git.Run(ctx, repoDir, "rev-parse", "--short", "HEAD")
+	if err != nil {
+		return fmt.Errorf("publisher: capture commit SHA: %w", err)
+	}
+	publishedSHA := strings.TrimSpace(shaOut)
+
 	// Local branch has unpushed publication commit(s); retry push without creating another commit
 	slog.Info("publisher: unpushed commits detected", "branch", branch)
 	if _, err := p.git.Run(ctx, repoDir, "push", "origin", branch); err != nil {
 		return fmt.Errorf("publisher: git push failed: %w", err)
 	}
+
+	p.mu.Lock()
+	p.lastPublishedCommit = publishedSHA
+	p.mu.Unlock()
 
 	slog.Info("publisher: publish completed")
 	return nil
