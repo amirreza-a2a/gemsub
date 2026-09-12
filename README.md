@@ -579,8 +579,8 @@ Maintainers follow a tag-driven release process automated through GitHub Actions
 
 1. **Tagging:** A release is triggered by pushing a semantic version tag:
    ```bash
-   git tag -a v0.1.0 -m "Release v0.1.0"
-   git push origin v0.1.0
+   git tag -a vX.Y.Z -m "Release vX.Y.Z"
+   git push origin vX.Y.Z
    ```
 2. **Automated Pipeline (`.github/workflows/release.yml`):**
    - The `validate` job runs `go vet` and serialized unit tests with least-privilege `contents: read` permissions.
