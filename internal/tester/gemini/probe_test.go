@@ -767,6 +767,33 @@ func TestProbe_DialTimeoutFallsBackToTimeout(t *testing.T) {
 	}
 }
 
+// TestProbe_ClampLatency_ZeroFallback verifies that clampLatency enforces strictly positive
+// latency (falling back to time.Nanosecond) when platform clock resolution evaluates to <= 0.
+func TestProbe_ClampLatency_ZeroFallback(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    time.Duration
+		expected time.Duration
+	}{
+		{"zero duration falls back to 1ns", 0, time.Nanosecond},
+		{"negative duration falls back to 1ns", -5 * time.Millisecond, time.Nanosecond},
+		{"1ns preserved", 1 * time.Nanosecond, 1 * time.Nanosecond},
+		{"positive duration preserved", 25 * time.Millisecond, 25 * time.Millisecond},
+		{"sub-millisecond positive duration preserved", 500 * time.Microsecond, 500 * time.Microsecond},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := gemini.ClampLatencyForTest(tc.input)
+			if got != tc.expected {
+				t.Errorf("ClampLatencyForTest(%v) = %v; want %v", tc.input, got, tc.expected)
+			}
+			if got <= 0 {
+				t.Errorf("ClampLatencyForTest(%v) returned non-positive duration %v", tc.input, got)
+			}
+		})
+	}
+}
+
 // --- Benchmark ---
 
 func BenchmarkClassifyResponse_1MB(b *testing.B) {

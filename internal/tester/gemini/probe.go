@@ -114,7 +114,7 @@ func Probe(ctx context.Context, dialFn transport.DialFunc, cfg Config) Result {
 
 	start := time.Now()
 	resp, err := client.Do(req)
-	latency := time.Since(start)
+	latency := clampLatency(time.Since(start))
 
 	if err != nil {
 		// Dial/TLS/transport errors during the Gemini request are returned
@@ -340,4 +340,17 @@ func classifyResponsePayload(resp *http.Response, body []byte, blockPhrases []st
 			Retryable:  false,
 		}
 	}
+}
+
+// clampLatency ensures a measured latency duration is strictly positive.
+// On operating systems with coarse timer or monotonic-clock resolution,
+// very fast completed requests can quantize to an elapsed measurement of 0s.
+// Since downstream consumers treat Latency <= 0 as unmeasured/unavailable,
+// any completed probe must be recorded with a positive duration (falling back
+// to time.Nanosecond).
+func clampLatency(d time.Duration) time.Duration {
+	if d <= 0 {
+		return time.Nanosecond
+	}
+	return d
 }
