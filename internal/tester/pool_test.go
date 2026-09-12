@@ -332,10 +332,22 @@ func TestRunPool_PublishesProgressMetricsToEventBus(t *testing.T) {
 		}
 	}
 
-	// The final event must reflect all completed probes
-	lastEv := eventsReceived[len(eventsReceived)-1]
-	if lastEv.Completed != 3 || lastEv.Passed != 1 || lastEv.Failed != 1 || lastEv.Inconclusive != 1 {
-		t.Errorf("last event metrics mismatch: got %+v, want Completed=3, Passed=1, Failed=1, Inconclusive=1", lastEv.ProgressMetrics)
+	// The event corresponding to all probes completed (Completed == 3) must reflect all outcomes.
+	// Note: Because worker goroutines publish concurrently, events may be delivered interleaved.
+	var finalEv *events.ProbeCompleted
+	for i := range eventsReceived {
+		if eventsReceived[i].Completed == 3 {
+			finalEv = &eventsReceived[i]
+			break
+		}
+	}
+
+	if finalEv == nil {
+		t.Fatalf("expected an event with Completed=3, received events: %+v", eventsReceived)
+	}
+
+	if finalEv.Passed != 1 || finalEv.Failed != 1 || finalEv.Inconclusive != 1 {
+		t.Errorf("final event metrics mismatch: got %+v, want Passed=1, Failed=1, Inconclusive=1", finalEv.ProgressMetrics)
 	}
 }
 
