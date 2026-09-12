@@ -152,3 +152,14 @@ func (c ConfigCenterViewModel) Publishing() PublishingViewModel {
 	}
 	return PublishingViewModel{}
 }
+
+// OnboardingConfig bundles the initial configuration values collected by the first-run wizard.
+type OnboardingConfig struct {
+	SourceURL   string
+	SourceName  string
+	Listen      string
+	Path        string
+	Concurrency int
+	Timeout     string
+	TargetURL   string
+}

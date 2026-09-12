@@ -735,3 +735,66 @@ func TestService_PublishLockScope_NoDeadlockWithSynchronousSubscriber(t *testing
 		t.Error("expected synchronous publisher to be called during reload")
 	}
 }
+
+func TestService_NewDefaultService_Lifecycle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	svc := config.NewDefaultService(path, nil)
+	if svc == nil {
+		t.Fatal("expected non-nil service from NewDefaultService")
+	}
+
+	if !svc.IsFirstRun() {
+		t.Error("expected IsFirstRun() == true initially")
+	}
+
+	if svc.Path() != path {
+		t.Errorf("expected Path %q, got %q", path, svc.Path())
+	}
+
+	cfg := svc.Get()
+	if cfg.Test.Concurrency != 20 {
+		t.Errorf("expected default Concurrency 20, got %d", cfg.Test.Concurrency)
+	}
+	if cfg.Test.TimeoutRaw != "10s" {
+		t.Errorf("expected default TimeoutRaw '10s', got %q", cfg.Test.TimeoutRaw)
+	}
+	if cfg.Serve.Listen != "127.0.0.1:8765" {
+		t.Errorf("expected default Serve.Listen '127.0.0.1:8765', got %q", cfg.Serve.Listen)
+	}
+	if cfg.Serve.Path != "/sub" {
+		t.Errorf("expected default Serve.Path '/sub', got %q", cfg.Serve.Path)
+	}
+	if cfg.Test.Gemini.URL != "https://gemini.google.com/" {
+		t.Errorf("expected default Gemini.URL 'https://gemini.google.com/', got %q", cfg.Test.Gemini.URL)
+	}
+
+	// Add source to make it fully valid and save
+	err := svc.Update(func(c *config.Config) error {
+		c.Sources = []config.SourceItem{
+			config.NewSource("https://example.com/feed.txt", "Example Feed"),
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+
+	if err := svc.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	if svc.IsFirstRun() {
+		t.Error("expected IsFirstRun() == false after Save()")
+	}
+
+	// Verify file exists on disk and is valid
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load saved config failed: %v", err)
+	}
+	if len(loaded.Sources) != 1 || loaded.Sources[0].URL != "https://example.com/feed.txt" {
+		t.Errorf("unexpected loaded sources: %+v", loaded.Sources)
+	}
+}

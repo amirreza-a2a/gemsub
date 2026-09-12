@@ -72,10 +72,16 @@ func (s *Service) Get(id string) (SourceItem, error) {
 	return SourceItem{}, fmt.Errorf("%w: %s", ErrSourceNotFound, id)
 }
 
-// Add adds a new source item, persisting the updated configuration through ConfigService.
-func (s *Service) Add(item SourceItem) (SourceItem, error) {
-	if s == nil || s.configSvc == nil {
-		return SourceItem{}, fmt.Errorf("config service unavailable")
+// AddToConfig applies canonical source normalization, ID generation, duplicate checks,
+// default naming, and appends the source item to the provided *config.Config.
+// It mutates cfg.Sources in-place but does NOT persist to disk, allowing it to
+// participate inside a single atomic ConfigService.Update() transaction.
+func (s *Service) AddToConfig(cfg *config.Config, item SourceItem) (SourceItem, error) {
+	if s == nil {
+		return SourceItem{}, fmt.Errorf("source service unavailable")
+	}
+	if cfg == nil {
+		return SourceItem{}, fmt.Errorf("config cannot be nil")
 	}
 
 	normURL, err := config.NormalizeURL(item.URL)
@@ -84,32 +90,42 @@ func (s *Service) Add(item SourceItem) (SourceItem, error) {
 	}
 	item.URL = normURL
 
+	if item.ID == "" {
+		item.ID = config.GenerateSourceID(item.URL)
+	}
+
+	// Check for duplicate URL or ID
+	for _, existing := range cfg.Sources {
+		if existing.URL == item.URL {
+			return SourceItem{}, fmt.Errorf("%w: %s (existing id: %s)", ErrDuplicateSource, item.URL, existing.ID)
+		}
+		if existing.ID == item.ID {
+			return SourceItem{}, fmt.Errorf("%w: %s", ErrDuplicateSourceID, item.ID)
+		}
+	}
+
+	if item.Name == "" {
+		item.Name = config.DefaultSourceName(item.URL)
+	}
+	if item.AddedAt.IsZero() {
+		item.AddedAt = time.Now().UTC()
+	}
+
+	cfg.Sources = append(cfg.Sources, item)
+	return item, nil
+}
+
+// Add adds a new source item, persisting the updated configuration through ConfigService.
+func (s *Service) Add(item SourceItem) (SourceItem, error) {
+	if s == nil || s.configSvc == nil {
+		return SourceItem{}, fmt.Errorf("config service unavailable")
+	}
+
 	var created SourceItem
-	err = s.configSvc.Update(func(cfg *config.Config) error {
-		if item.ID == "" {
-			item.ID = config.GenerateSourceID(item.URL)
-		}
-
-		// Check for duplicate URL or ID
-		for _, existing := range cfg.Sources {
-			if existing.URL == item.URL {
-				return fmt.Errorf("%w: %s (existing id: %s)", ErrDuplicateSource, item.URL, existing.ID)
-			}
-			if existing.ID == item.ID {
-				return fmt.Errorf("%w: %s", ErrDuplicateSourceID, item.ID)
-			}
-		}
-
-		if item.Name == "" {
-			item.Name = config.DefaultSourceName(item.URL)
-		}
-		if item.AddedAt.IsZero() {
-			item.AddedAt = time.Now().UTC()
-		}
-
-		cfg.Sources = append(cfg.Sources, item)
-		created = item
-		return nil
+	err := s.configSvc.Update(func(cfg *config.Config) error {
+		var err error
+		created, err = s.AddToConfig(cfg, item)
+		return err
 	})
 	if err != nil {
 		return SourceItem{}, err

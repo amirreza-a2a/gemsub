@@ -445,3 +445,61 @@ func TestSource_StructuredRoundTrip(t *testing.T) {
 		t.Fatalf("expected only enabled source in EnabledSourceURLs, got: %v", enabledURLs)
 	}
 }
+
+func TestSourceService_AddToConfig(t *testing.T) {
+	srcSvc := source.NewService(nil)
+
+	// 1. Nil config returns error
+	_, err := srcSvc.AddToConfig(nil, source.SourceItem{URL: "https://example.com/feed"})
+	if err == nil {
+		t.Error("expected error for nil config, got nil")
+	}
+
+	// 2. Invalid URL returns error
+	cfg := &config.Config{}
+	_, err = srcSvc.AddToConfig(cfg, source.SourceItem{URL: "ftp://example.com/feed"})
+	if err == nil {
+		t.Error("expected error for invalid scheme ftp, got nil")
+	}
+
+	// 3. Successful addition: normalizes URL, sets default name, assigns ID, timestamp, and appends
+	item, err := srcSvc.AddToConfig(cfg, source.SourceItem{
+		URL:     "HTTPS://EXAMPLE.COM:443/feed",
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("AddToConfig failed: %v", err)
+	}
+	if item.URL != "https://example.com/feed" {
+		t.Errorf("expected normalized URL https://example.com/feed, got %q", item.URL)
+	}
+	if item.ID == "" {
+		t.Error("expected generated ID")
+	}
+	if item.Name == "" {
+		t.Error("expected default source name")
+	}
+	if item.AddedAt.IsZero() {
+		t.Error("expected non-zero AddedAt")
+	}
+	if len(cfg.Sources) != 1 {
+		t.Fatalf("expected 1 source in cfg.Sources, got %d", len(cfg.Sources))
+	}
+
+	// 4. Duplicate URL returns ErrDuplicateSource
+	_, err = srcSvc.AddToConfig(cfg, source.SourceItem{
+		URL: "https://example.com:443/feed",
+	})
+	if !errors.Is(err, source.ErrDuplicateSource) {
+		t.Errorf("expected ErrDuplicateSource, got %v", err)
+	}
+
+	// 5. Duplicate ID returns ErrDuplicateSourceID
+	_, err = srcSvc.AddToConfig(cfg, source.SourceItem{
+		ID:  item.ID,
+		URL: "https://other.example.com/feed",
+	})
+	if !errors.Is(err, source.ErrDuplicateSourceID) {
+		t.Errorf("expected ErrDuplicateSourceID, got %v", err)
+	}
+}

@@ -38,6 +38,8 @@ type Controller interface {
 	TriggerCycleNow() error
 	TestPublishing(ctx context.Context) error
 	PublishNow(ctx context.Context) error
+	CompleteOnboarding(cfg viewmodel.OnboardingConfig) error
+	StartRuntime() error
 }
 
 // ActiveView represents the primary content pane currently displayed.
@@ -47,6 +49,7 @@ const (
 	ViewCandidates ActiveView = iota
 	ViewLogs
 	ViewConfig
+	ViewWizard
 )
 
 // TickMsg represents a periodic background refresh tick (bounded at 10 Hz / 100 ms).
@@ -123,6 +126,9 @@ type Model struct {
 	pubTestMsg        string
 	pubPublishing     bool
 	confirmPublish    bool
+
+	// Wizard state
+	wizard WizardState
 }
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -144,11 +150,22 @@ func New(ctrl Controller) *Model {
 		width:      80,
 		height:     24,
 		logFollow:  true,
+		wizard:     newWizardState(),
 	}
 	if ctrl != nil {
 		m.applySnapshot(ctrl.Snapshot(viewmodel.FilterAll), true)
 	}
 	return m
+}
+
+// ActiveView returns the currently active presentation view.
+func (m *Model) ActiveView() ActiveView {
+	return m.activeView
+}
+
+// SetView switches the active presentation view.
+func (m *Model) SetView(v ActiveView) {
+	m.activeView = v
 }
 
 // Init starts the periodic background refresh tick (bounded at 10 Hz / 100 ms).
@@ -232,6 +249,28 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshConfigCenter()
 		}
 		return m, nil
+
+	case onboardingSavedMsg:
+		m.wizard.saving = false
+		if msg.err != nil {
+			m.wizard.saveError = msg.err.Error()
+			return m, nil
+		}
+		if msg.configSaved {
+			m.wizard.configCommitted = true
+		}
+		if msg.runtimeErr != nil {
+			m.wizard.runtimeError = msg.runtimeErr.Error()
+			m.setStatus(fmt.Sprintf("Runtime startup error: %s", msg.runtimeErr))
+			return m, nil
+		}
+
+		m.activeView = ViewCandidates
+		m.setStatus("Configuration saved. Gemsub started.")
+		if m.ctrl != nil {
+			m.applySnapshot(m.ctrl.Snapshot(m.filterMode), true)
+		}
+		return m, nil
 	}
 
 	return m, nil
@@ -272,6 +311,10 @@ func (m *Model) publishNowCmd() tea.Cmd {
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.activeView == ViewWizard {
+		return m.handleWizardKeys(msg)
+	}
+
 	// In Config Center with active input/modal modes, capture keys (q, esc, etc.)
 	if m.activeView == ViewConfig && (m.settingEditMode || m.confirmPublish || (m.configCategory == viewmodel.CategorySources && m.sourceMode != sourceModeNormal)) {
 		if msg.String() == "ctrl+c" {
@@ -1279,6 +1322,8 @@ func (m *Model) View() string {
 			sb.WriteString(m.renderLogs())
 		case ViewConfig:
 			sb.WriteString(m.renderConfigCenter())
+		case ViewWizard:
+			sb.WriteString(m.renderWizard())
 		}
 	}
 
@@ -1309,6 +1354,16 @@ func (m *Model) renderHeader() string {
 	lastCycleStr := "Never"
 	if !m.header.LastCycle.IsZero() {
 		lastCycleStr = m.header.LastCycle.Format("15:04:05")
+	}
+
+	if m.activeView == ViewWizard {
+		line1 := fmt.Sprintf("%s  >  %s",
+			bold.Render("GEMSUB"),
+			bold.Render("FIRST-RUN CONFIGURATION WIZARD"),
+		)
+		line2 := dim.Render(fmt.Sprintf("Step %d of 5: %s", m.wizard.Step+1, m.wizard.Step.Name()))
+		divider := dim.Render(strings.Repeat("─", m.width))
+		return line1 + "\n" + line2 + "\n" + divider
 	}
 
 	if m.activeView == ViewConfig {
@@ -2258,6 +2313,21 @@ func (m *Model) renderFooter() string {
 	var hints string
 	if m.showDetail {
 		hints = "[Esc] Close Detail  [y] Copy Link  [q] Quit"
+	} else if m.activeView == ViewWizard {
+		switch m.wizard.Step {
+		case WizardStepWelcome:
+			hints = fmt.Sprintf("%s [Enter] Get Started  [q/Ctrl+C] Quit", statusStr)
+		case WizardStepReview:
+			if m.wizard.saving {
+				hints = fmt.Sprintf("%s Saving configuration and starting daemon...", statusStr)
+			} else if m.wizard.configCommitted && m.wizard.runtimeError != "" {
+				hints = fmt.Sprintf("%s [Enter] Retry Runtime  [Esc] Candidate View  [c] Config Center  [q/Ctrl+C] Quit", statusStr)
+			} else {
+				hints = fmt.Sprintf("%s [Enter] Save & Start  [Esc] Back  [q/Ctrl+C] Quit", statusStr)
+			}
+		default:
+			hints = fmt.Sprintf("%s [Enter] Continue  [Tab] Switch Field  [Esc] Back  [Ctrl+C] Quit", statusStr)
+		}
 	} else if m.activeView == ViewConfig {
 		if m.configCategory == viewmodel.CategorySources {
 			switch m.sourceMode {

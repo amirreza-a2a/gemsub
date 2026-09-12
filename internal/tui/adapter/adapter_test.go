@@ -3,6 +3,7 @@ package adapter_test
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -4261,5 +4262,183 @@ func TestAdapter_Publishing_ViewModelAndControls(t *testing.T) {
 	}
 	if pubVM.FailCount != 1 {
 		t.Errorf("expected FailCount=1, got %d", pubVM.FailCount)
+	}
+}
+
+func TestAdapter_CompleteOnboarding(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	stateFile := filepath.Join(tmpDir, "state.json")
+
+	st := store.New(stateFile, 2)
+	bus := events.New()
+	ring := logging.NewRingLogHandler(100)
+	ad := adapter.New(st, bus, ring)
+	defer ad.Close()
+
+	// 1. Calling without ConfigService returns error
+	err := ad.CompleteOnboarding(viewmodel.OnboardingConfig{
+		SourceURL: "https://example.com/subs.txt",
+	})
+	if err == nil || !strings.Contains(err.Error(), "configuration service unavailable") {
+		t.Errorf("expected config service unavailable error, got: %v", err)
+	}
+
+	cfgSvc := config.NewDefaultService(cfgPath, bus)
+	ad.SetServices(cfgSvc, nil, nil, nil)
+
+	// 2. Calling without SourceService returns error
+	err = ad.CompleteOnboarding(viewmodel.OnboardingConfig{
+		SourceURL: "https://example.com/subs.txt",
+	})
+	if err == nil || !strings.Contains(err.Error(), "source service unavailable") {
+		t.Errorf("expected source service unavailable error, got: %v", err)
+	}
+
+	srcSvc := source.NewService(cfgSvc)
+	ad.SetServices(cfgSvc, srcSvc, nil, nil)
+
+	// 3. Calling with invalid source URL returns error from SourceService
+	err = ad.CompleteOnboarding(viewmodel.OnboardingConfig{
+		SourceURL: "ftp://example.com/subs.txt",
+	})
+	if err == nil {
+		t.Error("expected error for invalid scheme ftp, got nil")
+	}
+
+	// 4. Set runtimeStarter callback
+	var starterInvoked bool
+	ad.SetRuntimeStarter(func() error {
+		starterInvoked = true
+		return nil
+	})
+
+	// 4. Successful onboarding configuration persistence
+	err = ad.CompleteOnboarding(viewmodel.OnboardingConfig{
+		SourceURL:   "https://example.com/subs.txt",
+		SourceName:  "Primary Feed",
+		Listen:      "127.0.0.1:8765",
+		Path:        "/sub",
+		Concurrency: 25,
+		Timeout:     "12s",
+		TargetURL:   "https://gemini.google.com/",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error during CompleteOnboarding: %v", err)
+	}
+
+	// 5. Independent runtime start
+	err = ad.StartRuntime()
+	if err != nil {
+		t.Fatalf("unexpected error during StartRuntime: %v", err)
+	}
+	if !starterInvoked {
+		t.Error("expected runtime starter to be invoked")
+	}
+
+	// Verify ConfigService has persisted state
+	cfg := cfgSvc.Get()
+	if len(cfg.Sources) != 1 || cfg.Sources[0].URL != "https://example.com/subs.txt" {
+		t.Errorf("unexpected sources in config: %+v", cfg.Sources)
+	}
+	if cfg.Serve.Listen != "127.0.0.1:8765" || cfg.Serve.Path != "/sub" {
+		t.Errorf("unexpected serve config: %+v", cfg.Serve)
+	}
+	if cfg.Test.Concurrency != 25 || cfg.Test.TimeoutRaw != "12s" {
+		t.Errorf("unexpected test config: %+v", cfg.Test)
+	}
+
+	// Verify file was written to disk
+	if _, err := os.Stat(cfgPath); err != nil {
+		t.Errorf("expected config file on disk, got: %v", err)
+	}
+}
+
+func TestAdapter_CompleteOnboarding_TransactionalRollbackOnFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	stateFile := filepath.Join(tmpDir, "state.json")
+
+	st := store.New(stateFile, 2)
+	bus := events.New()
+	ring := logging.NewRingLogHandler(100)
+	ad := adapter.New(st, bus, ring)
+	defer ad.Close()
+
+	cfgSvc := config.NewDefaultService(cfgPath, bus)
+	srcSvc := source.NewService(cfgSvc)
+	ad.SetServices(cfgSvc, srcSvc, nil, nil)
+
+	// Ensure preconditions: first-run mode is true, config file does not exist, sources empty
+	if !cfgSvc.IsFirstRun() {
+		t.Fatal("expected IsFirstRun() == true initially")
+	}
+	if _, err := os.Stat(cfgPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected config file to not exist yet, got err: %v", err)
+	}
+	if len(cfgSvc.Get().Sources) != 0 {
+		t.Fatalf("expected 0 sources initially, got %d", len(cfgSvc.Get().Sources))
+	}
+
+	// 1. Simulate a failure after source preparation but before successful commit.
+	// SourceURL is valid so srcSvc.AddToConfig succeeds and mutates the candidate's Sources.
+	// But Timeout is invalid duration syntax, causing c.Validate() to reject the candidate.
+	err := ad.CompleteOnboarding(viewmodel.OnboardingConfig{
+		SourceURL:   "https://example.com/subs.txt",
+		SourceName:  "Primary Feed",
+		Listen:      "127.0.0.1:8765",
+		Path:        "/sub",
+		Concurrency: 20,
+		Timeout:     "invalid-duration-syntax",
+		TargetURL:   "https://gemini.google.com/",
+	})
+	if err == nil {
+		t.Fatal("expected CompleteOnboarding to fail due to invalid timeout duration, got nil")
+	}
+
+	// Assert transactional failure invariants:
+	// - No partial config is persisted on disk
+	if _, err := os.Stat(cfgPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected config file to not exist after rollback, got: %v", err)
+	}
+	// - isFirstRun remains true
+	if !cfgSvc.IsFirstRun() {
+		t.Error("expected IsFirstRun() to remain true after failed onboarding transaction")
+	}
+	// - No partial source remains in ConfigService in-memory state
+	if len(cfgSvc.Get().Sources) != 0 {
+		t.Errorf("expected 0 sources in ConfigService after rollback, got %d", len(cfgSvc.Get().Sources))
+	}
+	// - No partial source remains in SourceService
+	if len(srcSvc.List()) != 0 {
+		t.Errorf("expected 0 sources in SourceService after rollback, got %d", len(srcSvc.List()))
+	}
+
+	// 2. Retry with fully valid configuration: single atomic commit must succeed and transition isFirstRun
+	err = ad.CompleteOnboarding(viewmodel.OnboardingConfig{
+		SourceURL:   "https://example.com/subs.txt",
+		SourceName:  "Primary Feed",
+		Listen:      "127.0.0.1:8765",
+		Path:        "/sub",
+		Concurrency: 20,
+		Timeout:     "10s",
+		TargetURL:   "https://gemini.google.com/",
+	})
+	if err != nil {
+		t.Fatalf("expected onboarding to succeed on retry with valid config: %v", err)
+	}
+
+	// Assert post-commit invariants:
+	if cfgSvc.IsFirstRun() {
+		t.Error("expected IsFirstRun() == false after successful onboarding commit")
+	}
+	if len(cfgSvc.Get().Sources) != 1 {
+		t.Errorf("expected 1 source in ConfigService after commit, got %d", len(cfgSvc.Get().Sources))
+	}
+	if len(srcSvc.List()) != 1 {
+		t.Errorf("expected 1 source in SourceService after commit, got %d", len(srcSvc.List()))
+	}
+	if _, err := os.Stat(cfgPath); err != nil {
+		t.Errorf("expected config file to exist on disk after successful commit: %v", err)
 	}
 }

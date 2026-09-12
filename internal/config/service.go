@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // EventPublisher is an interface for broadcasting application events.
@@ -29,6 +30,7 @@ type Service struct {
 	cfg        *Config
 	initialCfg *Config
 	bus        EventPublisher
+	isFirstRun bool
 }
 
 // ConfigService is an alias for Service.
@@ -66,6 +68,77 @@ func NewService(path string, cfg *Config, bus EventPublisher) (*Service, error) 
 		initialCfg: loaded.Clone(),
 		bus:        bus,
 	}, nil
+}
+
+// DefaultConfig returns a valid default configuration template suitable for first-run onboarding.
+func DefaultConfig() *Config {
+	defaultRetries := 2
+	return &Config{
+		Sources:          []SourceItem{},
+		FetchIntervalRaw: "3h",
+		FetchInterval:    3 * time.Hour,
+		Test: TestConfig{
+			HealthURL:        "https://www.gstatic.com/generate_204",
+			HealthTimeoutRaw: "4s",
+			HealthTimeout:    4 * time.Second,
+			Gemini: GeminiConfig{
+				URL: "https://gemini.google.com/",
+				BlockPhrases: []string{
+					"isn't currently supported in your country",
+					"not available in your country",
+					"not available in your region",
+				},
+			},
+			TargetURL: "https://gemini.google.com/",
+			BlockPhrases: []string{
+				"isn't currently supported in your country",
+				"not available in your country",
+				"not available in your region",
+			},
+			TimeoutRaw:            "10s",
+			Timeout:               10 * time.Second,
+			DialTimeoutRaw:        "4s",
+			DialTimeout:           4 * time.Second,
+			Concurrency:           20,
+			MaxRetriesRaw:         &defaultRetries,
+			MaxRetries:            2,
+			RetryBackoffRaw:       "1s",
+			RetryBackoff:          1 * time.Second,
+			MaxInconclusiveCycles: 2,
+		},
+		Serve: ServeConfig{
+			Listen: "127.0.0.1:8765",
+			Path:   "/sub",
+			Format: "base64",
+		},
+		Publishing: PublishingConfig{
+			Enabled: false,
+			Branch:  "main",
+		},
+		StateFile: "./gemsub_state.json",
+	}
+}
+
+// NewDefaultService creates a configuration Service pre-populated with a default configuration
+// template for first-run onboarding. It records that it is in first-run mode and does not persist
+// to disk until Save() is explicitly called.
+func NewDefaultService(path string, bus EventPublisher) *Service {
+	cfg := DefaultConfig()
+	return &Service{
+		path:       path,
+		cfg:        cfg,
+		initialCfg: cfg.Clone(),
+		bus:        bus,
+		isFirstRun: true,
+	}
+}
+
+// IsFirstRun reports whether the configuration service is in initial first-run onboarding mode
+// (meaning config has not yet been persisted to disk).
+func (s *Service) IsFirstRun() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isFirstRun
 }
 
 // PendingRestartFields returns any canonical field paths modified since initialization
@@ -159,6 +232,7 @@ func (s *Service) Update(mutator func(*Config) error) error {
 		oldCfg = *s.cfg.Clone()
 	}
 	s.cfg = candidate
+	s.isFirstRun = false
 	newCfg := *s.cfg.Clone()
 	bus := s.bus
 
@@ -196,6 +270,7 @@ func (s *Service) Save() error {
 		return fmt.Errorf("persist config: %w", err)
 	}
 
+	s.isFirstRun = false
 	return nil
 }
 

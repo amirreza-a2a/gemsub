@@ -81,10 +81,11 @@ type Adapter struct {
 	rebuildInFlightHook func()
 
 	// Application services for Configuration Center
-	configSvc     *config.Service
-	sourceSvc     *source.Service
-	publishSvc    *publisher.Service
-	schedulerCtrl *scheduler.ControlService
+	configSvc      *config.Service
+	sourceSvc      *source.Service
+	publishSvc     *publisher.Service
+	schedulerCtrl  *scheduler.ControlService
+	runtimeStarter func() error
 
 	// Event-driven configuration/publishing cache (used when services are nil or as event fallback)
 	lastCfg           config.Config
@@ -2011,4 +2012,75 @@ func (a *Adapter) PublishNow(ctx context.Context) error {
 		atomic.StoreInt32(&a.dirty, 1)
 	}
 	return err
+}
+
+// SetRuntimeStarter configures a lifecycle callback to start runtime workers (Store, Scheduler, Subserver)
+// upon successful onboarding completion.
+func (a *Adapter) SetRuntimeStarter(fn func() error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.runtimeStarter = fn
+}
+
+// CompleteOnboarding builds, validates, and persists initial configuration through ConfigService and SourceService.
+func (a *Adapter) CompleteOnboarding(data viewmodel.OnboardingConfig) error {
+	a.mu.RLock()
+	cfgSvc := a.configSvc
+	srcSvc := a.sourceSvc
+	a.mu.RUnlock()
+
+	if cfgSvc == nil {
+		return fmt.Errorf("configuration service unavailable")
+	}
+	if srcSvc == nil {
+		return fmt.Errorf("source service unavailable")
+	}
+
+	// Persist entire onboarding configuration as ONE single atomic ConfigService.Update() transaction.
+	err := cfgSvc.Update(func(c *config.Config) error {
+		// 1. Canonical source addition via SourceService
+		_, err := srcSvc.AddToConfig(c, source.SourceItem{
+			URL:     data.SourceURL,
+			Name:    data.SourceName,
+			Enabled: true,
+		})
+		if err != nil {
+			return fmt.Errorf("register primary source: %w", err)
+		}
+
+		// 2. Subserver configuration
+		c.Serve.Listen = data.Listen
+		c.Serve.Path = data.Path
+		c.Serve.Format = "base64"
+
+		// 3. Testing and Gemini configuration
+		c.Test.Concurrency = data.Concurrency
+		c.Test.TimeoutRaw = data.Timeout
+		c.Test.Gemini.URL = data.TargetURL
+		c.Test.TargetURL = data.TargetURL
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("save configuration: %w", err)
+	}
+
+	atomic.StoreInt32(&a.dirty, 1)
+	return nil
+}
+
+// StartRuntime starts application runtime workers (Store, Scheduler, Subserver)
+// using the registered runtime starter callback.
+func (a *Adapter) StartRuntime() error {
+	a.mu.RLock()
+	starter := a.runtimeStarter
+	a.mu.RUnlock()
+
+	if starter != nil {
+		if err := starter(); err != nil {
+			return fmt.Errorf("start runtime: %w", err)
+		}
+	}
+
+	atomic.StoreInt32(&a.dirty, 1)
+	return nil
 }

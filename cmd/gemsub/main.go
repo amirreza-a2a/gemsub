@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -30,6 +32,25 @@ import (
 	"gemsub/internal/tui/country"
 	"gemsub/internal/version"
 )
+
+// ErrMissingConfigHeadless is returned when config.json is missing in headless mode.
+var ErrMissingConfigHeadless = errors.New("configuration file not found in headless mode")
+
+// bootstrapConfig resolves the configuration service, detecting first-run onboarding when
+// config file does not exist.
+func bootstrapConfig(configPath string, headless bool) (*config.Service, bool, error) {
+	configSvc, err := config.NewService(configPath, nil, nil)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if headless {
+				return nil, false, fmt.Errorf("%w: %s", ErrMissingConfigHeadless, configPath)
+			}
+			return config.NewDefaultService(configPath, nil), true, nil
+		}
+		return nil, false, err
+	}
+	return configSvc, false, nil
+}
 
 func main() {
 	// Initialize default standard terminal logging during bootstrap
@@ -49,8 +70,17 @@ func main() {
 		return
 	}
 
-	configSvc, err := config.NewService(*configPath, nil, nil)
+	configSvc, isFirstRun, err := bootstrapConfig(*configPath, *headless)
 	if err != nil {
+		if errors.Is(err, ErrMissingConfigHeadless) {
+			fmt.Fprintf(os.Stderr, "Configuration file not found: %s\n\n"+
+				"To configure gemsub:\n"+
+				"  1. Run gemsub interactively without --headless to launch the onboarding wizard: gemsub\n"+
+				"  2. Or create %s manually by copying config.example.json:\n"+
+				"     cp config.example.json %s\n",
+				*configPath, *configPath, *configPath)
+			os.Exit(1)
+		}
 		slog.Error("config load failed", "err", err)
 		os.Exit(1)
 	}
@@ -67,7 +97,7 @@ func main() {
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "publish" {
 			runtimeCfg.Publishing.Enabled = *publish
-			if *publish {
+			if *publish && !isFirstRun {
 				if err := runtimeCfg.Validate(); err != nil {
 					slog.Error("config validation failed", "err", err)
 					os.Exit(1)
@@ -76,9 +106,11 @@ func main() {
 		}
 		if f.Name == "flag-mode" {
 			runtimeCfg.FlagMode = *flagMode
-			if err := runtimeCfg.Validate(); err != nil {
-				slog.Error("config validation failed", "err", err)
-				os.Exit(1)
+			if !isFirstRun {
+				if err := runtimeCfg.Validate(); err != nil {
+					slog.Error("config validation failed", "err", err)
+					os.Exit(1)
+				}
 			}
 		}
 	})
@@ -113,22 +145,59 @@ func runLifecycle(ctx context.Context, cfg *config.Config, logWriter io.Writer, 
 
 	var wg sync.WaitGroup
 
-	// Step 5: Start Scheduler via ControlService
-	if err := rt.SchedulerCtrl.Start(ctx); err != nil {
-		slog.Error("scheduler start error", "err", err)
-		cancel()
+	isFirstRun := false
+	if len(configSvc) > 0 && configSvc[0] != nil && configSvc[0].IsFirstRun() {
+		isFirstRun = true
 	}
-	defer func() { _ = rt.SchedulerCtrl.Stop() }()
 
-	// Step 6: Start HTTP subserver
-	srv := subserver.New(&cfg.Serve, rt.Store)
-	srv.SetEventBus(rt.Bus)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := srv.Run(ctx); err != nil {
-			slog.Error("subserver error", "err", err)
+	var workersStarted int32
+	startWorkers := func(runCtx context.Context) error {
+		if !atomic.CompareAndSwapInt32(&workersStarted, 0, 1) {
+			return nil
+		}
+		if err := rt.Store.Load(); err != nil {
+			slog.Warn("could not load previous state", "err", err)
+		}
+		currentCfg := cfg
+		if rt.ConfigSvc != nil {
+			c := rt.ConfigSvc.Get()
+			currentCfg = &c
+			if rt.Scheduler != nil {
+				rt.Scheduler.UpdateConfig(c)
+			}
+		}
+		if err := rt.SchedulerCtrl.Start(runCtx); err != nil {
+			atomic.StoreInt32(&workersStarted, 0)
+			return fmt.Errorf("start scheduler: %w", err)
+		}
+		srv := subserver.New(&currentCfg.Serve, rt.Store)
+		srv.SetEventBus(rt.Bus)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := srv.Run(runCtx); err != nil {
+				slog.Error("subserver error", "err", err)
+				cancel()
+			}
+		}()
+		return nil
+	}
+
+	if rt.Adapter != nil {
+		rt.Adapter.SetRuntimeStarter(func() error {
+			return startWorkers(ctx)
+		})
+	}
+
+	if !isFirstRun {
+		if err := startWorkers(ctx); err != nil {
+			slog.Error("scheduler start error", "err", err)
 			cancel()
+		}
+	}
+	defer func() {
+		if rt.SchedulerCtrl != nil {
+			_ = rt.SchedulerCtrl.Stop()
 		}
 	}()
 
@@ -158,6 +227,7 @@ type Runtime struct {
 	ConfigSvc     *config.Service
 	SourceSvc     *source.Service
 	PublishSvc    *publisher.Service
+	Scheduler     *scheduler.Scheduler
 	SchedulerCtrl *scheduler.ControlService
 	RingHandler   *logging.RingLogHandler
 	Store         *store.Store
@@ -209,6 +279,7 @@ func setupRuntime(cfg *config.Config, logWriter io.Writer, configSvc ...*config.
 		ConfigSvc:     svc,
 		SourceSvc:     srcSvc,
 		PublishSvc:    pubSvc,
+		Scheduler:     sched,
 		SchedulerCtrl: schedCtrl,
 		RingHandler:   ringHandler,
 		Store:         st,
@@ -225,6 +296,9 @@ func setupRuntime(cfg *config.Config, logWriter io.Writer, configSvc ...*config.
 		ad.Subscribe()
 		rt.Adapter = ad
 		rt.TUIModel = tui.New(ad)
+		if svc != nil && svc.IsFirstRun() {
+			rt.TUIModel.SetView(tui.ViewWizard)
+		}
 		rt.Program = tea.NewProgram(rt.TUIModel, tea.WithAltScreen())
 	}
 

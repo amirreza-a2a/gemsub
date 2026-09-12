@@ -1343,6 +1343,14 @@ func (c *testDecoupledController) PublishNow(ctx context.Context) error {
 	return nil
 }
 
+func (c *testDecoupledController) CompleteOnboarding(cfg viewmodel.OnboardingConfig) error {
+	return nil
+}
+
+func (c *testDecoupledController) StartRuntime() error {
+	return nil
+}
+
 func TestModel_ConfigCenterDecoupledController(t *testing.T) {
 	mock := &testDecoupledController{
 		configCenter: viewmodel.ConfigCenterViewModel{
