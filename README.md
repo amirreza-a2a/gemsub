@@ -9,7 +9,7 @@
 It ingests raw proxy share links from upstream sources, verifies network transport connectivity and target service accessibility through active two-stage probing, and serves reliable, classified configurations over a local HTTP subscription endpoint or a remote Git repository.
 
 > [!NOTE]
-> **Release Status**: The repository is currently preparing for the upcoming **`v0.1.1`** release. The previous stable release is **`v0.1.0`**.
+> **Release Status**: The repository is currently preparing for the upcoming **`v0.1.2`** release. The previous stable release is **`v0.1.1`**.
 
 ---
 
@@ -657,10 +657,12 @@ sha256sum --ignore-missing -c checksums.txt
 | **Linux** | `arm64` (`aarch64`) | Statically linked ELF64 | Installer script, `.tar.gz`, `.deb`, `.rpm` |
 | **Linux** | `armv7` (`armhf`) | Statically linked ELF32 | Installer script, `.tar.gz`, `.deb`, `.rpm` |
 | **Android / Termux** | `arm64` (`aarch64`) | Position-Independent ELF64 (`DYN`) | Termux installer script, `.tar.gz` |
+| **Windows** | `x86_64` (`amd64`) | Standalone PE64 (`.exe`) | Standalone `.zip` |
+| **Windows** | `arm64` | Standalone PE64 (`.exe`) | Standalone `.zip` |
 
 ### Known Limitations
 - **Android / Termux Runtime Validation:** The Termux arm64 binary is validated via cross-compilation ELF inspection and hermetic tests. Physical device runtime testing is ongoing.
-- **Desktop Platforms:** Windows and macOS desktop binaries are not currently generated or supported in the release matrix.
+- **Desktop Platforms:** macOS desktop binaries are not currently generated or supported in the release matrix. Official Windows binaries are supported for x86_64 and arm64.
 - **Upstream Sing-Box Race (`TD-008`):** An upstream data race exists in `sing-box`'s network interface monitor (`route/network.go`) under high concurrency with Go race detector enabled. This is isolated in CI and tracked in the repository technical debt register.
 
 ---
