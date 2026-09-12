@@ -13,9 +13,25 @@ It ingests raw proxy share links from upstream sources, verifies network transpo
 
 ---
 
+## Key Features
+
+- **Two-Stage Active Probing:** Combines TCP/TLS/uTLS transport connectivity checks with real HTTP application-layer validation against target services (such as Google Gemini).
+- **Dual Canonical Projections:** Derives both a strict Gemini-verified projection and a generic transport-passing projection from a single authoritative store.
+- **Interactive Terminal UI:** Built with Bubble Tea and Lip Gloss; includes a real-time candidate table, credential masking (`[REDACTED]`), country flags (`auto`, `unicode`, `ascii`), candidate detail inspect modal, and one-key clipboard copying (`y`).
+- **Interactive Configuration Center:** Built-in TUI manager (`c`) for live source management, runtime settings, scheduler control, and publishing diagnostics.
+- **First-Run Onboarding Wizard:** Guided 5-step interactive setup that validates sources, sets up the local subserver, configures test parameters, and atomically saves configuration on fresh installations.
+- **Headless Daemon Mode:** Lightweight background operation for Linux servers, systemd services, and resource-constrained environments without initializing the TUI.
+- **Dynamic Configuration Propagation:** Thread-safe configuration service with atomic persistence and hot-reloading for runtime settings without restarting the daemon.
+- **Local HTTP Subscription Server:** Serves auto-updating subscriptions to clients such as Throne, Sing-box, Clash, and v2rayN with dedicated routes (`/sub/generic`, `/sub/gemini`), protocol filtering (`?proto=vless`), format selection (`?format=raw` or `?format=base64`), and health/metrics endpoint (`/healthz`).
+- **Automated Git Publishing:** Deterministically exports, stages, and pushes passing configurations (`generic/`, `gemini/`, `meta.json`) to a remote Git repository.
+- **Persistent State & History:** Retains bounded circular cycle history, consecutive inconclusive tracking, and exponential reliability scoring across restarts with atomic gzip-compressed snapshots (`.json.gz`).
+- **Supported Protocols:** VLESS, VMess, Trojan, and Shadowsocks (`ss://`).
+
+---
+
 ## Architecture Overview
 
-`gemsub` maintains strict architectural boundaries between ingestion, scheduling, probing, authoritative state management, presentation, and delivery:
+`gemsub` enforces strict architectural boundaries between ingestion, scheduling, probing, authoritative state management, presentation, and delivery:
 
 ```text
 Upstream Sources (HTTP URLs / Local Files)
@@ -54,52 +70,22 @@ The **Store** is the single authoritative source of candidate state, health, sco
 
 ---
 
-## Core Capabilities
-
-- **Two-Stage Active Probing:**
-  - **Stage 1 (Transport Health):** TCP connection, TLS/uTLS handshake, and lightweight HTTP health validation (`https://www.gstatic.com/generate_204`).
-  - **Stage 2 (Application Validation):** Full HTTP target session against Google Gemini (`https://gemini.google.com/`) using uTLS browser fingerprint emulation, detecting regional blocks, denial pages, and silent rejections.
-- **Dual Canonical Projections:**
-  - **Generic Network Projection (`Store.NetworkPassing()`):** Proxies with verified transport connectivity, regardless of Gemini regional restrictions.
-  - **Gemini-Verified Projection (`Store.Passing()`):** Proxies that successfully pass both transport checks and Gemini application validation.
-- **Interactive Terminal UI (Bubble Tea & Lip Gloss):**
-  - Virtualized candidate table, credential masking (`[REDACTED]`), country flags (`auto`, `unicode`, `ascii`), candidate detail inspect modal, and one-key clipboard link copying (`y`).
-  - Real-time log viewer with ring-buffer storage, log level filtering (`DEBUG` to `ERROR`), and follow mode (`f`).
-  - Interactive **Config Center** (`c`) with dedicated categories for General settings, Sources, Testing parameters, Gemini validation, Scheduler control, and Publishing options.
-  - First-run **Onboarding Wizard** guiding initial setup on fresh installations.
-- **Dynamic Configuration & Propagation:**
-  - Thread-safe configuration service with atomic persistence to disk (`AtomicWriteFile` with temporary file and rename).
-  - Dynamic runtime propagation for hot-reloadable settings (sources, intervals, test parameters, publishing settings, probe limits, flag modes) without restarting the daemon.
-- **Headless Daemon Mode (`-headless`):**
-  - Lightweight background execution for Linux servers, systemd services, and unattended environments without TUI initialization.
-- **Local HTTP Subserver:**
-  - Auto-updating subscription delivery for clients such as Throne, Sing-box, Clash, and v2rayN.
-  - Dedicated routes (`/sub/generic`, `/sub/gemini`), base route (`/sub`), query parameters for protocol filtering (`?proto=vless`), output format selection (`?format=raw` or `?format=base64`), and health/metrics endpoint (`/healthz`).
-- **Automated Git Publishing:**
-  - Atomic export, staging, and push of passing configurations (`generic/`, `gemini/`, `meta.json`) to a remote Git repository at cycle completion.
-- **Persistent State & Bounded History:**
-  - State persistence using atomic gzip-compressed snapshots (`<path>.gz`) preserving bounded cycle history, exponential reliability scoring, and consecutive inconclusive tracking across restarts.
-- **Supported Protocols:**
-  - VLESS, VMess, Trojan, and Shadowsocks (`ss://`).
-
----
-
 ## Quick Start
 
 ### 1. Interactive First Run (Onboarding Wizard)
 
-When `gemsub` is launched interactively without an existing configuration file, it automatically starts the interactive 5-step onboarding wizard:
+When `gemsub` is launched interactively without an existing configuration file, it automatically starts the 5-step onboarding wizard:
 
 ```bash
 gemsub
 ```
 
 The wizard guides you through:
-1. **Welcome & Architecture:** System overview and pipeline concept.
-2. **Primary Subscription Source:** Ingest your first subscription URL (with syntax validation).
-3. **Local Subserver Setup:** Configure listen address (default `127.0.0.1:8765`) and endpoint path (default `/sub`).
+1. **Welcome & Architecture:** Overview of the active testing pipeline and projection model.
+2. **Primary Subscription Source:** Ingest and validate your first upstream subscription URL.
+3. **Local Subserver Setup:** Configure the listen address (default `127.0.0.1:8765`) and subscription path (default `/sub`).
 4. **Testing & Gemini Defaults:** Configure probe concurrency, timeouts, and target URLs.
-5. **Review & Save:** Review the generated configuration, atomically commit it to `config.json`, and immediately launch the background testing runtime.
+5. **Review & Save:** Review the generated configuration, atomically commit it to `config.json`, and immediately launch the testing runtime.
 
 ### 2. Headless First Run
 
@@ -109,7 +95,7 @@ In headless mode, an existing configuration file is required. If `config.json` i
 gemsub -headless
 ```
 
-`gemsub` exits with code 1 and displays instructions:
+`gemsub` exits with code 1 and displays guidance:
 
 ```text
 Configuration file not found: ./config.json
@@ -122,7 +108,7 @@ To configure gemsub:
 
 ### 3. Manual Configuration
 
-You can also initialize configuration manually from the provided template:
+You can also initialize configuration manually from the template:
 
 ```bash
 cp config.example.json config.json
@@ -135,7 +121,7 @@ Or run directly as a background daemon:
 gemsub -headless -config config.json
 ```
 
-Once running, verified subscription feeds are immediately accessible:
+Once started, verified subscription feeds are immediately available:
 
 ```bash
 # Fetch Gemini-passing proxies (Base64-encoded by default)
@@ -144,7 +130,7 @@ curl -s http://127.0.0.1:8765/sub
 # Fetch generic network-passing proxies in plain text
 curl -s "http://127.0.0.1:8765/sub/generic?format=raw"
 
-# Query subserver metrics
+# Query subserver status and metrics
 curl -s http://127.0.0.1:8765/healthz
 ```
 
@@ -207,7 +193,7 @@ sudo rpm -i gemsub_<version>_linux_<arch>.rpm
 ### Android / Termux
 
 > [!NOTE]
-> This is a **Termux-compatible standalone artifact**, built for 64-bit ARM (`aarch64`) Android devices running Termux.
+> This is a **Termux-compatible standalone artifact**, built for 64-bit ARM (`aarch64`) Android devices running Termux. Physical-device runtime validation is currently ongoing; verification has been conducted through hermetic builds and integration tests.
 
 Run the Termux installer inside your Termux shell:
 
@@ -215,14 +201,14 @@ Run the Termux installer inside your Termux shell:
 curl -sSfL https://raw.githubusercontent.com/amirreza-a2a/gemsub/main/scripts/install-termux.sh | bash
 ```
 
-The installer verifies userspace environment, checks architecture, validates checksums against `checksums.txt`, and places the binary in `$PREFIX/bin/gemsub`.
+The installer verifies the userspace environment, validates architecture, checks SHA-256 digests against `checksums.txt`, and installs the binary to `$PREFIX/bin/gemsub` without requiring root permissions.
 
 ---
 
 ### Building from Source
 
 #### Prerequisites
-- Go 1.25 or later (tested on Go 1.25.5)
+- Go 1.25 or later
 - Make
 - Git
 
@@ -264,7 +250,7 @@ Usage of gemsub:
 
 ## Terminal User Interface (TUI)
 
-The TUI provides complete real-time monitoring and interactive runtime management.
+The TUI provides real-time monitoring and interactive configuration management. Minimum recommended terminal size is **80 columns × 24 rows**.
 
 ### Candidate View (`ViewCandidates`)
 
@@ -285,11 +271,11 @@ Displays the table of evaluated candidates, latency, test outcome, protocol, and
 | `Tab` | Global | Switch focus between Candidate View and Log View |
 | `q` / `Ctrl+C` | Global | Gracefully shut down daemon, save state, and exit |
 
-*Credential Redaction:* Sensitive credentials (passwords, UUIDs) are masked in the UI (`[REDACTED]`). Copying with `y` copies the authentic, unredacted link to your clipboard.
+*Credential Redaction:* Sensitive credentials (passwords, UUIDs) are automatically redacted in presentation (`[REDACTED]`). Copying with `y` copies the authentic, unredacted link to your clipboard.
 
 ### Log View (`ViewLogs`)
 
-Displays real-time structured log events buffered in a circular memory handler.
+Displays real-time structured log records buffered in a circular memory handler.
 
 | Key | Context | Action |
 | :--- | :--- | :--- |
@@ -334,7 +320,7 @@ Press `c` from Candidate or Log view to open the interactive configuration cente
 
 ## Configuration
 
-Configuration is stored in JSON format (default `./config.json`). An annotated example template is provided in `config.example.json`.
+Configuration is stored in JSON format (default `./config.json`). A template is provided in `config.example.json`.
 
 ```json
 {
@@ -416,10 +402,77 @@ Configuration is stored in JSON format (default `./config.json`). An annotated e
 
 `gemsub` differentiates between settings that take effect immediately at runtime and settings that require restarting the process:
 
-| Policy | Configuration Fields | Behavior |
+| Policy | Configuration Fields | Runtime Behavior |
 | :--- | :--- | :--- |
-| **Hot-Reloadable** | `sources`, `fetch_interval`, `test.*`, `publishing.*`, `probe_limit`, `flag_mode`, `serve.format` | Applied immediately to running subsystems upon save. |
-| **Restart Required** | `serve.listen`, `serve.path`, `state_file`, `headless` | Saved to `config.json` immediately; flagged in Config Center as pending restart. |
+| **Hot-Reloadable** | `sources`<br>`fetch_interval`<br>`probe_limit`<br>`flag_mode`<br>`serve.format`<br>`test.health_url`<br>`test.health_timeout`<br>`test.gemini.url`<br>`test.gemini.block_phrases`<br>`test.timeout`<br>`test.dial_timeout`<br>`test.concurrency`<br>`test.rate_limit_rps`<br>`test.max_retries`<br>`test.retry_backoff`<br>`test.max_inconclusive_cycles`<br>`publishing.enabled`<br>`publishing.repository`<br>`publishing.branch`<br>`publishing.remote_url` | Applied immediately to running subsystems (Scheduler, Tester, Subserver, Publisher) upon save without restarting the process. |
+| **Restart Required** | `serve.listen`<br>`serve.path`<br>`state_file`<br>`headless` | Saved to `config.json` immediately; flagged in the Config Center as pending restart because network sockets, snapshot paths, or process modes cannot be rebound safely while running. |
+
+---
+
+## Candidate Testing & Validation Model
+
+`gemsub` maintains an active, multi-stage probing pipeline to ensure only stable and functional proxies are published:
+
+```text
+Raw Sources → Link Ingestion → Normalization & Deduplication
+                                         ↓
+                     Stage 1: Transport Health Check
+                       (TCP Connect, TLS / uTLS Handshake)
+                                         ↓
+                     Stage 2: Application Target Check
+                       (HTTP Request to Target Endpoint)
+                                         ↓
+                     Content Inspection & Gate Evaluation
+                                         ↓
+                     Authoritative Store & State Update
+```
+
+1. **Ingestion & Normalization:** Ingests raw configurations, parses protocol parameters, and normalizes candidate representations to prevent duplicate tests.
+2. **Transport Probing:** Evaluates the proxy's transport layer using `sing-box` with realistic uTLS client fingerprints. If TCP connection, TLS handshake, or health endpoint queries fail, the candidate is classified as a transport failure (`conn_refused`, `timeout`, `tls_error`, `reality_error`).
+3. **Application Validation:** Proxies with sound transport connectivity proceed to application-layer validation against the target endpoint.
+4. **Reliability Scoring & Bounded History:**
+   - Every candidate retains a bounded circular history buffer (up to 5 recent test outcomes).
+   - Transient failures (e.g. temporary packet loss or rate limits) are flagged as `inconclusive`. Candidates with prior passing records remain servable across up to `test.max_inconclusive_cycles`.
+   - Continuous passes build higher reliability scores using exponential scoring decay (`decay_lambda`), determining sorting order in subscriptions and presentation.
+
+---
+
+## Gemini-Specific Validation
+
+Generic proxy checkers rely solely on TCP pings or Google 204 connectivity. These checks are insufficient for Google Gemini because:
+
+1. **Regional Restrictions:** Proxies hosted in unsupported territories (or whose IP geolocation is incorrectly categorized) may connect cleanly to Google's CDN but are served localized denial pages.
+2. **Silent Rejections:** When blocked by region or policy, Gemini endpoints can return HTTP 200 or 403 pages containing specific rejection text:
+   - *"isn't currently supported in your country"*
+   - *"not available in your country"*
+   - *"not available in your region"*
+3. **TLS Fingerprint Rejection:** Google frontends may detect or throttle non-browser TLS handshakes.
+
+`gemsub` addresses this by simulating standard browser TLS client hellos via uTLS, establishing an authentic HTTP session to `https://gemini.google.com/`, and evaluating the response payload against configured `block_phrases`. Candidates encountering regional blocks are classified as `region_blocked`.
+
+---
+
+## Generic vs Gemini Projections
+
+The authoritative `Store` maintains two distinct, decoupled projections:
+
+```text
+                    ┌─────────────────────────┐
+                    │       Store State       │
+                    └────────────┬────────────┘
+                                 │
+                 ┌───────────────┴───────────────┐
+                 ▼                               ▼
+      Store.NetworkPassing()               Store.Passing()
+    [Generic Network Projection]       [Gemini-Verified Projection]
+                 │                               │
+                 ▼                               ▼
+        /sub/generic or                  /sub/gemini or
+        /sub?projection=generic          /sub?projection=gemini
+```
+
+- **Generic Projection (`Store.NetworkPassing()`):** Contains all candidates that passed transport health probing (`https://www.gstatic.com/generate_204`), regardless of whether Gemini blocks them. Recommended for general web browsing, messaging, and non-Gemini workloads.
+- **Gemini Projection (`Store.Passing()`):** Contains only candidates that passed both transport probing and Gemini application verification. Recommended for AI workflows and region-sensitive access.
 
 ---
 
@@ -484,7 +537,7 @@ When `publishing.enabled` is `true`, `gemsub` commits and pushes updated configu
 
 - Persisted state is saved to `state_file` (default `./gemsub_state.json`) and automatically compressed with gzip as `./gemsub_state.json.gz`.
 - Writes occur via a temporary file followed by an atomic rename, preventing file corruption across power loss or crashes.
-- On startup, `gemsub` restores candidate records, reliability scores, and historical test samples before resuming scheduler probing. Restored passing candidates are served immediately on startup.
+- On startup, `gemsub` restores candidate records, reliability scores, and historical test samples before resuming scheduler probing. Restored passing candidates are served immediately on startup without waiting for a new cycle to finish.
 
 ---
 
@@ -511,11 +564,56 @@ go test -tags with_utls -count=1 -p 1 ./...
 go test -tags with_utls -race -count=1 ./cmd/gemsub ./internal/config ./internal/scheduler ./internal/publisher ./internal/source ./internal/store ./internal/subserver ./internal/tui
 
 # Build executable
-go build -tags with_utls ./cmd/gemsub
+make build
+# or: go build -tags with_utls ./cmd/gemsub
 ```
 
 > [!NOTE]
 > `internal/tester` is tested without `-race` due to an upstream sing-box interface monitor data race tracked as `TD-008`.
+
+---
+
+## Release Process
+
+Maintainers follow a tag-driven release process automated through GitHub Actions and GoReleaser:
+
+1. **Tagging:** A release is triggered by pushing a semantic version tag:
+   ```bash
+   git tag -a v0.1.0 -m "Release v0.1.0"
+   git push origin v0.1.0
+   ```
+2. **Automated Pipeline (`.github/workflows/release.yml`):**
+   - The `validate` job runs `go vet` and serialized unit tests with least-privilege `contents: read` permissions.
+   - The `release` job invokes GoReleaser v2 (`v2.18.1`) with `contents: write` permissions.
+   - GoReleaser cross-compiles binaries, generates archives, builds `.deb` and `.rpm` packages, computes SHA-256 digests in `checksums.txt`, injects version metadata, and publishes assets to GitHub Releases.
+3. **Local Release Verification:**
+   Maintainers can verify release generation locally without creating Git tags:
+   ```bash
+   # Validate GoReleaser configuration syntax
+   make release-check
+
+   # Generate snapshot binaries and packages in ./dist
+   make release-snapshot
+   ```
+
+---
+
+## Checksums & Verification
+
+All release assets are accompanied by an authoritative `checksums.txt` file containing SHA-256 digests.
+
+### Automated Verifier Safety
+Both `scripts/install.sh` and `scripts/install-termux.sh` enforce strict integrity checks:
+- Exact filename matching (prevents substring confusion).
+- Single-entry cardinality enforcement (rejects duplicate or missing entries).
+- Strict 64-hex SHA-256 format verification.
+- Pre-extraction fail-closed validation (archives are deleted if checksums do not match).
+- Full support for binary-mode indicator formatting (`*<filename>`).
+
+### Manual Verification
+```bash
+sha256sum --ignore-missing -c checksums.txt
+```
 
 ---
 
