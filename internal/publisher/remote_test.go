@@ -147,6 +147,12 @@ func TestParseRemoteURL_Invalid(t *testing.T) {
 		{"local absolute filesystem path", "/var/git/repo.git"},
 		{"local relative path dot-slash", "./relative/repo.git"},
 		{"local relative path dot-dot-slash", "../relative/repo.git"},
+		{"Windows drive-letter path with backslash", "C:\\repo.git"},
+		{"Windows drive-letter path with forward slash", "C:/repo.git"},
+		{"Windows drive-letter path lowercase forward slash", "c:/repo.git"},
+		{"Windows UNC path", "\\\\server\\share\\repo.git"},
+		{"Windows relative path dot-backslash", ".\\relative\\repo.git"},
+		{"Windows relative path dot-dot-backslash", "..\\relative\\repo.git"},
 		{"query parameter in HTTPS", "https://github.com/owner/repo.git?evil=true"},
 		{"query parameter in SSH", "ssh://git@github.com/owner/repo.git?foo=bar"},
 		{"fragment in HTTPS", "https://github.com/owner/repo.git#fragment"},
@@ -285,11 +291,64 @@ func TestSameRepository_SafetyBoundaries(t *testing.T) {
 
 func TestSameRepository_InternalTestHarnessFallback(t *testing.T) {
 	// Preserves internal test harness compatibility where bare local repository paths are used
+	// POSIX paths
 	if !publisher.SameRepository("/tmp/repo.git", "/tmp/repo.git") {
 		t.Errorf("expected matching absolute file paths in internal test harness")
 	}
 	if publisher.SameRepository("/tmp/repo1.git", "/tmp/repo2.git") {
 		t.Errorf("expected mismatch between different file paths")
+	}
+
+	// Windows drive-letter paths (identical)
+	if !publisher.SameRepository("C:\\Users\\runner\\repo.git", "C:\\Users\\runner\\repo.git") {
+		t.Errorf("expected matching Windows drive-letter paths")
+	}
+
+	// Windows slash and backslash variants
+	if !publisher.SameRepository("C:/Users/runner/repo.git", "C:\\Users\\runner\\repo.git") {
+		t.Errorf("expected matching Windows slash/backslash variants")
+	}
+
+	// Windows drive-letter case-insensitivity
+	if !publisher.SameRepository("c:\\Users\\runner\\repo.git", "C:\\Users\\runner\\repo.git") {
+		t.Errorf("expected matching Windows drive letters with different casing")
+	}
+
+	// Windows UNC paths
+	if !publisher.SameRepository("\\\\server\\share\\repo.git", "\\\\server\\share\\repo.git") {
+		t.Errorf("expected matching Windows UNC paths")
+	}
+	if !publisher.SameRepository("\\\\server/share/repo.git", "\\\\server\\share\\repo.git") {
+		t.Errorf("expected matching Windows UNC paths with mixed slashes")
+	}
+
+	// Mismatched Windows paths
+	if publisher.SameRepository("C:\\repo1.git", "C:\\repo2.git") {
+		t.Errorf("expected mismatch between different Windows paths")
+	}
+	if publisher.SameRepository("\\\\server1\\share\\repo.git", "\\\\server2\\share\\repo.git") {
+		t.Errorf("expected mismatch between different UNC paths")
+	}
+
+	// Arbitrary text vs Windows path
+	if publisher.SameRepository("some-arbitrary-text", "C:\\repo.git") {
+		t.Errorf("expected mismatch between arbitrary text and Windows path")
+	}
+	if publisher.SameRepository("C:\\repo.git", "some-arbitrary-text") {
+		t.Errorf("expected mismatch between Windows path and arbitrary text")
+	}
+
+	// Network remote vs Windows path
+	if publisher.SameRepository("https://github.com/owner/repo.git", "C:\\repo.git") {
+		t.Errorf("expected mismatch between HTTPS remote and Windows path")
+	}
+	if publisher.SameRepository("git@github.com:owner/repo.git", "C:\\repo.git") {
+		t.Errorf("expected mismatch between SSH remote and Windows path")
+	}
+
+	// Mixed POSIX and Windows paths
+	if publisher.SameRepository("/tmp/repo.git", "C:\\repo.git") {
+		t.Errorf("expected mismatch between POSIX and Windows paths")
 	}
 }
 

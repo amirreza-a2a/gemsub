@@ -130,7 +130,9 @@ func ParseRemoteURL(raw string) (*GitRemote, error) {
 	}
 
 	// 1. Explicitly reject local filesystem paths
-	if strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "./") || strings.HasPrefix(trimmed, "../") {
+	if strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "\\") ||
+		strings.HasPrefix(trimmed, "./") || strings.HasPrefix(trimmed, ".\\") ||
+		strings.HasPrefix(trimmed, "../") || strings.HasPrefix(trimmed, "..\\") {
 		return nil, fmt.Errorf("local filesystem paths are not supported as remote URLs: %q", raw)
 	}
 
@@ -215,8 +217,8 @@ func ParseRemoteURL(raw string) (*GitRemote, error) {
 		host := strings.ToLower(m[2])
 		rawPath := m[3]
 
-		// Disallow Windows drive letters like C:\path
-		if len(host) == 1 && ((host[0] >= 'a' && host[0] <= 'z') || (host[0] >= 'A' && host[0] <= 'Z')) && (strings.HasPrefix(rawPath, "\\") || strings.HasPrefix(rawPath, "/")) {
+		// Disallow Windows drive letters like C:\path, C:/path, C:path
+		if len(host) == 1 && isDriveLetter(host[0]) {
 			return nil, fmt.Errorf("local filesystem paths are not supported as remote URLs: %q", raw)
 		}
 
@@ -275,12 +277,46 @@ func SameRepository(remoteA, remoteB string) bool {
 
 	// Fallback for bare or relative local filesystem paths in internal test harnesses.
 	// Both operands must independently satisfy the local-path fallback predicate.
-	if (strings.HasPrefix(a, "/") || strings.HasPrefix(a, ".")) &&
-		(strings.HasPrefix(b, "/") || strings.HasPrefix(b, ".")) {
+	if isLocalTestPath(a) && isLocalTestPath(b) {
+		if isWindowsLocalPath(a) && isWindowsLocalPath(b) {
+			cleanA := filepath.Clean(strings.ReplaceAll(a, "/", "\\"))
+			cleanB := filepath.Clean(strings.ReplaceAll(b, "/", "\\"))
+			return strings.EqualFold(cleanA, cleanB)
+		}
+		if isWindowsLocalPath(a) || isWindowsLocalPath(b) {
+			return false
+		}
 		return filepath.Clean(a) == filepath.Clean(b)
 	}
 
 	return false
+}
+
+func isLocalTestPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") || strings.HasPrefix(p, ".") {
+		return true
+	}
+	if len(p) >= 2 && isDriveLetter(p[0]) && p[1] == ':' {
+		return true
+	}
+	return false
+}
+
+func isWindowsLocalPath(p string) bool {
+	if len(p) >= 2 && isDriveLetter(p[0]) && p[1] == ':' {
+		return true
+	}
+	if strings.HasPrefix(p, `\\`) {
+		return true
+	}
+	return false
+}
+
+func isDriveLetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
 // ValidateRemoteURL validates that a string is a supported, syntactically valid Git remote specification.

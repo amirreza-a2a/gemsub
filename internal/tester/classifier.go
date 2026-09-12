@@ -8,6 +8,7 @@ import (
 
 	"gemsub/internal/store"
 	"gemsub/internal/tester/textutil"
+	"gemsub/internal/tester/transport"
 )
 
 // NormalizeText delegates to textutil.NormalizeText for backward compatibility.
@@ -76,7 +77,7 @@ func ClassifyDialError(err error) ClassificationResult {
 			Reason:    errStr,
 			Retryable: false,
 		}
-	case strings.Contains(lower, "connection refused"):
+	case transport.IsConnectionRefused(err):
 		return ClassificationResult{
 			Status:    store.StatusFailed,
 			Category:  store.ErrConnRefused,

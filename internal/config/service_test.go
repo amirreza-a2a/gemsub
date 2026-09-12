@@ -342,8 +342,13 @@ func TestService_Update_RollbackOnValidationError(t *testing.T) {
 }
 
 func TestService_Update_RollbackOnPersistenceError(t *testing.T) {
-	// Point service to an invalid path that cannot be written
-	invalidPath := "/invalid-dir-that-does-not-exist/sub/config.json"
+	// Point service to a path inside an existing regular file, ensuring parent directory creation fails
+	// deterministically on both POSIX (ENOTDIR) and Windows (ERROR_DIRECTORY).
+	blockedParent := filepath.Join(t.TempDir(), "blocked_file")
+	if err := os.WriteFile(blockedParent, []byte("data"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	invalidPath := filepath.Join(blockedParent, "sub", "config.json")
 
 	cfg := validTestConfig()
 	bus := events.New()

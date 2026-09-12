@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"syscall"
 	"time"
 
 	"gemsub/internal/store"
@@ -224,7 +225,7 @@ func classifyDialError(err error, ctx context.Context) store.ErrorCategory {
 	switch {
 	case strings.Contains(errStr, "unexpected HTTP response status: 429") || strings.Contains(errStr, "status: 429"):
 		return store.ErrProxyRateLimited
-	case strings.Contains(lower, "connection refused"):
+	case IsConnectionRefused(err):
 		return store.ErrConnRefused
 	case strings.Contains(lower, "i/o timeout") || strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "client.timeout exceeded"):
 		return store.ErrTimeout
@@ -239,4 +240,25 @@ func classifyDialError(err error, ctx context.Context) store.ErrorCategory {
 	default:
 		return store.ErrProxyError
 	}
+}
+
+// IsConnectionRefused reports whether err represents a TCP connection refused error,
+// inspecting standard library error hierarchies (POSIX ECONNREFUSED and Windows
+// Winsock WSAECONNREFUSED / 10061) as well as common synthetic error messages.
+func IsConnectionRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		if errno == syscall.ECONNREFUSED || uintptr(errno) == 10061 {
+			return true
+		}
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "actively refused")
 }

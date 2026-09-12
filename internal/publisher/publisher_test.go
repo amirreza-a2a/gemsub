@@ -1873,68 +1873,69 @@ func TestPublisher_AtomicWriteFile_Guarantees(t *testing.T) {
 	// 4. Reader concurrency / truncation test:
 	// A file with 50,000 bytes of 'A' is updated to 50,000 bytes of 'B'.
 	// A concurrent reader must NEVER observe an empty file (0 bytes) or partial length.
-	if runtime.GOOS == "windows" {
-		// Windows filesystem MoveFileEx does not support atomically replacing a file currently open by another handle.
-		return
-	}
-	concurrentFile := filepath.Join(tmpDir, "concurrent.txt")
-	chunkA := strings.Repeat("A", 50000)
-	chunkB := strings.Repeat("B", 50000)
-	if err := os.WriteFile(concurrentFile, []byte(chunkA), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	t.Run("ReaderConcurrencyTruncation", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("skipping concurrent open-reader test: Windows MoveFileEx returns sharing violation when destination is actively open")
+		}
+		concurrentFile := filepath.Join(tmpDir, "concurrent.txt")
+		chunkA := strings.Repeat("A", 50000)
+		chunkB := strings.Repeat("B", 50000)
+		if err := os.WriteFile(concurrentFile, []byte(chunkA), 0o644); err != nil {
+			t.Fatal(err)
+		}
 
-	stop := make(chan struct{})
-	readerErrCh := make(chan error, 1)
+		stop := make(chan struct{})
+		readerErrCh := make(chan error, 1)
 
-	go func() {
-		for {
-			select {
-			case <-stop:
-				readerErrCh <- nil
-				return
-			default:
-				data, err := os.ReadFile(concurrentFile)
-				if err != nil {
-					readerErrCh <- fmt.Errorf("read error: %w", err)
+		go func() {
+			for {
+				select {
+				case <-stop:
+					readerErrCh <- nil
 					return
-				}
-				if len(data) == 0 {
-					readerErrCh <- fmt.Errorf("read observed 0-byte truncated file (O_TRUNC exposure)")
-					return
-				}
-				if len(data) != 50000 {
-					readerErrCh <- fmt.Errorf("read observed partial data length: %d", len(data))
-					return
-				}
-				first := data[0]
-				for _, b := range data {
-					if b != first {
-						readerErrCh <- fmt.Errorf("read observed torn read with mixed bytes")
+				default:
+					data, err := os.ReadFile(concurrentFile)
+					if err != nil {
+						readerErrCh <- fmt.Errorf("read error: %w", err)
 						return
+					}
+					if len(data) == 0 {
+						readerErrCh <- fmt.Errorf("read observed 0-byte truncated file (O_TRUNC exposure)")
+						return
+					}
+					if len(data) != 50000 {
+						readerErrCh <- fmt.Errorf("read observed partial data length: %d", len(data))
+						return
+					}
+					first := data[0]
+					for _, b := range data {
+						if b != first {
+							readerErrCh <- fmt.Errorf("read observed torn read with mixed bytes")
+							return
+						}
 					}
 				}
 			}
-		}
-	}()
+		}()
 
-	// Perform multiple atomic overwrites
-	for i := 0; i < 20; i++ {
-		var toWrite string
-		if i%2 == 0 {
-			toWrite = chunkB
-		} else {
-			toWrite = chunkA
+		// Perform multiple atomic overwrites
+		for i := 0; i < 20; i++ {
+			var toWrite string
+			if i%2 == 0 {
+				toWrite = chunkB
+			} else {
+				toWrite = chunkA
+			}
+			if err := publisher.AtomicWriteFile(concurrentFile, []byte(toWrite), 0o644); err != nil {
+				t.Fatalf("concurrent AtomicWriteFile %d failed: %v", i, err)
+			}
 		}
-		if err := publisher.AtomicWriteFile(concurrentFile, []byte(toWrite), 0o644); err != nil {
-			t.Fatalf("concurrent AtomicWriteFile %d failed: %v", i, err)
-		}
-	}
 
-	close(stop)
-	if err := <-readerErrCh; err != nil {
-		t.Fatalf("concurrent reader check failed: %v", err)
-	}
+		close(stop)
+		if err := <-readerErrCh; err != nil {
+			t.Fatalf("concurrent reader check failed: %v", err)
+		}
+	})
 }
 
 func TestPublisher_MidBatchWriteFailure_RollbackAndSelfHealing(t *testing.T) {

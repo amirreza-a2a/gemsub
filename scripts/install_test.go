@@ -10,9 +10,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	if runtime.GOOS == "windows" {
+		// Linux/Termux bash installer scripts are not executed on Windows.
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 // createMockReleaseArchive creates a .tar.gz archive containing a mock 'gemsub' binary
 // and returns the archive bytes and its SHA-256 hex string.

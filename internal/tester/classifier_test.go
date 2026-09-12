@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"golang.org/x/time/rate"
@@ -137,6 +140,102 @@ func TestClassifyDialError_ContextCanceled(t *testing.T) {
 			}
 			if res.Retryable {
 				t.Errorf("cancelled probe should not be retryable")
+			}
+		})
+	}
+}
+
+func TestClassifyDialError_ConnectionRefused_CrossPlatform(t *testing.T) {
+	connRefusedCases := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "POSIX syscall.ECONNREFUSED",
+			err:  syscall.ECONNREFUSED,
+		},
+		{
+			name: "wrapped POSIX syscall.ECONNREFUSED in net.OpError",
+			err: &net.OpError{
+				Op:  "dial",
+				Net: "tcp",
+				Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED},
+			},
+		},
+		{
+			name: "fmt.Errorf wrapped ECONNREFUSED",
+			err:  fmt.Errorf("dial failed: %w", syscall.ECONNREFUSED),
+		},
+		{
+			name: "Winsock WSAECONNREFUSED errno 10061",
+			err:  syscall.Errno(10061),
+		},
+		{
+			name: "wrapped Winsock WSAECONNREFUSED in net.OpError connectex",
+			err: &net.OpError{
+				Op:  "dial",
+				Net: "tcp",
+				Err: &os.SyscallError{Syscall: "connectex", Err: syscall.Errno(10061)},
+			},
+		},
+		{
+			name: "wrapped connectex in url.Error",
+			err: &url.Error{
+				Op:  "Get",
+				URL: "http://127.0.0.1:49761/",
+				Err: &net.OpError{
+					Op:  "dial",
+					Net: "tcp",
+					Err: &os.SyscallError{Syscall: "connectex", Err: syscall.Errno(10061)},
+				},
+			},
+		},
+		{
+			name: "Windows English text with actively refused",
+			err:  errors.New("dial tcp 127.0.0.1:49761: connectex: No connection could be made because the target machine actively refused it."),
+		},
+		{
+			name: "Windows localized message wrapping errno 10061",
+			err:  fmt.Errorf("Es konnte keine Verbindung hergestellt werden: %w", syscall.Errno(10061)),
+		},
+		{
+			name: "standard text connection refused",
+			err:  errors.New("dial tcp 127.0.0.1:80: connection refused"),
+		},
+	}
+
+	for _, tc := range connRefusedCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := tester.ClassifyDialError(tc.err)
+			if res.Category != store.ErrConnRefused {
+				t.Errorf("expected ErrConnRefused, got %s (reason: %q)", res.Category, res.Reason)
+			}
+			if res.Status != store.StatusFailed {
+				t.Errorf("expected StatusFailed, got %s", res.Status)
+			}
+			if res.Retryable {
+				t.Errorf("expected Retryable=false")
+			}
+		})
+	}
+
+	negativeCases := []struct {
+		name string
+		err  error
+	}{
+		{"i/o timeout", errors.New("dial tcp: i/o timeout")},
+		{"context deadline exceeded", errors.New("context deadline exceeded")},
+		{"unexpected HTTP 503", errors.New("unexpected HTTP response status: 503")},
+		{"tls handshake failure", errors.New("tls: handshake failure")},
+		{"EOF", errors.New("unexpected EOF")},
+		{"unrelated errno ENOENT", syscall.Errno(2)},
+	}
+
+	for _, tc := range negativeCases {
+		t.Run("Negative_"+tc.name, func(t *testing.T) {
+			res := tester.ClassifyDialError(tc.err)
+			if res.Category == store.ErrConnRefused {
+				t.Errorf("unrelated error %q should NOT be classified as ErrConnRefused", tc.name)
 			}
 		})
 	}
