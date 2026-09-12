@@ -10,10 +10,10 @@ The canonical local register for non-blocking findings, deferred hardening items
 |:---|:---:|:---|
 | **Active Technical Debt (P1)** | 0 | Material architectural, product, or reliability issues requiring planned engineering tickets. |
 | **Future Hardening & Observability (P2)** | 3 | Non-blocking enhancements to metrics, operational logging, scheduling fairness, or optional configuration. |
-| **Code Quality & Test Cleanup (P2)** | 7 | Maintainability, naming clarity, deduplication, and test fixture consolidation. |
+| **Code Quality & Test Cleanup (P2)** | 10 | Maintainability, naming clarity, deduplication, and test fixture consolidation. |
 | **External & Upstream Tracking** | 1 | Issues rooted in external dependencies tracked across upstream releases. |
 | **Promoted / Resolved** | 5 | Items promoted to active GitHub issues or resolved in implementation commits. |
-| **Total Registered Items** | **16** | |
+| **Total Registered Items** | **19** | |
 
 ---
 
@@ -37,6 +37,9 @@ The canonical local register for non-blocking findings, deferred hardening items
 | [TD-014](#td-014--publisher-owned-path-slice-deduplication) | Publisher owned-path slice deduplication | P2 | Publisher / Code Quality | Ticket 26 independent code review | Open |
 | [TD-015](#td-015--tui-candidate-table-rendering-and-full-store-snapshot-thrashing) | TUI candidate table rendering and full-store snapshot thrashing | P0 | TUI / Performance | Post-Ticket-26 Investigation | Promoted (Ticket 27, #5) |
 | [TD-016](#td-016--state-persistence-compaction-and-compression) | State persistence compaction and compression | P1 | Store / Persistence / Performance | Post-Ticket-26 Investigation | Resolved (Ticket 28, 91aeeaf) |
+| [TD-017](#td-017--transport-wsaeconnrefused-named-constant) | Transport WSAECONNREFUSED named constant | P2 | Tester / Transport / Code Quality | GitHub Issue #23 Final Review | Open |
+| [TD-018](#td-018--publisher-windows-test-path-normalization) | Host-independent Windows test path normalization | P2 | Publisher / Testability | GitHub Issue #23 Final Review | Open |
+| [TD-019](#td-019--publisher-forward-slash-unc-detection) | Forward-slash UNC path detection in test fallback | P2 | Publisher / Testability | GitHub Issue #23 Final Review | Open |
 
 ---
 
@@ -387,6 +390,69 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **Dependencies:** `internal/publisher/publisher.go`
 - **Promotion Criteria:**
   Promote during future code cleanup or optimization of `internal/publisher`.
+
+---
+
+### TD-017 — Transport WSAECONNREFUSED named constant
+
+- **ID:** `TD-017`
+- **Title:** Transport WSAECONNREFUSED named constant in probe classification
+- **Priority:** P2
+- **Area:** Tester / Transport / Code Quality
+- **Status:** Open
+- **Origin:** GitHub Issue #23 final review (Finding F-01)
+- **Problem:**
+  In `internal/tester/transport/probe.go` within `IsConnectionRefused`, the Winsock connection refused error code `10061` (`WSAECONNREFUSED`) is evaluated as an inline literal (`uintptr(errno) == 10061`). While safe on all platforms because POSIX errnos are bounded to 1–133 and Go on Windows does not map 10061 to `syscall.ECONNREFUSED`, having the literal inline without an explicit named constant reduces code clarity.
+- **Impact:**
+  Low maintainability / readability smell. No operational or functional defect.
+- **Proposed Future Remediation:**
+  Define an unexported constant (e.g. `const wsaeConnRefused = 10061 // WSAECONNREFUSED on Windows`) in `probe.go` or a dedicated platform-specific definition.
+  - This is non-blocking cleanup only.
+- **Dependencies:** `internal/tester/transport/probe.go`
+- **Promotion Criteria:**
+  Promote during future transport probe refactoring or code cleanup.
+
+---
+
+### TD-018 — Host-independent Windows test path normalization
+
+- **ID:** `TD-018`
+- **Title:** Host-independent Windows local path normalization in SameRepository test fallback
+- **Priority:** P2
+- **Area:** Publisher / Testability
+- **Status:** Open
+- **Origin:** GitHub Issue #23 final review (Finding F-02)
+- **Problem:**
+  In `internal/publisher/remote.go` within `SameRepository`, Windows drive-letter paths in the test-harness fallback are normalized via `cleanA := filepath.Clean(strings.ReplaceAll(a, "/", "\\"))`. When tests execute on a Linux/POSIX host, `filepath.Separator` is `/`, so `filepath.Clean` treats `\` as a regular filename character rather than a directory delimiter. Consequently, redundant separators or relative segments (`.` and `..`) in synthetic Windows paths are not collapsed if evaluated on Linux hosts (though on Windows hosts `filepath.Clean` handles them properly).
+- **Impact:**
+  Low. Real Windows test paths only execute on Windows runners (where `filepath.Separator` is `\`), and unit test fixtures use clean canonical paths. Does not affect network remote URLs or public repository validation.
+- **Proposed Future Remediation:**
+  Convert backslashes to forward slashes and clean with `path.Clean(strings.ReplaceAll(p, "\\", "/"))` before comparing with `strings.EqualFold`, providing host-independent path component normalization across both Linux and Windows runners.
+  - This is non-blocking cleanup only.
+- **Dependencies:** `internal/publisher/remote.go`, `internal/publisher/remote_test.go`
+- **Promotion Criteria:**
+  Promote during future publisher remote URL maintenance or test harness refactoring.
+
+---
+
+### TD-019 — Forward-slash UNC path detection in test fallback
+
+- **ID:** `TD-019`
+- **Title:** Forward-slash UNC path detection in SameRepository test fallback
+- **Priority:** P2
+- **Area:** Publisher / Testability
+- **Status:** Open
+- **Origin:** GitHub Issue #23 final review (Finding F-03)
+- **Problem:**
+  In `internal/publisher/remote.go`, `isWindowsLocalPath` inspects `strings.HasPrefix(p, "\\\\")` to detect UNC network share paths in the internal test-harness fallback. However, some Git environments (such as MSYS2 or Git-Bash) or synthetic test cases may represent UNC paths using forward slashes (`//server/share`). Currently, `//` is treated as a POSIX-style path by `isLocalTestPath` and does not take the case-insensitive Windows comparison branch.
+- **Impact:**
+  Low / Edge-case. Real Git output on native Windows (`git remote get-url origin`) produces standard backslash UNC paths or drive-letter paths. Does not affect production remote URLs (which are strictly validated network remotes).
+- **Proposed Future Remediation:**
+  Add `strings.HasPrefix(p, "//")` to the UNC check in `isWindowsLocalPath` and normalize leading forward slashes to backslashes in Windows test-harness comparison.
+  - This is non-blocking cleanup only.
+- **Dependencies:** `internal/publisher/remote.go`, `internal/publisher/remote_test.go`
+- **Promotion Criteria:**
+  Promote if test environments require forward-slash UNC path fixtures or during general publisher test harness maintenance.
 
 ---
 
