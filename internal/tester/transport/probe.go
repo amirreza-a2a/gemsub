@@ -111,7 +111,7 @@ func Probe(ctx context.Context, dialFn DialFunc, cfg Config) Result {
 
 	start := time.Now()
 	resp, err := client.Do(req)
-	latency := time.Since(start)
+	latency := clampLatency(time.Since(start))
 
 	if err != nil {
 		cat := classifyDialError(err, probeCtx)
@@ -261,4 +261,16 @@ func IsConnectionRefused(err error) bool {
 	lower := strings.ToLower(err.Error())
 	return strings.Contains(lower, "connection refused") ||
 		strings.Contains(lower, "actively refused")
+}
+
+// clampLatency ensures a measured latency duration is strictly positive.
+// On operating systems with coarse timer tick resolution (such as Windows with ~15.6ms timer interrupts),
+// a sub-millisecond network request may measure as 0s. Since downstream store and history consumers treat
+// TransportLatency == 0 as "unavailable/unrecorded", any completed probe must be recorded with a positive
+// duration. If measured latency is <= 0, it falls back to time.Nanosecond (completed, but below measurable resolution).
+func clampLatency(d time.Duration) time.Duration {
+	if d <= 0 {
+		return time.Nanosecond
+	}
+	return d
 }

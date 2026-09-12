@@ -79,6 +79,7 @@ func TestTwoStage_A_TransportFailure_EarlyExit(t *testing.T) {
 // 3. TransportEvidenceKnown=true, TransportOK=true, TransportLatency preserved from Stage 1.
 func TestTwoStage_B_TransportSuccess_GeminiSuccess(t *testing.T) {
 	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(1 * time.Millisecond)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer healthSrv.Close()

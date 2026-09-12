@@ -1784,6 +1784,7 @@ func setupTestGitRepo(t *testing.T) (bareRemoteDir, repoDir string, runGit func(
 	runGit("init", "-b", "main")
 	runGit("config", "user.name", "Gemsub Test")
 	runGit("config", "user.email", "test@example.com")
+	runGit("config", "core.autocrlf", "false")
 	runGit("remote", "add", "origin", bareRemoteDir)
 
 	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# gemsub\n"), 0o644); err != nil {
