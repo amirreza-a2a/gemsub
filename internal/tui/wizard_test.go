@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -28,6 +29,7 @@ type mockWizardController struct {
 	startRuntimeCalls       int
 	configPath              string
 	statePath               string
+	legacyDetected          bool
 }
 
 func (m *mockWizardController) Snapshot(filter viewmodel.FilterMode) viewmodel.SnapshotViewModel {
@@ -100,6 +102,10 @@ func (m *mockWizardController) StartRuntime() error {
 
 func (m *mockWizardController) ConfigPaths() (string, string) {
 	return m.configPath, m.statePath
+}
+
+func (m *mockWizardController) LegacyConfigDetected() bool {
+	return m.legacyDetected
 }
 
 func setupWizardModel(ctrl Controller) *Model {
@@ -960,4 +966,142 @@ func TestWizard_ReviewStep_IntegrationWithAdapterAndConfigService(t *testing.T) 
 	if strings.Contains(view, "./config.json") {
 		t.Errorf("view unexpectedly contains obsolete ./config.json")
 	}
+}
+
+func TestWizard_WelcomeStep_LegacyConfigNotice(t *testing.T) {
+	t.Run("without legacy config", func(t *testing.T) {
+		ctrl := &mockWizardController{
+			configPath:     "/home/user/.config/gemsub/config.json",
+			legacyDetected: false,
+		}
+		m := setupWizardModel(ctrl)
+		view := m.View()
+
+		if strings.Contains(view, "Notice: Legacy Configuration Detected") {
+			t.Errorf("view unexpectedly contains legacy notice: %s", view)
+		}
+		if strings.Contains(view, "gemsub -config ./config.json") {
+			t.Errorf("view unexpectedly contains legacy config command: %s", view)
+		}
+	})
+
+	t.Run("with legacy config detected via controller", func(t *testing.T) {
+		ctrl := &mockWizardController{
+			configPath:     "/home/user/.config/gemsub/config.json",
+			legacyDetected: true,
+		}
+		m := setupWizardModel(ctrl)
+		view := m.View()
+
+		if !strings.Contains(view, "Notice: Legacy Configuration Detected") {
+			t.Errorf("expected view to contain legacy notice: %s", view)
+		}
+		if !strings.Contains(view, "gemsub -config ./config.json") {
+			t.Errorf("expected view to contain explicit command: %s", view)
+		}
+		if !strings.Contains(view, "mkdir -p /home/user/.config/gemsub && cp ./config.json /home/user/.config/gemsub/config.json") {
+			t.Errorf("expected view to contain migration command: %s", view)
+		}
+		if !strings.Contains(view, "press [Enter] to proceed with fresh onboarding") {
+			t.Errorf("expected view to explain proceeding with fresh onboarding: %s", view)
+		}
+	})
+
+	t.Run("with legacy config detected via Model setter directly (empty canonical path)", func(t *testing.T) {
+		m := setupWizardModel(nil)
+		m.SetLegacyConfigDetected(true)
+		view := m.View()
+
+		if !strings.Contains(view, "Notice: Legacy Configuration Detected") {
+			t.Errorf("expected view to contain legacy notice: %s", view)
+		}
+		if !strings.Contains(view, "gemsub -config ./config.json") {
+			t.Errorf("expected view to contain explicit command: %s", view)
+		}
+		// Invariant: empty canonical path must NEVER fabricate "cp ./config.json config.json"
+		if strings.Contains(view, "cp ./config.json config.json") {
+			t.Errorf("view fabricated self-copy command: %s", view)
+		}
+		if strings.Contains(view, "Or migrate it manually to the canonical location:") {
+			t.Errorf("view unexpectedly contained manual migration header when canonical path is empty: %s", view)
+		}
+	})
+
+	t.Run("formatLegacyMigrationAdvice empty path returns empty string", func(t *testing.T) {
+		if got := formatLegacyMigrationAdvice(""); got != "" {
+			t.Errorf("formatLegacyMigrationAdvice(\"\") = %q, want \"\"", got)
+		}
+		if got := formatLegacyMigrationAdvice("   "); got != "" {
+			t.Errorf("formatLegacyMigrationAdvice(\"   \") = %q, want \"\"", got)
+		}
+	})
+
+	t.Run("path with spaces is quoted safely in migration advice", func(t *testing.T) {
+		ctrl := &mockWizardController{
+			configPath:     "/home/test user/.config/gemsub/config.json",
+			legacyDetected: true,
+		}
+		m := setupWizardModel(ctrl)
+		view := m.View()
+
+		if runtime.GOOS != "windows" {
+			expectedCmd := "mkdir -p '/home/test user/.config/gemsub' && cp ./config.json '/home/test user/.config/gemsub/config.json'"
+			if !strings.Contains(view, expectedCmd) {
+				t.Errorf("expected quoted posix migration command %q, got: %s", expectedCmd, view)
+			}
+		}
+	})
+
+	t.Run("interaction: enter advances to Step 2 Source, q quits", func(t *testing.T) {
+		ctrl := &mockWizardController{
+			configPath:     "/home/user/.config/gemsub/config.json",
+			legacyDetected: true,
+		}
+		m := setupWizardModel(ctrl)
+		if m.wizard.Step != WizardStepWelcome {
+			t.Fatalf("expected initial step WizardStepWelcome, got %v", m.wizard.Step)
+		}
+
+		// Press Enter -> advances to Source step
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(*Model)
+		if m.wizard.Step != WizardStepSource {
+			t.Errorf("expected step WizardStepSource after enter, got %v", m.wizard.Step)
+		}
+
+		// Reset to welcome step and press 'q' -> quits
+		m.wizard.Step = WizardStepWelcome
+		_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+		if cmd == nil {
+			t.Error("expected quit cmd on 'q'")
+		}
+	})
+
+	t.Run("integration with Adapter and config.Service", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "canonical_config.json")
+
+		bus := events.New()
+		st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+		ring := logging.NewRingLogHandler(100)
+		ad := adapter.New(st, bus, ring)
+		defer ad.Close()
+
+		cfgSvc := config.NewDefaultService(cfgPath, bus)
+		cfgSvc.SetLegacyConfigDetected(true)
+		ad.SetServices(cfgSvc, nil, nil, nil)
+
+		m := setupWizardModel(ad)
+		view := m.View()
+
+		if !strings.Contains(view, "Notice: Legacy Configuration Detected") {
+			t.Errorf("expected view to contain legacy notice via Adapter: %s", view)
+		}
+		if !strings.Contains(view, "gemsub -config ./config.json") {
+			t.Errorf("expected view to contain explicit command: %s", view)
+		}
+		if !strings.Contains(view, cfgPath) {
+			t.Errorf("expected view to contain canonical path %q: %s", cfgPath, view)
+		}
+	})
 }

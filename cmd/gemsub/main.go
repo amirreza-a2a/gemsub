@@ -70,7 +70,7 @@ func main() {
 		return
 	}
 
-	resolvedConfigPath, _, err := determineConfigPath(flag.CommandLine, *configFlag)
+	resolvedConfigPath, isExplicit, err := determineConfigPath(flag.CommandLine, *configFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Configuration path error: %v\n", err)
 		os.Exit(1)
@@ -79,11 +79,16 @@ func main() {
 	configSvc, isFirstRun, err := bootstrapConfig(resolvedConfigPath, *headless)
 	if err != nil {
 		if errors.Is(err, ErrMissingConfigHeadless) {
-			fmt.Fprint(os.Stderr, formatMissingConfigHeadlessHelp(resolvedConfigPath))
+			legacyDetected := !isExplicit && detectLegacyConfig()
+			fmt.Fprint(os.Stderr, formatMissingConfigHeadlessHelp(resolvedConfigPath, legacyDetected))
 			os.Exit(1)
 		}
 		slog.Error("config load failed", "err", err)
 		os.Exit(1)
+	}
+
+	if isFirstRun && !isExplicit && detectLegacyConfig() {
+		configSvc.SetLegacyConfigDetected(true)
 	}
 
 	baseCfg := configSvc.Get()
@@ -297,8 +302,13 @@ func setupRuntime(cfg *config.Config, logWriter io.Writer, configSvc ...*config.
 		ad.Subscribe()
 		rt.Adapter = ad
 		rt.TUIModel = tui.New(ad)
-		if svc != nil && svc.IsFirstRun() {
-			rt.TUIModel.SetView(tui.ViewWizard)
+		if svc != nil {
+			if svc.IsFirstRun() {
+				rt.TUIModel.SetView(tui.ViewWizard)
+			}
+			if svc.LegacyConfigDetected() {
+				rt.TUIModel.SetLegacyConfigDetected(true)
+			}
 		}
 		rt.Program = tea.NewProgram(rt.TUIModel, tea.WithAltScreen())
 	}

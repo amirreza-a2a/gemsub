@@ -279,7 +279,7 @@ func TestFormatMissingConfigHeadlessHelp(t *testing.T) {
 		}
 		path := `C:\Users\Test User\AppData\Roaming\gemsub\config.json`
 		msg := formatMissingConfigHeadlessHelp(path)
-		expectedAdvice := `mkdir -p "C:\Users\Test User\AppData\Roaming\gemsub" && cp config.example.json "C:\Users\Test User\AppData\Roaming\gemsub\config.json"`
+		expectedAdvice := `mkdir -p 'C:\Users\Test User\AppData\Roaming\gemsub' && cp config.example.json 'C:\Users\Test User\AppData\Roaming\gemsub\config.json'`
 		if !strings.Contains(msg, expectedAdvice) {
 			t.Errorf("expected advice %q, got:\n%s", expectedAdvice, msg)
 		}
@@ -318,16 +318,9 @@ func TestQuoteShellArg(t *testing.T) {
 	t.Run("paths with spaces quoted", func(t *testing.T) {
 		in := "/path with spaces/config.json"
 		got := quoteShellArg(in)
-		if runtime.GOOS == "windows" {
-			want := `"` + in + `"`
-			if got != want {
-				t.Errorf("got %q, want %q", got, want)
-			}
-		} else {
-			want := `'` + in + `'`
-			if got != want {
-				t.Errorf("got %q, want %q", got, want)
-			}
+		want := `'` + in + `'`
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
 		}
 	})
 }
@@ -435,4 +428,121 @@ func TestBootstrapConfig_OnboardingProducesCanonicalStateFile(t *testing.T) {
 	if reloaded.StateFile != expectedState {
 		t.Errorf("persisted config state_file: expected %q, got %q", expectedState, reloaded.StateFile)
 	}
+}
+
+func TestDetectLegacyConfig(t *testing.T) {
+	t.Run("missing file returns false", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		if detectLegacyConfig(tmpDir) {
+			t.Errorf("expected detectLegacyConfig(%q) == false for missing file", tmpDir)
+		}
+	})
+
+	t.Run("existing regular file returns true", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		filePath := filepath.Join(tmpDir, "config.json")
+		if err := os.WriteFile(filePath, []byte(`{"sources":[]}`), 0600); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+		if !detectLegacyConfig(tmpDir) {
+			t.Errorf("expected detectLegacyConfig(%q) == true for existing file", tmpDir)
+		}
+	})
+
+	t.Run("directory named config.json returns false", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dirPath := filepath.Join(tmpDir, "config.json")
+		if err := os.Mkdir(dirPath, 0755); err != nil {
+			t.Fatalf("failed to create directory: %v", err)
+		}
+		if detectLegacyConfig(tmpDir) {
+			t.Errorf("expected detectLegacyConfig(%q) == false when target is a directory", tmpDir)
+		}
+	})
+
+	t.Run("malformed content is detected purely by existence without error", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		filePath := filepath.Join(tmpDir, "config.json")
+		// Invalid JSON syntax that would fail parsing
+		if err := os.WriteFile(filePath, []byte(`{INVALID JSON ::: NOT PARSED`), 0600); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+		if !detectLegacyConfig(tmpDir) {
+			t.Errorf("expected detectLegacyConfig(%q) == true for malformed file", tmpDir)
+		}
+	})
+
+	t.Run("stat error handling", func(t *testing.T) {
+		mockErrStat := func(name string) (os.FileInfo, error) {
+			return nil, os.ErrPermission
+		}
+		if detectLegacyConfigWithStat(mockErrStat, "/test/dir") {
+			t.Error("expected detectLegacyConfigWithStat == false when stat returns error")
+		}
+	})
+}
+
+func TestFormatMissingConfigHeadlessHelp_LegacyNotice(t *testing.T) {
+	canonicalPath := "/home/user/.config/gemsub/config.json"
+
+	t.Run("legacy false produces standard guidance", func(t *testing.T) {
+		msg := formatMissingConfigHeadlessHelp(canonicalPath, false)
+		if strings.Contains(msg, "A legacy configuration was found at:") {
+			t.Errorf("unexpected legacy notice when legacyDetected=false: %s", msg)
+		}
+		if strings.Contains(msg, "gemsub --headless -config ./config.json") {
+			t.Errorf("unexpected explicit command when legacyDetected=false: %s", msg)
+		}
+		if !strings.Contains(msg, "Configuration file not found: "+canonicalPath) {
+			t.Errorf("missing header: %s", msg)
+		}
+	})
+
+	t.Run("legacy true produces extended guidance", func(t *testing.T) {
+		msg := formatMissingConfigHeadlessHelp(canonicalPath, true)
+		if !strings.Contains(msg, "Configuration file not found: "+canonicalPath) {
+			t.Errorf("missing header: %s", msg)
+		}
+		if !strings.Contains(msg, "A legacy configuration was found at:\n  ./config.json") {
+			t.Errorf("missing legacy notice: %s", msg)
+		}
+		if !strings.Contains(msg, "This file is not loaded automatically.") {
+			t.Errorf("missing security statement: %s", msg)
+		}
+		if !strings.Contains(msg, "To use it explicitly:\n  gemsub --headless -config ./config.json") {
+			t.Errorf("missing explicit command: %s", msg)
+		}
+		if runtime.GOOS != "windows" {
+			expectedMigration := "mkdir -p /home/user/.config/gemsub && cp ./config.json /home/user/.config/gemsub/config.json"
+			if !strings.Contains(msg, expectedMigration) {
+				t.Errorf("missing migration command %q: %s", expectedMigration, msg)
+			}
+		}
+		if !strings.Contains(msg, "Or to configure a new setup:") {
+			t.Errorf("missing clean setup alternative: %s", msg)
+		}
+	})
+
+	t.Run("legacy true with spaces in canonical path", func(t *testing.T) {
+		pathWithSpaces := "/home/test user/.config/gemsub/config.json"
+		msg := formatMissingConfigHeadlessHelp(pathWithSpaces, true)
+		if runtime.GOOS != "windows" {
+			expectedMigration := "mkdir -p '/home/test user/.config/gemsub' && cp ./config.json '/home/test user/.config/gemsub/config.json'"
+			if !strings.Contains(msg, expectedMigration) {
+				t.Errorf("missing quoted migration command %q: %s", expectedMigration, msg)
+			}
+		}
+	})
+
+	t.Run("legacy true on windows platform", func(t *testing.T) {
+		if runtime.GOOS != "windows" {
+			t.Skip("skipping native Windows path assertion on non-Windows host")
+		}
+		winPath := `C:\Users\Test User\AppData\Roaming\gemsub\config.json`
+		msg := formatMissingConfigHeadlessHelp(winPath, true)
+		expectedMigration := `mkdir -p 'C:\Users\Test User\AppData\Roaming\gemsub' && cp ./config.json 'C:\Users\Test User\AppData\Roaming\gemsub\config.json'`
+		if !strings.Contains(msg, expectedMigration) {
+			t.Errorf("missing Windows migration command %q: %s", expectedMigration, msg)
+		}
+	})
 }

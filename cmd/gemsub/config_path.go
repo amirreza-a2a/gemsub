@@ -4,8 +4,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"gemsub/internal/paths"
@@ -52,9 +52,34 @@ func determineConfigPath(fs *flag.FlagSet, configFlagValue string, lk ...paths.L
 	return resolved, isExplicit, nil
 }
 
+// LegacyConfigFileName is the name of the legacy configuration file.
+const LegacyConfigFileName = "config.json"
+
+type statFunc func(string) (os.FileInfo, error)
+
+// detectLegacyConfig reports whether a legacy config.json file exists in dir (default ".").
+// It checks file existence and ensures it is not a directory. It NEVER reads or parses the content.
+func detectLegacyConfig(dir ...string) bool {
+	return detectLegacyConfigWithStat(os.Stat, dir...)
+}
+
+func detectLegacyConfigWithStat(stat statFunc, dir ...string) bool {
+	targetDir := "."
+	if len(dir) > 0 && dir[0] != "" {
+		targetDir = dir[0]
+	}
+	targetPath := filepath.Join(targetDir, LegacyConfigFileName)
+	fi, err := stat(targetPath)
+	if err != nil {
+		return false
+	}
+	return !fi.IsDir()
+}
+
 // formatMissingConfigHeadlessHelp formats user-facing guidance when configuration
-// is missing in headless mode.
-func formatMissingConfigHeadlessHelp(configPath string) string {
+// is missing in headless mode. If legacyDetected is true, it extends the output
+// with explicit guidance on how to run with or migrate the detected legacy configuration.
+func formatMissingConfigHeadlessHelp(configPath string, legacyDetected ...bool) string {
 	dir := filepath.Dir(configPath)
 	var copyAdvice string
 	if dir != "" && dir != "." {
@@ -63,40 +88,41 @@ func formatMissingConfigHeadlessHelp(configPath string) string {
 		copyAdvice = fmt.Sprintf("cp config.example.json %s", quoteShellArg(configPath))
 	}
 
+	hasLegacy := len(legacyDetected) > 0 && legacyDetected[0]
+	if !hasLegacy {
+		return fmt.Sprintf("Configuration file not found: %s\n\n"+
+			"To configure gemsub:\n"+
+			"  1. Run gemsub interactively without --headless to launch the onboarding wizard: gemsub\n"+
+			"  2. Or create %s manually by copying config.example.json:\n"+
+			"     %s\n",
+			configPath, configPath, copyAdvice)
+	}
+
+	var migrationAdvice string
+	if dir != "" && dir != "." {
+		migrationAdvice = fmt.Sprintf("mkdir -p %s && cp ./config.json %s", quoteShellArg(dir), quoteShellArg(configPath))
+	} else {
+		migrationAdvice = fmt.Sprintf("cp ./config.json %s", quoteShellArg(configPath))
+	}
+
 	return fmt.Sprintf("Configuration file not found: %s\n\n"+
-		"To configure gemsub:\n"+
+		"A legacy configuration was found at:\n"+
+		"  ./config.json\n\n"+
+		"This file is not loaded automatically.\n\n"+
+		"To use it explicitly:\n"+
+		"  gemsub --headless -config ./config.json\n\n"+
+		"To migrate it manually:\n"+
+		"  %s\n\n"+
+		"Or to configure a new setup:\n"+
 		"  1. Run gemsub interactively without --headless to launch the onboarding wizard: gemsub\n"+
 		"  2. Or create %s manually by copying config.example.json:\n"+
 		"     %s\n",
-		configPath, configPath, copyAdvice)
+		configPath, migrationAdvice, configPath, copyAdvice)
 }
 
 // quoteShellArg quotes a file or directory path for safe copy-pasting in a shell
 // if it contains spaces or other shell metacharacters. If the path contains only
 // safe path characters, it is returned unquoted to preserve readability.
 func quoteShellArg(s string) string {
-	if s == "" {
-		if runtime.GOOS == "windows" {
-			return `""`
-		}
-		return "''"
-	}
-
-	isSafe := true
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
-			r == '/' || r == '\\' || r == '.' || r == '_' || r == '-' || r == ':' || r == '@' {
-			continue
-		}
-		isSafe = false
-		break
-	}
-	if isSafe {
-		return s
-	}
-
-	if runtime.GOOS == "windows" {
-		return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
-	}
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+	return paths.QuoteShellArg(s)
 }

@@ -214,3 +214,51 @@ func joinPath(goos string, elem ...string) string {
 	}
 	return path.Join(elem...)
 }
+
+// QuoteShellArg quotes a file or directory path for safe copy-pasting in a shell
+// if it contains spaces or other shell metacharacters. If the path contains only
+// safe path characters, it is returned unquoted to preserve readability.
+func QuoteShellArg(s string) string {
+	return QuoteShellArgForGOOS(s, runtime.GOOS)
+}
+
+// QuoteShellArgForGOOS quotes a file or directory path for the specified target OS.
+//
+// Target Shell Contract:
+//   - On Windows (runtime.GOOS == "windows"), generated guidance explicitly targets PowerShell 7+ (pwsh).
+//     PowerShell single-quoted literal strings ('...') are used to prevent unintended variable
+//     interpolation ($var), command invocation (&), or subexpression evaluation ($(cmd)).
+//     Embedded single quotes are escaped using PowerShell's verbatim doubling syntax (doubled single quote characters).
+//     Note: Windows PowerShell 5.1 (powershell.exe) does not support the pipeline chaining operator '&&'
+//     used in compound migration commands (which requires PowerShell 7.0+ / pwsh). Furthermore, legacy
+//     Windows cmd.exe is not supported. The quoting semantics are specific to PowerShell and do not target
+//     POSIX shells on Windows such as Git Bash or MSYS2. Universal Windows shell compatibility is not claimed.
+//   - On non-Windows platforms (POSIX/Unix), standard POSIX single-quoted literal strings are used,
+//     with embedded single quotes escaped via POSIX syntax (closing quote, escaped quote, opening quote).
+//
+// Safe path characters (a-z, A-Z, 0-9, '/', '\', '.', '_', '-', ':', '@') remain unquoted.
+func QuoteShellArgForGOOS(s, goos string) string {
+	if s == "" {
+		return "''"
+	}
+
+	isSafe := true
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '/' || r == '\\' || r == '.' || r == '_' || r == '-' || r == ':' || r == '@' {
+			continue
+		}
+		isSafe = false
+		break
+	}
+	if isSafe {
+		return s
+	}
+
+	if goos == "windows" {
+		// In PowerShell, single-quoted strings are verbatim literals with no variable interpolation ($var).
+		// Embedded single quotes are escaped by doubling them ('').
+		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}

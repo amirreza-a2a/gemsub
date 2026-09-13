@@ -41,6 +41,7 @@ type Controller interface {
 	CompleteOnboarding(cfg viewmodel.OnboardingConfig) error
 	StartRuntime() error
 	ConfigPaths() (configPath, statePath string)
+	LegacyConfigDetected() bool
 }
 
 // ActiveView represents the primary content pane currently displayed.
@@ -167,6 +168,11 @@ func (m *Model) ActiveView() ActiveView {
 // SetView switches the active presentation view.
 func (m *Model) SetView(v ActiveView) {
 	m.activeView = v
+}
+
+// SetLegacyConfigDetected sets whether a legacy configuration file was detected during bootstrap.
+func (m *Model) SetLegacyConfigDetected(detected bool) {
+	m.wizard.LegacyDetected = detected
 }
 
 // Init starts the periodic background refresh tick (bounded at 10 Hz / 100 ms).

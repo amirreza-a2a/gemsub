@@ -405,3 +405,94 @@ func TestLiveDefaults(t *testing.T) {
 		t.Errorf("expected live StatePath to end with 'state.json', got %q", statePath)
 	}
 }
+
+func TestQuoteShellArg(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		goos string
+		want string
+	}{
+		{
+			name: "empty posix",
+			in:   "",
+			goos: "linux",
+			want: "''",
+		},
+		{
+			name: "empty windows (PowerShell literal)",
+			in:   "",
+			goos: "windows",
+			want: "''",
+		},
+		{
+			name: "safe posix path",
+			in:   "/home/user/.config/gemsub/config.json",
+			goos: "linux",
+			want: "/home/user/.config/gemsub/config.json",
+		},
+		{
+			name: "safe windows path",
+			in:   `C:\Users\User\AppData\Roaming\gemsub\config.json`,
+			goos: "windows",
+			want: `C:\Users\User\AppData\Roaming\gemsub\config.json`,
+		},
+		{
+			name: "posix path with spaces",
+			in:   "/home/test user/.config/gemsub",
+			goos: "linux",
+			want: "'/home/test user/.config/gemsub'",
+		},
+		{
+			name: "posix path with single quote (escaped as '\\'')'",
+			in:   "/home/o'neil/config.json",
+			goos: "linux",
+			want: `'/home/o'\''neil/config.json'`,
+		},
+		{
+			name: "windows path with spaces (PowerShell literal)",
+			in:   `C:\Users\Test User\AppData\Roaming\gemsub`,
+			goos: "windows",
+			want: `'C:\Users\Test User\AppData\Roaming\gemsub'`,
+		},
+		{
+			name: "windows path with dollar prevents PowerShell variable interpolation",
+			in:   `C:\Users\$User\AppData\Roaming\gemsub`,
+			goos: "windows",
+			want: `'C:\Users\$User\AppData\Roaming\gemsub'`,
+		},
+		{
+			name: "windows path with ampersand and parentheses prevents PowerShell operator evaluation",
+			in:   `C:\Users\Alice & Bob (Work)\AppData\Roaming\gemsub`,
+			goos: "windows",
+			want: `'C:\Users\Alice & Bob (Work)\AppData\Roaming\gemsub'`,
+		},
+		{
+			name: "windows path with percent sign",
+			in:   `C:\Users\Dev%1\gemsub`,
+			goos: "windows",
+			want: `'C:\Users\Dev%1\gemsub'`,
+		},
+		{
+			name: "windows path with exclamation and caret",
+			in:   `C:\Users\User!^\gemsub`,
+			goos: "windows",
+			want: `'C:\Users\User!^\gemsub'`,
+		},
+		{
+			name: "windows path with embedded single quote (PowerShell doubled quote escaping)",
+			in:   `C:\Users\O'Neil\AppData\Roaming\gemsub`,
+			goos: "windows",
+			want: `'C:\Users\O''Neil\AppData\Roaming\gemsub'`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := paths.QuoteShellArgForGOOS(tt.in, tt.goos)
+			if got != tt.want {
+				t.Errorf("QuoteShellArgForGOOS(%q, %q) = %q, want %q", tt.in, tt.goos, got, tt.want)
+			}
+		})
+	}
+}

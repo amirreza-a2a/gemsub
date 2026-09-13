@@ -88,14 +88,15 @@ type Adapter struct {
 	runtimeStarter func() error
 
 	// Event-driven configuration/publishing cache (used when services are nil or as event fallback)
-	configPath        string
-	lastCfg           config.Config
-	pubRunning        bool
-	lastPublished     time.Time
-	lastPublishCommit string
-	lastPublishError  string
-	publishCount      int
-	publishFailCount  int
+	configPath           string
+	lastCfg              config.Config
+	legacyConfigDetected bool
+	pubRunning           bool
+	lastPublished        time.Time
+	lastPublishCommit    string
+	lastPublishError     string
+	publishCount         int
+	publishFailCount     int
 }
 
 // New creates an unstarted Adapter.
@@ -973,6 +974,7 @@ func (a *Adapter) SetServices(cfgSvc *config.Service, srcSvc *source.Service, pu
 	if cfgSvc != nil {
 		a.configPath = cfgSvc.Path()
 		a.lastCfg = cfgSvc.Get()
+		a.legacyConfigDetected = cfgSvc.LegacyConfigDetected()
 	}
 	atomic.StoreInt32(&a.dirty, 1)
 }
@@ -2162,4 +2164,25 @@ func (a *Adapter) ConfigPaths() (configPath, statePath string) {
 		return a.configSvc.Path(), a.configSvc.Get().StateFile
 	}
 	return a.configPath, a.lastCfg.StateFile
+}
+
+// SetLegacyConfigDetected sets whether a legacy configuration file was detected during bootstrap.
+func (a *Adapter) SetLegacyConfigDetected(detected bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.legacyConfigDetected = detected
+	if a.configSvc != nil {
+		a.configSvc.SetLegacyConfigDetected(detected)
+	}
+}
+
+// LegacyConfigDetected reports whether a legacy configuration file was detected during bootstrap.
+func (a *Adapter) LegacyConfigDetected() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.configSvc != nil {
+		return a.configSvc.LegacyConfigDetected()
+	}
+	return a.legacyConfigDetected
 }

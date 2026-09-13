@@ -27,12 +27,13 @@ type ConfigUpdated struct {
 // Service provides thread-safe access, validation, mutation, and atomic
 // persistence for gemsub's configuration.
 type Service struct {
-	mu         sync.RWMutex
-	path       string
-	cfg        *Config
-	initialCfg *Config
-	bus        EventPublisher
-	isFirstRun bool
+	mu                   sync.RWMutex
+	path                 string
+	cfg                  *Config
+	initialCfg           *Config
+	bus                  EventPublisher
+	isFirstRun           bool
+	legacyConfigDetected bool
 }
 
 // ConfigService is an alias for Service.
@@ -144,6 +145,20 @@ func (s *Service) IsFirstRun() bool {
 	return s.isFirstRun
 }
 
+// SetLegacyConfigDetected records whether a legacy configuration file was detected during bootstrap.
+func (s *Service) SetLegacyConfigDetected(detected bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.legacyConfigDetected = detected
+}
+
+// LegacyConfigDetected reports whether a legacy configuration file was detected during bootstrap.
+func (s *Service) LegacyConfigDetected() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.legacyConfigDetected
+}
+
 // PendingRestartFields returns any canonical field paths modified since initialization
 // that require an application restart to take effect in the runtime environment.
 func (s *Service) PendingRestartFields() []string {
@@ -236,6 +251,7 @@ func (s *Service) Update(mutator func(*Config) error) error {
 	}
 	s.cfg = candidate
 	s.isFirstRun = false
+	s.legacyConfigDetected = false
 	newCfg := *s.cfg.Clone()
 	bus := s.bus
 
@@ -274,6 +290,7 @@ func (s *Service) Save() error {
 	}
 
 	s.isFirstRun = false
+	s.legacyConfigDetected = false
 	return nil
 }
 

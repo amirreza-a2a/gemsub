@@ -810,3 +810,57 @@ func TestService_NewDefaultService_Lifecycle(t *testing.T) {
 		t.Errorf("unexpected loaded sources: %+v", loaded.Sources)
 	}
 }
+
+func TestService_LegacyConfigDetected(t *testing.T) {
+	svc := config.NewDefaultService("/tmp/nonexistent-config.json", nil)
+	if svc.LegacyConfigDetected() {
+		t.Error("expected LegacyConfigDetected() == false by default")
+	}
+
+	svc.SetLegacyConfigDetected(true)
+	if !svc.LegacyConfigDetected() {
+		t.Error("expected LegacyConfigDetected() == true after setting true")
+	}
+
+	svc.SetLegacyConfigDetected(false)
+	if svc.LegacyConfigDetected() {
+		t.Error("expected LegacyConfigDetected() == false after setting false")
+	}
+
+	// Verify Save() clears legacyConfigDetected
+	tmpPath := filepath.Join(t.TempDir(), "config.json")
+	saveSvc := config.NewDefaultService(tmpPath, nil)
+	saveSvc.SetLegacyConfigDetected(true)
+	if err := saveSvc.Save(); err != nil {
+		t.Fatalf("Save() failed: %v", err)
+	}
+	if saveSvc.LegacyConfigDetected() {
+		t.Error("expected LegacyConfigDetected() == false after Save()")
+	}
+
+	// Verify Update() clears legacyConfigDetected
+	updatePath := filepath.Join(t.TempDir(), "config.json")
+	updateSvc := config.NewDefaultService(updatePath, nil)
+	updateSvc.SetLegacyConfigDetected(true)
+	if !updateSvc.LegacyConfigDetected() {
+		t.Fatal("expected LegacyConfigDetected() == true before Update()")
+	}
+	err := updateSvc.Update(func(c *config.Config) error {
+		c.Sources = append(c.Sources, config.SourceItem{
+			URL:     "https://example.com/sub",
+			Name:    "Test",
+			Enabled: true,
+		})
+		c.Serve.Listen = "127.0.0.1:9090"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Update() failed: %v", err)
+	}
+	if updateSvc.LegacyConfigDetected() {
+		t.Error("expected LegacyConfigDetected() == false after Update()")
+	}
+	if updateSvc.IsFirstRun() {
+		t.Error("expected IsFirstRun() == false after Update()")
+	}
+}

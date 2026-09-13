@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"gemsub/internal/config"
+	"gemsub/internal/paths"
 	"gemsub/internal/tui/viewmodel"
 )
 
@@ -46,6 +48,9 @@ func (s WizardStep) Name() string {
 // WizardState encapsulates the in-memory state of the first-run onboarding wizard.
 type WizardState struct {
 	Step WizardStep
+
+	// Step 1: Welcome & Legacy Notice
+	LegacyDetected bool
 
 	// Step 2: Source
 	SourceURL   string
@@ -450,6 +455,37 @@ func (m *Model) renderWizard() string {
 		content.WriteString("  3. Store     : Authoritatively tracks health, latency, scores, and projections.\n")
 		content.WriteString("  4. Subserver : Serves passing links locally over HTTP for client auto-update.\n")
 		content.WriteString("  5. Publisher : (Optional) Publishes passing subscriptions to Git repositories.\n\n")
+
+		legacyDetected := m.wizard.LegacyDetected
+		if !legacyDetected && m.ctrl != nil {
+			legacyDetected = m.ctrl.LegacyConfigDetected()
+		}
+		if legacyDetected {
+			var configPath string
+			if m.ctrl != nil {
+				configPath, _ = m.ctrl.ConfigPaths()
+			}
+			advice := formatLegacyMigrationAdvice(configPath)
+
+			warnBoxStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("11")).Padding(0, 1)
+			warnTitleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11"))
+
+			var warn strings.Builder
+			warn.WriteString(warnTitleStyle.Render("Notice: Legacy Configuration Detected") + "\n")
+			warn.WriteString("Found legacy configuration file at: ./config.json\n")
+			warn.WriteString("For security, legacy configurations are not loaded automatically.\n\n")
+			warn.WriteString("Options:\n")
+			warn.WriteString("  • To use your legacy configuration explicitly, exit and run:\n")
+			warn.WriteString("      gemsub -config ./config.json\n")
+			if advice != "" {
+				warn.WriteString("  • Or migrate it manually to the canonical location:\n")
+				warn.WriteString("      " + advice + "\n")
+			}
+			warn.WriteString("  • Or press [Enter] to proceed with fresh onboarding.\n")
+
+			content.WriteString(warnBoxStyle.Render(warn.String()) + "\n\n")
+		}
+
 		content.WriteString(dimStyle.Render("This wizard will help you configure your primary source and initial settings.") + "\n")
 		content.WriteString(dimStyle.Render("All settings can be modified anytime later in the Configuration Center.") + "\n\n")
 		content.WriteString(activeLabelStyle.Render("Press [Enter] to begin configuration, or [q] to exit."))
@@ -632,4 +668,16 @@ func (m *Model) renderWizard() string {
 	}
 
 	return sb.String()
+}
+
+func formatLegacyMigrationAdvice(canonicalPath string) string {
+	canonicalPath = strings.TrimSpace(canonicalPath)
+	if canonicalPath == "" {
+		return ""
+	}
+	dir := filepath.Dir(canonicalPath)
+	if dir != "" && dir != "." {
+		return fmt.Sprintf("mkdir -p %s && cp ./config.json %s", paths.QuoteShellArg(dir), paths.QuoteShellArg(canonicalPath))
+	}
+	return fmt.Sprintf("cp ./config.json %s", paths.QuoteShellArg(canonicalPath))
 }

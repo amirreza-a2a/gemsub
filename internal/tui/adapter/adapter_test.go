@@ -4786,3 +4786,42 @@ func TestAdapter_ConfigCenter_StateFilePresentation(t *testing.T) {
 		}
 	})
 }
+
+func TestAdapter_LegacyConfigDetected(t *testing.T) {
+	t.Run("fallback when config service is nil", func(t *testing.T) {
+		ad := adapter.New(nil, nil, nil)
+		if ad.LegacyConfigDetected() {
+			t.Error("expected LegacyConfigDetected() == false initially")
+		}
+
+		ad.SetLegacyConfigDetected(true)
+		if !ad.LegacyConfigDetected() {
+			t.Error("expected LegacyConfigDetected() == true after setting true")
+		}
+
+		ad.SetLegacyConfigDetected(false)
+		if ad.LegacyConfigDetected() {
+			t.Error("expected LegacyConfigDetected() == false after setting false")
+		}
+	})
+
+	t.Run("delegates to config service when present", func(t *testing.T) {
+		svc := config.NewDefaultService("/tmp/test-config.json", nil)
+		svc.SetLegacyConfigDetected(true)
+
+		ad := adapter.New(nil, nil, nil)
+		ad.SetServices(svc, nil, nil, nil)
+
+		if !ad.LegacyConfigDetected() {
+			t.Error("expected LegacyConfigDetected() == true from config service")
+		}
+
+		ad.SetLegacyConfigDetected(false)
+		if ad.LegacyConfigDetected() {
+			t.Error("expected LegacyConfigDetected() == false after adapter update")
+		}
+		if svc.LegacyConfigDetected() {
+			t.Error("expected underlying config service to be updated as well")
+		}
+	})
+}

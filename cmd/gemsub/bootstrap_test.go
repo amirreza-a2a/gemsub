@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -349,4 +350,299 @@ func TestFirstRun_RuntimeStarter_FailureAllowsRetry(t *testing.T) {
 	if attemptCount != 2 {
 		t.Errorf("expected attemptCount == 2 (attempt 3 should be skipped by CAS), got %d", attemptCount)
 	}
+}
+
+func TestBootstrap_LegacyConfigHandling(t *testing.T) {
+	t.Run("headless without legacy file in cwd", func(t *testing.T) {
+		cwd := t.TempDir()
+		origDir, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("getwd: %v", err)
+		}
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+		canonicalPath := filepath.Join(cwd, "canonical", "config.json")
+		isExplicit := false
+
+		svc, isFirstRun, err := bootstrapConfig(canonicalPath, true)
+		if !errors.Is(err, ErrMissingConfigHeadless) {
+			t.Fatalf("expected ErrMissingConfigHeadless, got: %v", err)
+		}
+		if svc != nil {
+			t.Fatalf("expected nil service on headless missing config, got: %v", svc)
+		}
+		if isFirstRun {
+			t.Error("expected isFirstRun == false")
+		}
+
+		legacyDetected := !isExplicit && detectLegacyConfig()
+		if legacyDetected {
+			t.Error("expected legacyDetected == false when ./config.json is absent")
+		}
+
+		help := formatMissingConfigHeadlessHelp(canonicalPath, legacyDetected)
+		if strings.Contains(help, "A legacy configuration was found at:") {
+			t.Errorf("unexpected legacy notice: %s", help)
+		}
+		if strings.Contains(help, "gemsub --headless -config ./config.json") {
+			t.Errorf("unexpected explicit command: %s", help)
+		}
+	})
+
+	t.Run("headless with legacy file in cwd", func(t *testing.T) {
+		cwd := t.TempDir()
+		origDir, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("getwd: %v", err)
+		}
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+		// Create legacy config.json in CWD
+		legacyContent := `{"sources":[{"url":"https://legacy.example.com/sub.txt","name":"Legacy"}]}`
+		if err := os.WriteFile(filepath.Join(cwd, "config.json"), []byte(legacyContent), 0600); err != nil {
+			t.Fatalf("write legacy config: %v", err)
+		}
+
+		canonicalPath := filepath.Join(cwd, "canonical", "config.json")
+		isExplicit := false
+
+		svc, isFirstRun, err := bootstrapConfig(canonicalPath, true)
+		if !errors.Is(err, ErrMissingConfigHeadless) {
+			t.Fatalf("expected ErrMissingConfigHeadless, got: %v", err)
+		}
+		// Confirm legacy config is NOT loaded
+		if svc != nil {
+			t.Fatalf("expected nil service (never auto-load legacy config), got: %v", svc)
+		}
+		if isFirstRun {
+			t.Error("expected isFirstRun == false on error")
+		}
+
+		legacyDetected := !isExplicit && detectLegacyConfig()
+		if !legacyDetected {
+			t.Fatal("expected legacyDetected == true when ./config.json is present")
+		}
+
+		help := formatMissingConfigHeadlessHelp(canonicalPath, legacyDetected)
+		if !strings.Contains(help, "A legacy configuration was found at:\n  ./config.json") {
+			t.Errorf("expected legacy notice in help message: %s", help)
+		}
+		if !strings.Contains(help, "This file is not loaded automatically.") {
+			t.Errorf("expected security notice in help message: %s", help)
+		}
+		if !strings.Contains(help, "gemsub --headless -config ./config.json") {
+			t.Errorf("expected explicit command in help message: %s", help)
+		}
+		if !strings.Contains(help, canonicalPath) {
+			t.Errorf("expected canonical path %q in help message: %s", canonicalPath, help)
+		}
+	})
+
+	t.Run("canonical config exists takes precedence over cwd legacy config", func(t *testing.T) {
+		cwd := t.TempDir()
+		origDir, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("getwd: %v", err)
+		}
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+		// Create legacy config in CWD
+		if err := os.WriteFile(filepath.Join(cwd, "config.json"), []byte(`{"sources":[{"url":"https://legacy.example.com"}]}`), 0600); err != nil {
+			t.Fatalf("write legacy config: %v", err)
+		}
+
+		// Create canonical config
+		canonicalDir := filepath.Join(cwd, "canonical")
+		if err := os.MkdirAll(canonicalDir, 0700); err != nil {
+			t.Fatalf("mkdir canonical: %v", err)
+		}
+		canonicalPath := filepath.Join(canonicalDir, "config.json")
+		canonicalContent := `{
+			"sources": [{"url": "https://canonical.example.com"}],
+			"fetch_interval": "1h",
+			"serve": {"listen": "127.0.0.1:9000", "path": "/testsub"},
+			"test": {"concurrency": 5, "timeout": "5s", "gemini": {"url": "https://gemini.google.com/", "block_phrases": ["not available"]}}
+		}`
+		if err := os.WriteFile(canonicalPath, []byte(canonicalContent), 0600); err != nil {
+			t.Fatalf("write canonical config: %v", err)
+		}
+
+		isExplicit := false
+
+		// Precondition: legacy config.json genuinely exists in CWD
+		if !detectLegacyConfig() {
+			t.Fatal("precondition failed: legacy config must exist in cwd for this test")
+		}
+
+		// 1. Headless mode: canonical config exists, must load without ErrMissingConfigHeadless
+		svc, isFirstRun, err := bootstrapConfig(canonicalPath, true)
+		if err != nil {
+			t.Fatalf("expected success loading existing canonical config in headless mode, got: %v", err)
+		}
+		if isFirstRun {
+			t.Error("expected isFirstRun == false when canonical config exists")
+		}
+		if svc == nil {
+			t.Fatal("expected non-nil service")
+		}
+
+		// Verify canonical content was loaded, NOT legacy content
+		loadedSources := svc.Get().Sources
+		if len(loadedSources) != 1 || loadedSources[0].URL != "https://canonical.example.com" {
+			t.Errorf("expected canonical source, got %+v", loadedSources)
+		}
+		if errors.Is(err, ErrMissingConfigHeadless) {
+			t.Error("expected headless startup not to return ErrMissingConfigHeadless when canonical config exists")
+		}
+		if svc.LegacyConfigDetected() {
+			t.Error("svc.LegacyConfigDetected() should remain false")
+		}
+
+		// 2. Interactive mode: canonical config exists, must NOT trigger first-run legacy detection
+		svcInteractive, isFirstRunInteractive, err := bootstrapConfig(canonicalPath, false)
+		if err != nil {
+			t.Fatalf("expected success loading existing canonical config in interactive mode, got: %v", err)
+		}
+		if isFirstRunInteractive {
+			t.Error("expected isFirstRun == false in interactive mode when canonical config exists")
+		}
+
+		// In main.go, SetLegacyConfigDetected is gated on isFirstRun
+		if isFirstRunInteractive && !isExplicit && detectLegacyConfig() {
+			svcInteractive.SetLegacyConfigDetected(true)
+		}
+		if svcInteractive.LegacyConfigDetected() {
+			t.Error("svcInteractive.LegacyConfigDetected() should remain false when canonical config exists")
+		}
+	})
+
+	t.Run("explicit -config flag disables legacy detection notice", func(t *testing.T) {
+		cwd := t.TempDir()
+		origDir, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("getwd: %v", err)
+		}
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+		// Create legacy config in CWD
+		if err := os.WriteFile(filepath.Join(cwd, "config.json"), []byte(`{"sources":[]}`), 0600); err != nil {
+			t.Fatalf("write legacy config: %v", err)
+		}
+
+		// User explicitly specifies a missing custom path
+		explicitPath := filepath.Join(cwd, "missing-custom.json")
+		isExplicit := true
+
+		_, _, err = bootstrapConfig(explicitPath, true)
+		if !errors.Is(err, ErrMissingConfigHeadless) {
+			t.Fatalf("expected ErrMissingConfigHeadless, got: %v", err)
+		}
+
+		// Invariant: explicit path never triggers legacy notice
+		legacyDetected := !isExplicit && detectLegacyConfig()
+		if legacyDetected {
+			t.Error("expected legacyDetected == false when isExplicit == true")
+		}
+
+		help := formatMissingConfigHeadlessHelp(explicitPath, legacyDetected)
+		if strings.Contains(help, "A legacy configuration was found at:") {
+			t.Errorf("unexpected legacy notice for explicit flag: %s", help)
+		}
+	})
+
+	t.Run("interactive mode informs user via config service without loading legacy content", func(t *testing.T) {
+		cwd := t.TempDir()
+		origDir, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("getwd: %v", err)
+		}
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+		// Legacy file in CWD
+		if err := os.WriteFile(filepath.Join(cwd, "config.json"), []byte(`{"sources":[{"url":"https://legacy.example.com"}]}`), 0600); err != nil {
+			t.Fatalf("write legacy config: %v", err)
+		}
+
+		canonicalPath := filepath.Join(cwd, "canonical", "config.json")
+		isExplicit := false
+
+		svc, isFirstRun, err := bootstrapConfig(canonicalPath, false)
+		if err != nil {
+			t.Fatalf("bootstrapConfig: %v", err)
+		}
+		if !isFirstRun {
+			t.Error("expected isFirstRun == true")
+		}
+		if !svc.IsFirstRun() {
+			t.Error("expected svc.IsFirstRun() == true")
+		}
+
+		// Verify legacy config was NOT loaded as the initial service config
+		if len(svc.Get().Sources) != 0 {
+			t.Errorf("expected clean default sources (len 0), got: %+v", svc.Get().Sources)
+		}
+
+		if isFirstRun && !isExplicit && detectLegacyConfig() {
+			svc.SetLegacyConfigDetected(true)
+		}
+
+		if !svc.LegacyConfigDetected() {
+			t.Error("expected svc.LegacyConfigDetected() == true")
+		}
+	})
+
+	t.Run("malformed legacy file does not cause bootstrap failure", func(t *testing.T) {
+		cwd := t.TempDir()
+		origDir, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("getwd: %v", err)
+		}
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+		// Write malformed JSON
+		if err := os.WriteFile(filepath.Join(cwd, "config.json"), []byte(`{{{ NOT JSON`), 0600); err != nil {
+			t.Fatalf("write malformed config: %v", err)
+		}
+
+		canonicalPath := filepath.Join(cwd, "canonical", "config.json")
+		isExplicit := false
+
+		// In headless mode: fails with missing config error (not a JSON parse error!)
+		svc, _, err := bootstrapConfig(canonicalPath, true)
+		if !errors.Is(err, ErrMissingConfigHeadless) {
+			t.Fatalf("expected ErrMissingConfigHeadless, got: %v", err)
+		}
+		if svc != nil {
+			t.Fatal("expected nil service")
+		}
+
+		// Detection succeeds purely on existence
+		legacyDetected := !isExplicit && detectLegacyConfig()
+		if !legacyDetected {
+			t.Error("expected legacyDetected == true even with malformed file")
+		}
+
+		help := formatMissingConfigHeadlessHelp(canonicalPath, legacyDetected)
+		if !strings.Contains(help, "A legacy configuration was found at:\n  ./config.json") {
+			t.Errorf("expected legacy notice: %s", help)
+		}
+	})
 }
