@@ -1,3 +1,5 @@
+//go:build with_quic
+
 package parser_test
 
 import (
