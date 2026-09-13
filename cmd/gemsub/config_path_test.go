@@ -546,3 +546,237 @@ func TestFormatMissingConfigHeadlessHelp_LegacyNotice(t *testing.T) {
 		}
 	})
 }
+
+func TestHermeticCLI_DetermineConfigPath_VariantsAndOverrides(t *testing.T) {
+	linuxLookup := paths.Lookup{
+		GOOS: "linux",
+		Getenv: func(key string) string {
+			if key == "XDG_CONFIG_HOME" {
+				return "/home/alice/.config"
+			}
+			return ""
+		},
+		UserHomeDir: func() (string, error) {
+			return "/home/alice", nil
+		},
+	}
+
+	windowsLookup := paths.Lookup{
+		GOOS: "windows",
+		UserConfigDir: func() (string, error) {
+			return `C:\Users\Alice\AppData\Roaming`, nil
+		},
+	}
+
+	testCases := []struct {
+		name         string
+		args         []string
+		lookup       paths.Lookup
+		wantPath     string
+		wantExplicit bool
+		wantErr      bool
+	}{
+		{
+			name:         "omitted flag linux canonical",
+			args:         []string{"--headless"},
+			lookup:       linuxLookup,
+			wantPath:     "/home/alice/.config/gemsub/config.json",
+			wantExplicit: false,
+		},
+		{
+			name:         "omitted flag windows canonical",
+			args:         []string{"--headless"},
+			lookup:       windowsLookup,
+			wantPath:     `C:\Users\Alice\AppData\Roaming\gemsub\config.json`,
+			wantExplicit: false,
+		},
+		{
+			name:         "explicit relative dot-slash single-dash",
+			args:         []string{"-config", "./test.json"},
+			lookup:       linuxLookup,
+			wantPath:     "./test.json",
+			wantExplicit: true,
+		},
+		{
+			name:         "explicit relative dot-slash single-dash equal",
+			args:         []string{"-config=./test.json"},
+			lookup:       linuxLookup,
+			wantPath:     "./test.json",
+			wantExplicit: true,
+		},
+		{
+			name:         "explicit relative dot-slash double-dash",
+			args:         []string{"--config", "./test.json"},
+			lookup:       linuxLookup,
+			wantPath:     "./test.json",
+			wantExplicit: true,
+		},
+		{
+			name:         "explicit relative dot-slash double-dash equal",
+			args:         []string{"--config=./test.json"},
+			lookup:       linuxLookup,
+			wantPath:     "./test.json",
+			wantExplicit: true,
+		},
+		{
+			name:         "explicit relative bare filename",
+			args:         []string{"-config", "test.json"},
+			lookup:       linuxLookup,
+			wantPath:     "test.json",
+			wantExplicit: true,
+		},
+		{
+			name:         "explicit absolute posix",
+			args:         []string{"-config", "/tmp/test.json"},
+			lookup:       linuxLookup,
+			wantPath:     "/tmp/test.json",
+			wantExplicit: true,
+		},
+		{
+			name:         "explicit absolute windows",
+			args:         []string{"-config", `C:\config\test.json`},
+			lookup:       windowsLookup,
+			wantPath:     `C:\config\test.json`,
+			wantExplicit: true,
+		},
+		{
+			name:         "explicit empty string fails closed",
+			args:         []string{"-config", ""},
+			lookup:       linuxLookup,
+			wantErr:      true,
+			wantExplicit: true,
+		},
+		{
+			name:         "explicit empty string with equal fails closed",
+			args:         []string{"-config="},
+			lookup:       linuxLookup,
+			wantErr:      true,
+			wantExplicit: true,
+		},
+		{
+			name:         "explicit whitespace string fails closed",
+			args:         []string{"-config", "   "},
+			lookup:       linuxLookup,
+			wantErr:      true,
+			wantExplicit: true,
+		},
+		{
+			name:         "explicit whitespace with tabs fails closed",
+			args:         []string{"--config=\t  \n"},
+			lookup:       linuxLookup,
+			wantErr:      true,
+			wantExplicit: true,
+		},
+		{
+			name: "lookup error on omitted flag propagates error",
+			args: []string{"--headless"},
+			lookup: paths.Lookup{
+				GOOS: "linux",
+				UserHomeDir: func() (string, error) {
+					return "", errors.New("cannot determine home")
+				},
+			},
+			wantErr:      true,
+			wantExplicit: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			cfgFlag := fs.String("config", "", "path to config file")
+			_ = fs.Bool("headless", false, "run headless")
+
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("unexpected flag parse failure: %v", err)
+			}
+
+			resolved, isExplicit, err := determineConfigPath(fs, *cfgFlag, tc.lookup)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil (resolved=%q, isExplicit=%v)", resolved, isExplicit)
+				}
+				if isExplicit != tc.wantExplicit {
+					t.Errorf("isExplicit = %v; want %v", isExplicit, tc.wantExplicit)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if isExplicit != tc.wantExplicit {
+				t.Errorf("isExplicit = %v; want %v", isExplicit, tc.wantExplicit)
+			}
+			if resolved != tc.wantPath {
+				t.Errorf("resolved = %q; want %q", resolved, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestHermeticCLI_MissingConfigFormatting_Comprehensive(t *testing.T) {
+	t.Run("missing canonical without legacy notice", func(t *testing.T) {
+		canonicalPath := "/home/alice/.config/gemsub/config.json"
+		msg := formatMissingConfigHeadlessHelp(canonicalPath, false)
+
+		if !strings.Contains(msg, "Configuration file not found: "+canonicalPath) {
+			t.Errorf("expected header with canonical path, got:\n%s", msg)
+		}
+		if strings.Contains(msg, "A legacy configuration was found at:") {
+			t.Errorf("unexpected legacy notice in output:\n%s", msg)
+		}
+		if strings.Contains(msg, "-config ./config.json") {
+			t.Errorf("unexpected legacy advice in output:\n%s", msg)
+		}
+		expectedCopy := "mkdir -p /home/alice/.config/gemsub && cp config.example.json /home/alice/.config/gemsub/config.json"
+		if runtime.GOOS != "windows" && !strings.Contains(msg, expectedCopy) {
+			t.Errorf("expected copy advice %q, got:\n%s", expectedCopy, msg)
+		}
+	})
+
+	t.Run("missing canonical with legacy notice", func(t *testing.T) {
+		canonicalPath := "/home/alice/.config/gemsub/config.json"
+		msg := formatMissingConfigHeadlessHelp(canonicalPath, true)
+
+		if !strings.Contains(msg, "Configuration file not found: "+canonicalPath) {
+			t.Errorf("expected header with canonical path, got:\n%s", msg)
+		}
+		if !strings.Contains(msg, "A legacy configuration was found at:\n  ./config.json") {
+			t.Errorf("expected legacy notice, got:\n%s", msg)
+		}
+		if !strings.Contains(msg, "This file is not loaded automatically.") {
+			t.Errorf("expected security statement, got:\n%s", msg)
+		}
+		if !strings.Contains(msg, "gemsub --headless -config ./config.json") {
+			t.Errorf("expected explicit legacy command, got:\n%s", msg)
+		}
+		expectedMigration := "mkdir -p /home/alice/.config/gemsub && cp ./config.json /home/alice/.config/gemsub/config.json"
+		if runtime.GOOS != "windows" && !strings.Contains(msg, expectedMigration) {
+			t.Errorf("expected migration command %q, got:\n%s", expectedMigration, msg)
+		}
+		if !strings.Contains(msg, "Or to configure a new setup:") {
+			t.Errorf("expected clean setup alternative, got:\n%s", msg)
+		}
+	})
+
+	t.Run("missing relative cwd config without legacy notice", func(t *testing.T) {
+		msg := formatMissingConfigHeadlessHelp("./custom.json", false)
+		if strings.Contains(msg, "mkdir -p") {
+			t.Errorf("cwd path should not generate mkdir -p, got:\n%s", msg)
+		}
+		if !strings.Contains(msg, "cp config.example.json ./custom.json") {
+			t.Errorf("expected plain cp advice, got:\n%s", msg)
+		}
+	})
+
+	t.Run("missing relative cwd config with legacy notice", func(t *testing.T) {
+		msg := formatMissingConfigHeadlessHelp("./custom.json", true)
+		if strings.Contains(msg, "mkdir -p") {
+			t.Errorf("cwd path should not generate mkdir -p, got:\n%s", msg)
+		}
+		if !strings.Contains(msg, "cp ./config.json ./custom.json") {
+			t.Errorf("expected plain cp migration advice, got:\n%s", msg)
+		}
+	})
+}

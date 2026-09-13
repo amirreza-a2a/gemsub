@@ -496,3 +496,387 @@ func TestQuoteShellArg(t *testing.T) {
 		})
 	}
 }
+
+func TestHermetic_ConfigAndStateIndependence(t *testing.T) {
+	home := "/home/alice"
+	customCfg := "/custom/cfg_home"
+	customState := "/custom/state_home"
+
+	tests := []struct {
+		name          string
+		xdgConfig     string
+		xdgState      string
+		wantCfgDir    string
+		wantCfgPath   string
+		wantStateDir  string
+		wantStatePath string
+	}{
+		{
+			name:          "both custom absolute",
+			xdgConfig:     customCfg,
+			xdgState:      customState,
+			wantCfgDir:    "/custom/cfg_home/gemsub",
+			wantCfgPath:   "/custom/cfg_home/gemsub/config.json",
+			wantStateDir:  "/custom/state_home/gemsub",
+			wantStatePath: "/custom/state_home/gemsub/state.json",
+		},
+		{
+			name:          "config custom, state unset (falls back to home)",
+			xdgConfig:     customCfg,
+			xdgState:      "",
+			wantCfgDir:    "/custom/cfg_home/gemsub",
+			wantCfgPath:   "/custom/cfg_home/gemsub/config.json",
+			wantStateDir:  "/home/alice/.local/state/gemsub",
+			wantStatePath: "/home/alice/.local/state/gemsub/state.json",
+		},
+		{
+			name:          "state custom, config unset (falls back to home)",
+			xdgConfig:     "",
+			xdgState:      customState,
+			wantCfgDir:    "/home/alice/.config/gemsub",
+			wantCfgPath:   "/home/alice/.config/gemsub/config.json",
+			wantStateDir:  "/custom/state_home/gemsub",
+			wantStatePath: "/custom/state_home/gemsub/state.json",
+		},
+		{
+			name:          "both unset (both fall back to home)",
+			xdgConfig:     "",
+			xdgState:      "",
+			wantCfgDir:    "/home/alice/.config/gemsub",
+			wantCfgPath:   "/home/alice/.config/gemsub/config.json",
+			wantStateDir:  "/home/alice/.local/state/gemsub",
+			wantStatePath: "/home/alice/.local/state/gemsub/state.json",
+		},
+		{
+			name:          "config relative rejected, state custom accepted",
+			xdgConfig:     "relative/config",
+			xdgState:      customState,
+			wantCfgDir:    "/home/alice/.config/gemsub",
+			wantCfgPath:   "/home/alice/.config/gemsub/config.json",
+			wantStateDir:  "/custom/state_home/gemsub",
+			wantStatePath: "/custom/state_home/gemsub/state.json",
+		},
+		{
+			name:          "state relative rejected, config custom accepted",
+			xdgConfig:     customCfg,
+			xdgState:      "relative/state",
+			wantCfgDir:    "/custom/cfg_home/gemsub",
+			wantCfgPath:   "/custom/cfg_home/gemsub/config.json",
+			wantStateDir:  "/home/alice/.local/state/gemsub",
+			wantStatePath: "/home/alice/.local/state/gemsub/state.json",
+		},
+		{
+			name:          "both relative rejected (both fall back to home)",
+			xdgConfig:     "relative/config",
+			xdgState:      "relative/state",
+			wantCfgDir:    "/home/alice/.config/gemsub",
+			wantCfgPath:   "/home/alice/.config/gemsub/config.json",
+			wantStateDir:  "/home/alice/.local/state/gemsub",
+			wantStatePath: "/home/alice/.local/state/gemsub/state.json",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lk := mockLookup("linux", home, tc.xdgConfig, tc.xdgState, "", "")
+
+			cfgDir, err := paths.ConfigDirWithLookup(lk)
+			if err != nil {
+				t.Fatalf("ConfigDirWithLookup failed: %v", err)
+			}
+			if cfgDir != tc.wantCfgDir {
+				t.Errorf("cfgDir = %q, want %q", cfgDir, tc.wantCfgDir)
+			}
+
+			cfgPath, err := paths.ConfigPathWithLookup("", lk)
+			if err != nil {
+				t.Fatalf("ConfigPathWithLookup failed: %v", err)
+			}
+			if cfgPath != tc.wantCfgPath {
+				t.Errorf("cfgPath = %q, want %q", cfgPath, tc.wantCfgPath)
+			}
+
+			stateDir, err := paths.StateDirWithLookup(lk)
+			if err != nil {
+				t.Fatalf("StateDirWithLookup failed: %v", err)
+			}
+			if stateDir != tc.wantStateDir {
+				t.Errorf("stateDir = %q, want %q", stateDir, tc.wantStateDir)
+			}
+
+			statePath, err := paths.StatePathWithLookup("", lk)
+			if err != nil {
+				t.Fatalf("StatePathWithLookup failed: %v", err)
+			}
+			if statePath != tc.wantStatePath {
+				t.Errorf("statePath = %q, want %q", statePath, tc.wantStatePath)
+			}
+		})
+	}
+}
+
+func TestHermetic_UserHomeDir_FailurePropagation(t *testing.T) {
+	t.Run("UserHomeDir returns error", func(t *testing.T) {
+		expectedErr := errors.New("simulated home lookup failure")
+		lk := paths.Lookup{
+			GOOS: "linux",
+			UserHomeDir: func() (string, error) {
+				return "", expectedErr
+			},
+		}
+
+		if _, err := paths.ConfigDirWithLookup(lk); err == nil || !errors.Is(err, expectedErr) {
+			t.Errorf("expected wrapped error %v, got %v", expectedErr, err)
+		}
+		if _, err := paths.ConfigPathWithLookup("", lk); err == nil || !errors.Is(err, expectedErr) {
+			t.Errorf("expected wrapped error %v, got %v", expectedErr, err)
+		}
+		if _, err := paths.StateDirWithLookup(lk); err == nil || !errors.Is(err, expectedErr) {
+			t.Errorf("expected wrapped error %v, got %v", expectedErr, err)
+		}
+		if _, err := paths.StatePathWithLookup("", lk); err == nil || !errors.Is(err, expectedErr) {
+			t.Errorf("expected wrapped error %v, got %v", expectedErr, err)
+		}
+	})
+
+	t.Run("UserHomeDir is nil", func(t *testing.T) {
+		lk := paths.Lookup{
+			GOOS:        "linux",
+			UserHomeDir: nil,
+		}
+
+		if _, err := paths.ConfigDirWithLookup(lk); err == nil {
+			t.Error("expected error for nil UserHomeDir, got nil")
+		}
+		if _, err := paths.ConfigPathWithLookup("", lk); err == nil {
+			t.Error("expected error for nil UserHomeDir, got nil")
+		}
+		if _, err := paths.StateDirWithLookup(lk); err == nil {
+			t.Error("expected error for nil UserHomeDir, got nil")
+		}
+		if _, err := paths.StatePathWithLookup("", lk); err == nil {
+			t.Error("expected error for nil UserHomeDir, got nil")
+		}
+	})
+
+	t.Run("UserHomeDir returns empty string", func(t *testing.T) {
+		lk := paths.Lookup{
+			GOOS: "linux",
+			UserHomeDir: func() (string, error) {
+				return "", nil
+			},
+		}
+
+		if _, err := paths.ConfigDirWithLookup(lk); err == nil {
+			t.Error("expected error for empty UserHomeDir, got nil")
+		}
+		if _, err := paths.ConfigPathWithLookup("", lk); err == nil {
+			t.Error("expected error for empty UserHomeDir, got nil")
+		}
+		if _, err := paths.StateDirWithLookup(lk); err == nil {
+			t.Error("expected error for empty UserHomeDir, got nil")
+		}
+		if _, err := paths.StatePathWithLookup("", lk); err == nil {
+			t.Error("expected error for empty UserHomeDir, got nil")
+		}
+	})
+
+	t.Run("UserHomeDir returns relative path", func(t *testing.T) {
+		lk := paths.Lookup{
+			GOOS: "linux",
+			UserHomeDir: func() (string, error) {
+				return "relative/home", nil
+			},
+		}
+
+		if _, err := paths.ConfigDirWithLookup(lk); err == nil {
+			t.Error("expected error for relative UserHomeDir, got nil")
+		}
+		if _, err := paths.ConfigPathWithLookup("", lk); err == nil {
+			t.Error("expected error for relative UserHomeDir, got nil")
+		}
+		if _, err := paths.StateDirWithLookup(lk); err == nil {
+			t.Error("expected error for relative UserHomeDir, got nil")
+		}
+		if _, err := paths.StatePathWithLookup("", lk); err == nil {
+			t.Error("expected error for relative UserHomeDir, got nil")
+		}
+	})
+}
+
+func TestHermetic_Windows_SimulatedLookups(t *testing.T) {
+	appDataErr := errors.New("appdata failed")
+	localAppDataErr := errors.New("localappdata failed")
+
+	t.Run("UserConfigDir error propagation", func(t *testing.T) {
+		lk := paths.Lookup{
+			GOOS: "windows",
+			UserConfigDir: func() (string, error) {
+				return "", appDataErr
+			},
+			UserCacheDir: func() (string, error) {
+				return `C:\Users\Alice\AppData\Local`, nil
+			},
+		}
+
+		if _, err := paths.ConfigDirWithLookup(lk); err == nil || !errors.Is(err, appDataErr) {
+			t.Errorf("expected error %v, got %v", appDataErr, err)
+		}
+		if _, err := paths.ConfigPathWithLookup("", lk); err == nil || !errors.Is(err, appDataErr) {
+			t.Errorf("expected error %v, got %v", appDataErr, err)
+		}
+
+		// State resolution must remain independent and succeed
+		statePath, err := paths.StatePathWithLookup("", lk)
+		if err != nil {
+			t.Fatalf("expected state resolution to succeed independently: %v", err)
+		}
+		wantState := `C:\Users\Alice\AppData\Local\gemsub\state.json`
+		if statePath != wantState {
+			t.Errorf("got %q, want %q", statePath, wantState)
+		}
+	})
+
+	t.Run("UserCacheDir error propagation", func(t *testing.T) {
+		lk := paths.Lookup{
+			GOOS: "windows",
+			UserConfigDir: func() (string, error) {
+				return `C:\Users\Alice\AppData\Roaming`, nil
+			},
+			UserCacheDir: func() (string, error) {
+				return "", localAppDataErr
+			},
+		}
+
+		if _, err := paths.StateDirWithLookup(lk); err == nil || !errors.Is(err, localAppDataErr) {
+			t.Errorf("expected error %v, got %v", localAppDataErr, err)
+		}
+		if _, err := paths.StatePathWithLookup("", lk); err == nil || !errors.Is(err, localAppDataErr) {
+			t.Errorf("expected error %v, got %v", localAppDataErr, err)
+		}
+
+		// Config resolution must remain independent and succeed
+		cfgPath, err := paths.ConfigPathWithLookup("", lk)
+		if err != nil {
+			t.Fatalf("expected config resolution to succeed independently: %v", err)
+		}
+		wantCfg := `C:\Users\Alice\AppData\Roaming\gemsub\config.json`
+		if cfgPath != wantCfg {
+			t.Errorf("got %q, want %q", cfgPath, wantCfg)
+		}
+	})
+
+	t.Run("nil directory functions on windows return error", func(t *testing.T) {
+		lk := paths.Lookup{
+			GOOS: "windows",
+		}
+
+		if _, err := paths.ConfigDirWithLookup(lk); err == nil {
+			t.Error("expected error for nil UserConfigDir, got nil")
+		}
+		if _, err := paths.StateDirWithLookup(lk); err == nil {
+			t.Error("expected error for nil UserCacheDir, got nil")
+		}
+	})
+
+	t.Run("empty directory return on windows returns error", func(t *testing.T) {
+		lk := paths.Lookup{
+			GOOS: "windows",
+			UserConfigDir: func() (string, error) {
+				return "", nil
+			},
+			UserCacheDir: func() (string, error) {
+				return "", nil
+			},
+		}
+
+		if _, err := paths.ConfigDirWithLookup(lk); err == nil {
+			t.Error("expected error for empty UserConfigDir, got nil")
+		}
+		if _, err := paths.StateDirWithLookup(lk); err == nil {
+			t.Error("expected error for empty UserCacheDir, got nil")
+		}
+	})
+
+	t.Run("trailing slashes stripped cleanly", func(t *testing.T) {
+		lk := paths.Lookup{
+			GOOS: "windows",
+			UserConfigDir: func() (string, error) {
+				return `C:\Users\Alice\AppData\Roaming\`, nil
+			},
+			UserCacheDir: func() (string, error) {
+				return `C:\Users\Alice\AppData\Local/`, nil
+			},
+		}
+
+		cfgPath, err := paths.ConfigPathWithLookup("", lk)
+		if err != nil {
+			t.Fatalf("ConfigPathWithLookup failed: %v", err)
+		}
+		wantCfg := `C:\Users\Alice\AppData\Roaming\gemsub\config.json`
+		if cfgPath != wantCfg {
+			t.Errorf("got %q, want %q", cfgPath, wantCfg)
+		}
+
+		statePath, err := paths.StatePathWithLookup("", lk)
+		if err != nil {
+			t.Fatalf("StatePathWithLookup failed: %v", err)
+		}
+		wantState := `C:\Users\Alice\AppData\Local\gemsub\state.json`
+		if statePath != wantState {
+			t.Errorf("got %q, want %q", statePath, wantState)
+		}
+	})
+}
+
+func TestHermetic_ExplicitOverrides_ImmuneToLookupFailures(t *testing.T) {
+	// A completely broken Lookup where all functions are nil or return errors
+	brokenLookup := paths.Lookup{
+		GOOS: "linux",
+		Getenv: func(string) string {
+			return ""
+		},
+		UserHomeDir: func() (string, error) {
+			return "", errors.New("home lookup broken")
+		},
+		UserConfigDir: func() (string, error) {
+			return "", errors.New("config dir broken")
+		},
+		UserCacheDir: func() (string, error) {
+			return "", errors.New("cache dir broken")
+		},
+	}
+
+	overrides := []string{
+		"./config.json",
+		"./gemsub_state.json",
+		"config.json",
+		"state.json",
+		"/tmp/custom_config.json",
+		"/tmp/custom_state.json.gz",
+		"../relative/config.json",
+		`C:\Users\Alice\custom.json`,
+	}
+
+	for _, ov := range overrides {
+		t.Run("Config_"+ov, func(t *testing.T) {
+			got, err := paths.ConfigPathWithLookup(ov, brokenLookup)
+			if err != nil {
+				t.Fatalf("unexpected error for explicit override %q: %v", ov, err)
+			}
+			if got != ov {
+				t.Errorf("expected %q, got %q", ov, got)
+			}
+		})
+
+		t.Run("State_"+ov, func(t *testing.T) {
+			got, err := paths.StatePathWithLookup(ov, brokenLookup)
+			if err != nil {
+				t.Fatalf("unexpected error for explicit override %q: %v", ov, err)
+			}
+			if got != ov {
+				t.Errorf("expected %q, got %q", ov, got)
+			}
+		})
+	}
+}

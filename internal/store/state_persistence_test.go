@@ -288,3 +288,160 @@ func TestStoreSave_StatErrorPropagation(t *testing.T) {
 		t.Errorf("expected error to mention stat/directory failure, got: %v", err)
 	}
 }
+
+func TestHermeticStore_DeepNestedParentDirectoryCreation(t *testing.T) {
+	tmpDir := t.TempDir()
+	nestedDirs := []string{"level1", "level2", "level3", "level4", "level5"}
+	stateDir := filepath.Join(append([]string{tmpDir}, nestedDirs...)...)
+	statePath := filepath.Join(stateDir, "state.json")
+
+	// Verify with os.Stat that the target directory and intermediate directories do not exist before Save()
+	for i := 1; i <= len(nestedDirs); i++ {
+		checkPath := filepath.Join(append([]string{tmpDir}, nestedDirs[:i]...)...)
+		if _, err := os.Stat(checkPath); !os.IsNotExist(err) {
+			t.Fatalf("expected directory %s not to exist prior to Save()", checkPath)
+		}
+	}
+
+	st := store.New(statePath, 2)
+	link1 := "vless://node1@1.1.1.1:443#Node1"
+	st.PutWithTransition(store.Result{
+		Link:     link1,
+		Status:   store.StatusPassed,
+		Latency:  45 * time.Millisecond,
+		TestedAt: time.Now(),
+	})
+	st.FinishCycle()
+
+	if err := st.Save(); err != nil {
+		t.Fatalf("st.Save() failed on deep nested path: %v", err)
+	}
+
+	primaryPath := st.PrimaryPath()
+	fi, err := os.Stat(primaryPath)
+	if err != nil {
+		t.Fatalf("expected primary file %s to exist: %v", primaryPath, err)
+	}
+	if fi.IsDir() {
+		t.Fatalf("expected primary path %s to be a file, not a directory", primaryPath)
+	}
+	if fi.Size() == 0 {
+		t.Fatalf("expected primary file %s to have non-zero size", primaryPath)
+	}
+
+	if runtime.GOOS != "windows" {
+		if got := fi.Mode().Perm(); got != 0o600 {
+			t.Errorf("expected primary file mode 0600, got %04o", got)
+		}
+
+		// Verify every created directory in the hierarchy has 0o700 permission
+		for i := 1; i <= len(nestedDirs); i++ {
+			dirPath := filepath.Join(append([]string{tmpDir}, nestedDirs[:i]...)...)
+			dirInfo, err := os.Stat(dirPath)
+			if err != nil {
+				t.Fatalf("os.Stat(%s) failed: %v", dirPath, err)
+			}
+			if !dirInfo.IsDir() {
+				t.Errorf("expected %s to be a directory", dirPath)
+			}
+			if got := dirInfo.Mode().Perm(); got != 0o700 {
+				t.Errorf("expected directory %s mode 0700, got %04o", dirPath, got)
+			}
+		}
+	}
+
+	// Verify persistence round-trip by reloading into a separate Store instance
+	st2 := store.New(statePath, 2)
+	if err := st2.Load(); err != nil {
+		t.Fatalf("st2.Load() failed: %v", err)
+	}
+	passing := st2.Passing()
+	if len(passing) != 1 || passing[0] != link1 {
+		t.Fatalf("expected passing %v, got %v", []string{link1}, passing)
+	}
+
+	// Second cycle save to verify idempotency and existing directory handling
+	link2 := "vless://node2@2.2.2.2:443#Node2"
+	st2.PutWithTransition(store.Result{
+		Link:     link2,
+		Status:   store.StatusPassed,
+		Latency:  35 * time.Millisecond,
+		TestedAt: time.Now(),
+	})
+	st2.FinishCycle()
+	if err := st2.Save(); err != nil {
+		t.Fatalf("st2.Save() second cycle failed: %v", err)
+	}
+
+	st3 := store.New(statePath, 2)
+	if err := st3.Load(); err != nil {
+		t.Fatalf("st3.Load() failed: %v", err)
+	}
+	if len(st3.Passing()) != 2 {
+		t.Fatalf("expected 2 passing candidates, got %d", len(st3.Passing()))
+	}
+}
+
+func TestHermeticStore_PermissionHardening_ModeMatrix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file permissions are not applicable on Windows")
+	}
+
+	testModes := []os.FileMode{
+		0o600,
+		0o640,
+		0o644,
+		0o660,
+	}
+
+	for _, initialMode := range testModes {
+		t.Run(initialMode.String(), func(t *testing.T) {
+			tmpDir := t.TempDir()
+			statePath := filepath.Join(tmpDir, "state.json")
+			primaryPath := statePath + ".gz"
+
+			// Create pre-existing state file with specific permissions
+			if err := os.WriteFile(primaryPath, []byte("pre-existing placeholder data"), initialMode); err != nil {
+				t.Fatalf("failed to write initial state file: %v", err)
+			}
+			if err := os.Chmod(primaryPath, initialMode); err != nil {
+				t.Fatalf("failed to chmod initial state file: %v", err)
+			}
+
+			// Verify with os.Stat that pre-existing mode is established
+			fiBefore, err := os.Stat(primaryPath)
+			if err != nil {
+				t.Fatalf("stat before Save: %v", err)
+			}
+			if got := fiBefore.Mode().Perm(); got != initialMode {
+				t.Fatalf("initial mode setup failed: got %04o, want %04o", got, initialMode)
+			}
+
+			// Instantiate store and save a valid snapshot
+			st := store.New(statePath, 2)
+			st.PutWithTransition(store.Result{
+				Link:     "vless://perm-test@1.1.1.1:443#PermTest",
+				Status:   store.StatusPassed,
+				Latency:  50 * time.Millisecond,
+				TestedAt: time.Now(),
+			})
+			st.FinishCycle()
+
+			if err := st.Save(); err != nil {
+				t.Fatalf("st.Save() failed: %v", err)
+			}
+
+			// Assert via os.Stat that file permissions were preserved
+			fiAfter, err := os.Stat(primaryPath)
+			if err != nil {
+				t.Fatalf("stat after Save: %v", err)
+			}
+			if got := fiAfter.Mode().Perm(); got != initialMode {
+				t.Errorf("expected preserved mode %04o, got %04o", initialMode, got)
+			}
+			if fiAfter.Size() == 0 {
+				t.Error("expected non-empty state file after Save()")
+			}
+		})
+	}
+}
