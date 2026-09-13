@@ -10,10 +10,12 @@ import (
 	"cmp"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
 	"os"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -23,6 +25,8 @@ import (
 	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
+
+	"gemsub/internal/paths"
 )
 
 // Status is the canonical internal state of a candidate probe outcome.
@@ -626,10 +630,25 @@ func (s *Store) Save() error {
 	})
 
 	primary := s.PrimaryPath()
+	if err := paths.EnsureDir(primary, 0o700); err != nil {
+		return fmt.Errorf("ensure state directory: %w", err)
+	}
+
+	perm := os.FileMode(0o600)
+	fi, err := os.Stat(primary)
+	if err == nil {
+		perm = fi.Mode().Perm()
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat existing state file %s: %w", primary, err)
+	}
+
 	tmp := primary + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
 		return err
+	}
+	if runtime.GOOS != "windows" {
+		_ = f.Chmod(perm)
 	}
 
 	bw := bufio.NewWriterSize(f, 256*1024)

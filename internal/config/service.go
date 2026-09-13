@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"gemsub/internal/paths"
 )
 
 // EventPublisher is an interface for broadcasting application events.
@@ -73,6 +75,7 @@ func NewService(path string, cfg *Config, bus EventPublisher) (*Service, error) 
 // DefaultConfig returns a valid default configuration template suitable for first-run onboarding.
 func DefaultConfig() *Config {
 	defaultRetries := 2
+	defaultStatePath, _ := paths.StatePath("")
 	return &Config{
 		Sources:          []SourceItem{},
 		FetchIntervalRaw: "3h",
@@ -115,7 +118,7 @@ func DefaultConfig() *Config {
 			Enabled: false,
 			Branch:  "main",
 		},
-		StateFile: "./gemsub_state.json",
+		StateFile: defaultStatePath,
 	}
 }
 

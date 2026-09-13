@@ -396,3 +396,43 @@ func TestBootstrapConfig_MissingCanonicalHeadless(t *testing.T) {
 		t.Errorf("expected nil service, got %v", svc)
 	}
 }
+
+func TestBootstrapConfig_OnboardingProducesCanonicalStateFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	nestedConfigPath := filepath.Join(tmpDir, ".config", "gemsub", "config.json")
+
+	svc, isFirstRun, err := bootstrapConfig(nestedConfigPath, false)
+	if err != nil {
+		t.Fatalf("bootstrapConfig: %v", err)
+	}
+	if !isFirstRun {
+		t.Fatal("expected isFirstRun == true")
+	}
+
+	expectedState, err := paths.StatePath("")
+	if err != nil {
+		t.Fatalf("paths.StatePath: %v", err)
+	}
+
+	if got := svc.Get().StateFile; got != expectedState {
+		t.Errorf("expected onboarding state_file %q, got %q", expectedState, got)
+	}
+
+	// Update and save
+	err = svc.Update(func(c *config.Config) error {
+		c.Sources = config.NewSources("https://example.com/sub.txt")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("svc.Update: %v", err)
+	}
+
+	// Reload from disk and verify state_file persisted as canonical default
+	reloaded, err := config.Load(nestedConfigPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if reloaded.StateFile != expectedState {
+		t.Errorf("persisted config state_file: expected %q, got %q", expectedState, reloaded.StateFile)
+	}
+}

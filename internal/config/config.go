@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"gemsub/internal/paths"
 )
 
 type GeminiConfig struct {
@@ -239,9 +241,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("serve.format must be \"raw\" or \"base64\", got %q", c.Serve.Format)
 	}
 
-	if c.StateFile == "" {
-		c.StateFile = "./gemsub_state.json"
+	resolvedState, err := paths.StatePath(c.StateFile)
+	if err != nil {
+		return fmt.Errorf("resolve state file: %w", err)
 	}
+	c.StateFile = resolvedState
 
 	if c.Publishing.Branch == "" {
 		c.Publishing.Branch = "main"
