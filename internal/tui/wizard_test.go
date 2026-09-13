@@ -26,6 +26,8 @@ type mockWizardController struct {
 	completeOnboardingCalls int
 	startRuntimeFn          func() error
 	startRuntimeCalls       int
+	configPath              string
+	statePath               string
 }
 
 func (m *mockWizardController) Snapshot(filter viewmodel.FilterMode) viewmodel.SnapshotViewModel {
@@ -94,6 +96,10 @@ func (m *mockWizardController) StartRuntime() error {
 		return m.startRuntimeFn()
 	}
 	return nil
+}
+
+func (m *mockWizardController) ConfigPaths() (string, string) {
+	return m.configPath, m.statePath
 }
 
 func setupWizardModel(ctrl Controller) *Model {
@@ -786,5 +792,172 @@ func TestWizard_SaveOnboarding_InvalidConcurrencyReturnsError(t *testing.T) {
 	}
 	if mockCtrl.completeOnboardingCalls != 0 {
 		t.Errorf("expected CompleteOnboarding not to be called, got %d calls", mockCtrl.completeOnboardingCalls)
+	}
+}
+
+func TestWizard_ReviewStep_DisplaysEffectiveCanonicalPaths(t *testing.T) {
+	canonicalConfig := "/home/user/.config/gemsub/config.json"
+	canonicalState := "/home/user/.local/state/gemsub/state.json"
+
+	mockCtrl := &mockWizardController{
+		configPath: canonicalConfig,
+		statePath:  canonicalState,
+	}
+	m := setupWizardModel(mockCtrl)
+	m.wizard.Step = WizardStepReview
+	m.wizard.SourceURL = "https://example.com/subs.txt"
+	m.wizard.SubserverListen = "127.0.0.1:8765"
+	m.wizard.SubserverPath = "/sub"
+	m.wizard.Concurrency = "10"
+	m.wizard.Timeout = "5s"
+	m.wizard.TargetURL = "https://gemini.google.com/"
+
+	view := m.View()
+
+	if !strings.Contains(view, canonicalConfig) {
+		t.Errorf("expected review step to contain canonical config path %q, view:\n%s", canonicalConfig, view)
+	}
+	if !strings.Contains(view, canonicalState) {
+		t.Errorf("expected review step to contain canonical state path %q, view:\n%s", canonicalState, view)
+	}
+
+	// Must NOT contain the obsolete hardcoded paths
+	if strings.Contains(view, "./config.json") {
+		t.Errorf("review step unexpectedly contains obsolete hardcoded ./config.json")
+	}
+	if strings.Contains(view, "./gemsub_state.json") {
+		t.Errorf("review step unexpectedly contains obsolete hardcoded ./gemsub_state.json")
+	}
+}
+
+func TestWizard_ReviewStep_DisplaysCustomExplicitPathsVerbatim(t *testing.T) {
+	customConfig := "./custom/config.json"
+	customState := "./custom/my_state.json"
+
+	mockCtrl := &mockWizardController{
+		configPath: customConfig,
+		statePath:  customState,
+	}
+	m := setupWizardModel(mockCtrl)
+	m.wizard.Step = WizardStepReview
+	m.wizard.SourceURL = "https://example.com/subs.txt"
+	m.wizard.SubserverListen = "127.0.0.1:8765"
+	m.wizard.SubserverPath = "/sub"
+	m.wizard.Concurrency = "10"
+	m.wizard.Timeout = "5s"
+	m.wizard.TargetURL = "https://gemini.google.com/"
+
+	view := m.View()
+
+	if !strings.Contains(view, customConfig) {
+		t.Errorf("expected review step to contain verbatim custom config path %q", customConfig)
+	}
+	if !strings.Contains(view, customState) {
+		t.Errorf("expected review step to contain verbatim custom state path %q", customState)
+	}
+}
+
+func TestWizard_ReviewStep_DisplaysWindowsPathsVerbatim(t *testing.T) {
+	winConfig := `C:\Users\Alice\AppData\Roaming\gemsub\config.json`
+	winState := `C:\Users\Alice\AppData\Local\gemsub\state.json`
+
+	mockCtrl := &mockWizardController{
+		configPath: winConfig,
+		statePath:  winState,
+	}
+	m := setupWizardModel(mockCtrl)
+	m.wizard.Step = WizardStepReview
+	m.wizard.SourceURL = "https://example.com/subs.txt"
+	m.wizard.SubserverListen = "127.0.0.1:8765"
+	m.wizard.SubserverPath = "/sub"
+	m.wizard.Concurrency = "10"
+	m.wizard.Timeout = "5s"
+	m.wizard.TargetURL = "https://gemini.google.com/"
+
+	view := m.View()
+
+	if !strings.Contains(view, winConfig) {
+		t.Errorf("expected review step to contain verbatim Windows config path %q", winConfig)
+	}
+	if !strings.Contains(view, winState) {
+		t.Errorf("expected review step to contain verbatim Windows state path %q", winState)
+	}
+}
+
+func TestWizard_ReviewStep_FallbackWhenUnsetOrNil(t *testing.T) {
+	// Case 1: Controller present but paths empty
+	mockCtrl := &mockWizardController{
+		configPath: "",
+		statePath:  "",
+	}
+	m := setupWizardModel(mockCtrl)
+	m.wizard.Step = WizardStepReview
+	m.wizard.SourceURL = "https://example.com/subs.txt"
+	m.wizard.SubserverListen = "127.0.0.1:8765"
+	m.wizard.SubserverPath = "/sub"
+	m.wizard.Concurrency = "10"
+	m.wizard.Timeout = "5s"
+	m.wizard.TargetURL = "https://gemini.google.com/"
+
+	view := m.View()
+	if !strings.Contains(view, "(unknown)") {
+		t.Errorf("expected (unknown) for unconfigured config path")
+	}
+	if !strings.Contains(view, "(none)") {
+		t.Errorf("expected (none) for unconfigured state path")
+	}
+
+	// Case 2: Controller is nil
+	mNil := setupWizardModel(nil)
+	mNil.wizard.Step = WizardStepReview
+	mNil.wizard.SourceURL = "https://example.com/subs.txt"
+	mNil.wizard.SubserverListen = "127.0.0.1:8765"
+	mNil.wizard.SubserverPath = "/sub"
+	mNil.wizard.Concurrency = "10"
+	mNil.wizard.Timeout = "5s"
+	mNil.wizard.TargetURL = "https://gemini.google.com/"
+
+	viewNil := mNil.View()
+	if !strings.Contains(viewNil, "(unknown)") {
+		t.Errorf("expected (unknown) when controller is nil")
+	}
+}
+
+func TestWizard_ReviewStep_IntegrationWithAdapterAndConfigService(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "custom_config.json")
+
+	bus := events.New()
+	st := store.New(filepath.Join(tmpDir, "custom_state.json"), 2)
+	ring := logging.NewRingLogHandler(100)
+	ad := adapter.New(st, bus, ring)
+	defer ad.Close()
+
+	cfgSvc := config.NewDefaultService(cfgPath, bus)
+	srcSvc := source.NewService(cfgSvc)
+	ad.SetServices(cfgSvc, srcSvc, nil, nil)
+
+	m := setupWizardModel(ad)
+	m.wizard.Step = WizardStepReview
+	m.wizard.SourceURL = "https://example.com/subs.txt"
+	m.wizard.SubserverListen = "127.0.0.1:8765"
+	m.wizard.SubserverPath = "/sub"
+	m.wizard.Concurrency = "10"
+	m.wizard.Timeout = "5s"
+	m.wizard.TargetURL = "https://gemini.google.com/"
+
+	view := m.View()
+
+	expectedConfigPath := cfgPath
+	expectedStatePath := cfgSvc.Get().StateFile
+
+	if !strings.Contains(view, expectedConfigPath) {
+		t.Errorf("expected view to contain adapter config path %q", expectedConfigPath)
+	}
+	if !strings.Contains(view, expectedStatePath) {
+		t.Errorf("expected view to contain adapter state path %q", expectedStatePath)
+	}
+	if strings.Contains(view, "./config.json") {
+		t.Errorf("view unexpectedly contains obsolete ./config.json")
 	}
 }

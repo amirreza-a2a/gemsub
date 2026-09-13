@@ -1273,6 +1273,8 @@ func TestModel_ConfigCenterTerminalBounds_80x24(t *testing.T) {
 
 type testDecoupledController struct {
 	configCenter viewmodel.ConfigCenterViewModel
+	configPath   string
+	statePath    string
 }
 
 func (c *testDecoupledController) Snapshot(filter viewmodel.FilterMode) viewmodel.SnapshotViewModel {
@@ -1349,6 +1351,10 @@ func (c *testDecoupledController) CompleteOnboarding(cfg viewmodel.OnboardingCon
 
 func (c *testDecoupledController) StartRuntime() error {
 	return nil
+}
+
+func (c *testDecoupledController) ConfigPaths() (string, string) {
+	return c.configPath, c.statePath
 }
 
 func TestModel_ConfigCenterDecoupledController(t *testing.T) {

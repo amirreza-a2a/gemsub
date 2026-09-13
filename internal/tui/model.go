@@ -40,6 +40,7 @@ type Controller interface {
 	PublishNow(ctx context.Context) error
 	CompleteOnboarding(cfg viewmodel.OnboardingConfig) error
 	StartRuntime() error
+	ConfigPaths() (configPath, statePath string)
 }
 
 // ActiveView represents the primary content pane currently displayed.

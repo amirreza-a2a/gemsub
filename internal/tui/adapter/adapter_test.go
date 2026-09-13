@@ -4605,3 +4605,184 @@ func TestAdapter_CompleteOnboarding_TransactionalRollbackOnFailure(t *testing.T)
 		t.Errorf("expected config file to exist on disk after successful commit: %v", err)
 	}
 }
+
+func TestAdapter_ConfigPaths_WithConfigService(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "app_config.json")
+	statePath := filepath.Join(tmpDir, "app_state.json")
+
+	cfg := config.DefaultConfig()
+	cfg.StateFile = statePath
+	cfg.Sources = []config.SourceItem{{URL: "https://example.com/subs.txt", Name: "Primary", Enabled: true}}
+
+	bus := events.New()
+	cfgSvc, err := config.NewService(cfgPath, cfg, bus)
+	if err != nil {
+		t.Fatalf("config.NewService: %v", err)
+	}
+
+	st := store.New(statePath, 2)
+	ad := adapter.New(st, bus, logging.NewRingLogHandler(10))
+	defer ad.Close()
+
+	ad.SetServices(cfgSvc, nil, nil, nil)
+
+	gotCfgPath, gotStatePath := ad.ConfigPaths()
+	if gotCfgPath != cfgPath {
+		t.Errorf("expected configPath %q, got %q", cfgPath, gotCfgPath)
+	}
+	if gotStatePath != statePath {
+		t.Errorf("expected statePath %q, got %q", statePath, gotStatePath)
+	}
+
+	// Update StateFile via ConfigService and confirm dynamic reflection
+	newStatePath := filepath.Join(tmpDir, "new_state.json")
+	err = cfgSvc.Update(func(c *config.Config) error {
+		c.StateFile = newStatePath
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("cfgSvc.Update: %v", err)
+	}
+
+	_, gotUpdatedState := ad.ConfigPaths()
+	if gotUpdatedState != newStatePath {
+		t.Errorf("expected updated statePath %q, got %q", newStatePath, gotUpdatedState)
+	}
+}
+
+func TestAdapter_ConfigPaths_FallbackWithoutService(t *testing.T) {
+	bus := events.New()
+	st := store.New("", 2)
+	ad := adapter.New(st, bus, logging.NewRingLogHandler(10))
+	ad.Subscribe()
+	defer ad.Close()
+
+	fallbackConfig := "/etc/gemsub/config.json"
+	ad.SetConfigPath(fallbackConfig)
+
+	// Simulate event-driven cache update
+	expectedState := "/var/lib/gemsub/state.json"
+	bus.Publish(events.ConfigUpdated{
+		New: config.Config{
+			StateFile: expectedState,
+		},
+	})
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		_, sp := ad.ConfigPaths()
+		if sp == expectedState {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	gotCfgPath, gotStatePath := ad.ConfigPaths()
+	if gotCfgPath != fallbackConfig {
+		t.Errorf("expected fallback configPath %q, got %q", fallbackConfig, gotCfgPath)
+	}
+	if gotStatePath != expectedState {
+		t.Errorf("expected cached statePath %q, got %q", expectedState, gotStatePath)
+	}
+}
+
+func TestAdapter_ConfigCenter_StateFilePresentation(t *testing.T) {
+	testCases := []struct {
+		name          string
+		stateFile     string
+		expectedValue string
+	}{
+		{
+			name:          "canonical state path",
+			stateFile:     "/home/user/.local/state/gemsub/state.json",
+			expectedValue: "/home/user/.local/state/gemsub/state.json",
+		},
+		{
+			name:          "custom relative path verbatim",
+			stateFile:     "./my_state.json",
+			expectedValue: "./my_state.json",
+		},
+		{
+			name:          "windows style path verbatim",
+			stateFile:     `C:\Users\Alice\AppData\Local\gemsub\state.json`,
+			expectedValue: `C:\Users\Alice\AppData\Local\gemsub\state.json`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			cfgPath := filepath.Join(tmpDir, "config.json")
+
+			cfg := config.DefaultConfig()
+			cfg.StateFile = tc.stateFile
+			cfg.Sources = []config.SourceItem{{URL: "https://example.com/subs.txt", Name: "Primary", Enabled: true}}
+
+			bus := events.New()
+			cfgSvc, err := config.NewService(cfgPath, cfg, bus)
+			if err != nil {
+				t.Fatalf("config.NewService: %v", err)
+			}
+
+			st := store.New(tc.stateFile, 2)
+			ad := adapter.New(st, bus, logging.NewRingLogHandler(10))
+			defer ad.Close()
+
+			ad.SetServices(cfgSvc, nil, nil, nil)
+
+			vm := ad.ConfigCenter()
+			var found bool
+			for _, cat := range vm.Categories {
+				if cat.Category == viewmodel.CategoryGeneral {
+					for _, item := range cat.Items {
+						if item.Key == "state_file" {
+							found = true
+							if item.Value != tc.expectedValue {
+								t.Errorf("ConfigCenter state_file Value: expected %q, got %q", tc.expectedValue, item.Value)
+							}
+							if item.EditorValue != tc.stateFile {
+								t.Errorf("ConfigCenter state_file EditorValue: expected %q, got %q", tc.stateFile, item.EditorValue)
+							}
+							if item.RawValue != tc.stateFile {
+								t.Errorf("ConfigCenter state_file RawValue: expected %q, got %q", tc.stateFile, item.RawValue)
+							}
+						}
+					}
+				}
+			}
+			if !found {
+				t.Errorf("state_file setting not found in ConfigCenter General category")
+			}
+		})
+	}
+
+	t.Run("empty state file in event fallback displays (none)", func(t *testing.T) {
+		bus := events.New()
+		st := store.New("", 2)
+		ad := adapter.New(st, bus, logging.NewRingLogHandler(10))
+		defer ad.Close()
+
+		// No configSvc attached, lastCfg is empty
+		vm := ad.ConfigCenter()
+		var found bool
+		for _, cat := range vm.Categories {
+			if cat.Category == viewmodel.CategoryGeneral {
+				for _, item := range cat.Items {
+					if item.Key == "state_file" {
+						found = true
+						if item.Value != "(none)" {
+							t.Errorf("expected (none) for unconfigured state_file, got %q", item.Value)
+						}
+						if item.EditorValue != "" {
+							t.Errorf("expected empty EditorValue for unconfigured state_file, got %q", item.EditorValue)
+						}
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("state_file setting not found in ConfigCenter General category")
+		}
+	})
+}

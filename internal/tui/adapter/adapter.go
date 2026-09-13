@@ -88,6 +88,7 @@ type Adapter struct {
 	runtimeStarter func() error
 
 	// Event-driven configuration/publishing cache (used when services are nil or as event fallback)
+	configPath        string
 	lastCfg           config.Config
 	pubRunning        bool
 	lastPublished     time.Time
@@ -969,6 +970,10 @@ func (a *Adapter) SetServices(cfgSvc *config.Service, srcSvc *source.Service, pu
 	a.sourceSvc = srcSvc
 	a.publishSvc = pubSvc
 	a.schedulerCtrl = schedCtrl
+	if cfgSvc != nil {
+		a.configPath = cfgSvc.Path()
+		a.lastCfg = cfgSvc.Get()
+	}
 	atomic.StoreInt32(&a.dirty, 1)
 }
 
@@ -2138,4 +2143,23 @@ func (a *Adapter) StartRuntime() error {
 
 	atomic.StoreInt32(&a.dirty, 1)
 	return nil
+}
+
+// SetConfigPath sets the fallback configuration file path when configSvc is not provided.
+func (a *Adapter) SetConfigPath(p string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.configPath = p
+}
+
+// ConfigPaths returns the effective configuration file path and candidate state file path
+// from the authoritative configuration service, falling back to cached configuration.
+func (a *Adapter) ConfigPaths() (configPath, statePath string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.configSvc != nil {
+		return a.configSvc.Path(), a.configSvc.Get().StateFile
+	}
+	return a.configPath, a.lastCfg.StateFile
 }

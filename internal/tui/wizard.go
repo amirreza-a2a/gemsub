@@ -582,6 +582,20 @@ func (m *Model) renderWizard() string {
 			alias = "(auto-derived from URL)"
 		}
 
+		configPath := "(unknown)"
+		statePath := "(unknown)"
+		if m.ctrl != nil {
+			cp, sp := m.ctrl.ConfigPaths()
+			if cp != "" {
+				configPath = cp
+			}
+			if sp != "" {
+				statePath = sp
+			} else {
+				statePath = "(none)"
+			}
+		}
+
 		content.WriteString(fmt.Sprintf("  • %-22s : %s\n", "Primary Source URL", m.wizard.SourceURL))
 		content.WriteString(fmt.Sprintf("  • %-22s : %s\n", "Source Alias", alias))
 		content.WriteString(fmt.Sprintf("  • %-22s : %s\n", "Subserver Listen", m.wizard.SubserverListen))
@@ -589,8 +603,8 @@ func (m *Model) renderWizard() string {
 		content.WriteString(fmt.Sprintf("  • %-22s : %s\n", "Testing Concurrency", m.wizard.Concurrency))
 		content.WriteString(fmt.Sprintf("  • %-22s : %s\n", "Testing Timeout", m.wizard.Timeout))
 		content.WriteString(fmt.Sprintf("  • %-22s : %s\n", "Target URL", m.wizard.TargetURL))
-		content.WriteString(fmt.Sprintf("  • %-22s : %s\n", "Config File", "./config.json"))
-		content.WriteString(fmt.Sprintf("  • %-22s : %s\n\n", "State File", "./gemsub_state.json"))
+		content.WriteString(fmt.Sprintf("  • %-22s : %s\n", "Config File", configPath))
+		content.WriteString(fmt.Sprintf("  • %-22s : %s\n\n", "State File", statePath))
 
 		if m.wizard.configCommitted {
 			content.WriteString(successStyle.Render("✓ Initial configuration saved successfully to disk.") + "\n\n")
