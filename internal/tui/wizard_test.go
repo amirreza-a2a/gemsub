@@ -971,7 +971,7 @@ func TestWizard_ReviewStep_IntegrationWithAdapterAndConfigService(t *testing.T) 
 func TestWizard_WelcomeStep_LegacyConfigNotice(t *testing.T) {
 	t.Run("without legacy config", func(t *testing.T) {
 		ctrl := &mockWizardController{
-			configPath:     "/home/user/.config/gemsub/config.json",
+			configPath:     filepath.FromSlash("/home/user/.config/gemsub/config.json"),
 			legacyDetected: false,
 		}
 		m := setupWizardModel(ctrl)
@@ -986,8 +986,9 @@ func TestWizard_WelcomeStep_LegacyConfigNotice(t *testing.T) {
 	})
 
 	t.Run("with legacy config detected via controller", func(t *testing.T) {
+		canonicalPath := filepath.FromSlash("/home/user/.config/gemsub/config.json")
 		ctrl := &mockWizardController{
-			configPath:     "/home/user/.config/gemsub/config.json",
+			configPath:     canonicalPath,
 			legacyDetected: true,
 		}
 		m := setupWizardModel(ctrl)
@@ -999,8 +1000,9 @@ func TestWizard_WelcomeStep_LegacyConfigNotice(t *testing.T) {
 		if !strings.Contains(view, "gemsub -config ./config.json") {
 			t.Errorf("expected view to contain explicit command: %s", view)
 		}
-		if !strings.Contains(view, "mkdir -p /home/user/.config/gemsub && cp ./config.json /home/user/.config/gemsub/config.json") {
-			t.Errorf("expected view to contain migration command: %s", view)
+		expectedCmd := formatLegacyMigrationAdvice(canonicalPath)
+		if expectedCmd == "" || !strings.Contains(view, expectedCmd) {
+			t.Errorf("expected view to contain migration command %q: %s", expectedCmd, view)
 		}
 		if !strings.Contains(view, "press [Enter] to proceed with fresh onboarding") {
 			t.Errorf("expected view to explain proceeding with fresh onboarding: %s", view)
@@ -1037,24 +1039,29 @@ func TestWizard_WelcomeStep_LegacyConfigNotice(t *testing.T) {
 	})
 
 	t.Run("path with spaces is quoted safely in migration advice", func(t *testing.T) {
+		var configPath, expectedCmd string
+		if runtime.GOOS == "windows" {
+			configPath = `C:\Users\Test User\AppData\Roaming\gemsub\config.json`
+			expectedCmd = `mkdir -p 'C:\Users\Test User\AppData\Roaming\gemsub' && cp ./config.json 'C:\Users\Test User\AppData\Roaming\gemsub\config.json'`
+		} else {
+			configPath = "/home/test user/.config/gemsub/config.json"
+			expectedCmd = "mkdir -p '/home/test user/.config/gemsub' && cp ./config.json '/home/test user/.config/gemsub/config.json'"
+		}
 		ctrl := &mockWizardController{
-			configPath:     "/home/test user/.config/gemsub/config.json",
+			configPath:     configPath,
 			legacyDetected: true,
 		}
 		m := setupWizardModel(ctrl)
 		view := m.View()
 
-		if runtime.GOOS != "windows" {
-			expectedCmd := "mkdir -p '/home/test user/.config/gemsub' && cp ./config.json '/home/test user/.config/gemsub/config.json'"
-			if !strings.Contains(view, expectedCmd) {
-				t.Errorf("expected quoted posix migration command %q, got: %s", expectedCmd, view)
-			}
+		if !strings.Contains(view, expectedCmd) {
+			t.Errorf("expected quoted migration command %q, got: %s", expectedCmd, view)
 		}
 	})
 
 	t.Run("interaction: enter advances to Step 2 Source, q quits", func(t *testing.T) {
 		ctrl := &mockWizardController{
-			configPath:     "/home/user/.config/gemsub/config.json",
+			configPath:     filepath.FromSlash("/home/user/.config/gemsub/config.json"),
 			legacyDetected: true,
 		}
 		m := setupWizardModel(ctrl)
