@@ -32,7 +32,7 @@ func TestResolveConfigPath_ImplicitDefault(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := filepath.Join("/custom/xdg_config", "gemsub", "config.json")
+		want := "/custom/xdg_config/gemsub/config.json"
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}
@@ -53,7 +53,7 @@ func TestResolveConfigPath_ImplicitDefault(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := filepath.Join("/home/testuser", ".config", "gemsub", "config.json")
+		want := "/home/testuser/.config/gemsub/config.json"
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}
@@ -181,7 +181,7 @@ func TestDetermineConfigPath_FlagSet(t *testing.T) {
 		if isExplicit {
 			t.Error("expected isExplicit == false when -config flag omitted")
 		}
-		want := filepath.Join("/xdg/conf", "gemsub", "config.json")
+		want := "/xdg/conf/gemsub/config.json"
 		if resolved != want {
 			t.Errorf("got %q, want %q", resolved, want)
 		}
@@ -235,6 +235,9 @@ func TestFormatMissingConfigHeadlessHelp(t *testing.T) {
 	})
 
 	t.Run("normal canonical path remains readable without quotes", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("skipping POSIX canonical path assertion on Windows host")
+		}
 		canonicalPath := "/home/user/.config/gemsub/config.json"
 		msg := formatMissingConfigHeadlessHelp(canonicalPath)
 		if !strings.Contains(msg, "Configuration file not found: "+canonicalPath) {
@@ -277,6 +280,18 @@ func TestFormatMissingConfigHeadlessHelp(t *testing.T) {
 		path := `C:\Users\Test User\AppData\Roaming\gemsub\config.json`
 		msg := formatMissingConfigHeadlessHelp(path)
 		expectedAdvice := `mkdir -p "C:\Users\Test User\AppData\Roaming\gemsub" && cp config.example.json "C:\Users\Test User\AppData\Roaming\gemsub\config.json"`
+		if !strings.Contains(msg, expectedAdvice) {
+			t.Errorf("expected advice %q, got:\n%s", expectedAdvice, msg)
+		}
+	})
+
+	t.Run("windows canonical path without spaces remains readable without quotes", func(t *testing.T) {
+		if runtime.GOOS != "windows" {
+			t.Skip("skipping native Windows path format assertion on non-Windows host")
+		}
+		path := `C:\AppData\gemsub\config.json`
+		msg := formatMissingConfigHeadlessHelp(path)
+		expectedAdvice := `mkdir -p C:\AppData\gemsub && cp config.example.json C:\AppData\gemsub\config.json`
 		if !strings.Contains(msg, expectedAdvice) {
 			t.Errorf("expected advice %q, got:\n%s", expectedAdvice, msg)
 		}

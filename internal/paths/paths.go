@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -211,5 +212,5 @@ func joinPath(goos string, elem ...string) string {
 		}
 		return strings.Join(cleaned, "\\")
 	}
-	return filepath.Join(elem...)
+	return path.Join(elem...)
 }
