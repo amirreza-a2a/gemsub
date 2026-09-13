@@ -33,7 +33,7 @@ import (
 	"gemsub/internal/version"
 )
 
-// ErrMissingConfigHeadless is returned when config.json is missing in headless mode.
+// ErrMissingConfigHeadless is returned when configuration file is missing in headless mode.
 var ErrMissingConfigHeadless = errors.New("configuration file not found in headless mode")
 
 // bootstrapConfig resolves the configuration service, detecting first-run onboarding when
@@ -56,7 +56,7 @@ func main() {
 	// Initialize default standard terminal logging during bootstrap
 	logging.Setup(true, 1000, os.Stderr)
 
-	configPath := flag.String("config", "./config.json", "path to config file")
+	configFlag := flag.String("config", "", "path to config file")
 	headless := flag.Bool("headless", false, "run without the TUI (daemon + sub server only)")
 	probeLimit := flag.Int("limit", 0, "limit number of parsed candidates to probe per cycle (0 = unlimited)")
 	publish := flag.Bool("publish", false, "enable git publishing after test cycles (overrides config)")
@@ -70,15 +70,16 @@ func main() {
 		return
 	}
 
-	configSvc, isFirstRun, err := bootstrapConfig(*configPath, *headless)
+	resolvedConfigPath, _, err := determineConfigPath(flag.CommandLine, *configFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration path error: %v\n", err)
+		os.Exit(1)
+	}
+
+	configSvc, isFirstRun, err := bootstrapConfig(resolvedConfigPath, *headless)
 	if err != nil {
 		if errors.Is(err, ErrMissingConfigHeadless) {
-			fmt.Fprintf(os.Stderr, "Configuration file not found: %s\n\n"+
-				"To configure gemsub:\n"+
-				"  1. Run gemsub interactively without --headless to launch the onboarding wizard: gemsub\n"+
-				"  2. Or create %s manually by copying config.example.json:\n"+
-				"     cp config.example.json %s\n",
-				*configPath, *configPath, *configPath)
+			fmt.Fprint(os.Stderr, formatMissingConfigHeadlessHelp(resolvedConfigPath))
 			os.Exit(1)
 		}
 		slog.Error("config load failed", "err", err)
