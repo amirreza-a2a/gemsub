@@ -68,6 +68,17 @@ Upstream Sources (HTTP URLs / Local Files)
 
 The **Store** is the single authoritative source of candidate state, health, scoring, and projection membership. Presentation (TUI) and delivery (Subserver, Publisher) layers consume these canonical projections directly without duplicating classification or scoring logic.
 
+### Filesystem & Layout Separation
+
+`gemsub` enforces clear separation between application binaries, user configuration, and runtime state:
+
+| Component | Default Linux Path | Default Windows Path | Purpose |
+| :--- | :--- | :--- | :--- |
+| **Binary** | `~/.local/bin/gemsub`<br>or `/usr/local/bin/gemsub` | `.\gemsub.exe`<br>or directory in `%PATH%` | Application executable. |
+| **Configuration** | `~/.config/gemsub/config.json` | `%AppData%\gemsub\config.json` | User configuration (`sources`, listen port, probe intervals). |
+| **Runtime State** | `~/.local/state/gemsub/state.json.gz` | `%LocalAppData%\gemsub\state.json.gz` | Authoritative candidate test history, reliability scores, and health samples. |
+| **Explicit Override** | `gemsub -config <path>` | `.\gemsub.exe -config <path>` | Optional CLI override; relative paths remain relative to caller's CWD. |
+
 ---
 
 ## Quick Start
@@ -85,11 +96,11 @@ The wizard guides you through:
 2. **Primary Subscription Source:** Ingest and validate your first upstream subscription URL.
 3. **Local Subserver Setup:** Configure the listen address (default `127.0.0.1:8765`) and subscription path (default `/sub`).
 4. **Testing & Gemini Defaults:** Configure probe concurrency, timeouts, and target URLs.
-5. **Review & Save:** Review the generated configuration, atomically commit it to `config.json`, and immediately launch the testing runtime.
+5. **Review & Save:** Review the generated configuration, atomically commit it to the canonical per-user path (`~/.config/gemsub/config.json` on Linux, `%AppData%\gemsub\config.json` on Windows), and immediately launch the testing runtime.
 
 ### 2. Headless First Run
 
-In headless mode, an existing configuration file is required. If `config.json` is missing:
+In headless mode, an existing configuration file is required. If configuration is missing from the canonical path:
 
 ```bash
 gemsub -headless
@@ -98,28 +109,49 @@ gemsub -headless
 `gemsub` exits with code 1 and displays guidance:
 
 ```text
-Configuration file not found: ./config.json
+Configuration file not found: /home/user/.config/gemsub/config.json
 
 To configure gemsub:
   1. Run gemsub interactively without --headless to launch the onboarding wizard: gemsub
-  2. Or create ./config.json manually by copying config.example.json:
-     cp config.example.json ./config.json
+  2. Or create /home/user/.config/gemsub/config.json manually by copying config.example.json:
+     mkdir -p ~/.config/gemsub && cp config.example.json ~/.config/gemsub/config.json
+```
+
+On Windows (PowerShell 7+):
+```powershell
+New-Item -ItemType Directory -Force "$env:APPDATA\gemsub"
+Copy-Item config.example.json "$env:APPDATA\gemsub\config.json"
 ```
 
 ### 3. Manual Configuration
 
-You can also initialize configuration manually from the template:
+You can also initialize configuration manually into the canonical per-user path:
 
 ```bash
-cp config.example.json config.json
-gemsub -config config.json
+mkdir -p ~/.config/gemsub
+cp config.example.json ~/.config/gemsub/config.json
+gemsub
 ```
 
-Or run directly as a background daemon:
+Or run headless with the canonical configuration:
 
 ```bash
-gemsub -headless -config config.json
+gemsub -headless
 ```
+
+#### Explicit Configuration Overrides
+To use a configuration file at a custom path, supply the `-config` flag:
+
+```bash
+# Explicit path relative to current working directory (remains relative to CWD)
+gemsub -config ./my-config.json
+
+# Explicit absolute path
+gemsub -headless -config /etc/gemsub/config.json
+```
+
+> [!NOTE]
+> Explicit paths passed via `-config` are preserved verbatim and do not resolve through the XDG or AppData default path logic. Relative paths remain relative to the current working directory.
 
 Once started, verified subscription feeds are immediately available:
 
@@ -225,11 +257,14 @@ Official standalone zip archives are available for 64-bit Windows on both x86_64
    ```
 4. Run `gemsub.exe` in Windows Terminal or PowerShell:
    ```powershell
-   # Interactive mode (launches onboarding wizard or TUI)
+   # Interactive mode (launches onboarding wizard or TUI, saves to %AppData%\gemsub\config.json)
    .\gemsub.exe
 
-   # Headless daemon mode with configuration file
-   .\gemsub.exe -headless -config config.json
+   # Headless daemon mode (uses canonical %AppData%\gemsub\config.json)
+   .\gemsub.exe -headless
+
+   # Headless daemon mode with explicit configuration override
+   .\gemsub.exe -headless -config .\config.json
    ```
 
 > [!NOTE]
@@ -264,7 +299,7 @@ make build
 ```text
 Usage of gemsub:
   -config string
-        path to config file (default "./config.json")
+        path to config file
   -flag-mode string
         country flag presentation mode: auto, unicode, ascii
   -headless
@@ -277,6 +312,9 @@ Usage of gemsub:
   -version
         print version information and exit
 ```
+
+> [!NOTE]
+> When `-config` is omitted, `gemsub` resolves the canonical per-user configuration path. When an explicit `-config <path>` is supplied, it acts as an override and is evaluated verbatim without XDG/AppData resolution (relative paths remain relative to the caller's working directory).
 
 ---
 
@@ -352,7 +390,11 @@ Press `c` from Candidate or Log view to open the interactive configuration cente
 
 ## Configuration
 
-Configuration is stored in JSON format (default `./config.json`). A template is provided in `config.example.json`.
+Configuration is stored in JSON format. When not explicitly specified via `-config`, `gemsub` resolves the canonical per-user configuration path:
+- **Linux / Unix:** `$XDG_CONFIG_HOME/gemsub/config.json` when `$XDG_CONFIG_HOME` is set to an absolute path; falls back to `$HOME/.config/gemsub/config.json` if unset, empty, or relative.
+- **Windows:** `%AppData%\gemsub\config.json` (user's roaming application data).
+
+A template is provided in `config.example.json`.
 
 ```json
 {
@@ -394,7 +436,7 @@ Configuration is stored in JSON format (default `./config.json`). A template is 
     "branch": "main",
     "remote_url": "git@github.com:your-user/your-subscriptions.git"
   },
-  "state_file": "./gemsub_state.json",
+  "state_file": "",
   "headless": false,
   "probe_limit": 0,
   "flag_mode": "auto"
@@ -425,7 +467,7 @@ Configuration is stored in JSON format (default `./config.json`). A template is 
 | `publishing.repository` | `string` | `""` | Local filesystem path to the target Git repository (required if publishing enabled). |
 | `publishing.branch` | `string` | `"main"` | Git branch for publication commits. |
 | `publishing.remote_url` | `string` | `""` | Remote Git repository URL used for origin safety verification (required if publishing enabled). |
-| `state_file` | `string` | `"./gemsub_state.json"` | Path for candidate state snapshot (automatically saved as compressed `.json.gz`). |
+| `state_file` | `string` | `""` | Path for candidate state snapshot (automatically saved as compressed `.json.gz`). When empty (`""`), defaults to the platform-aware canonical path (`~/.local/state/gemsub/state.json.gz` on Linux, `%LocalAppData%\gemsub\state.json.gz` on Windows). An explicit non-empty path is preserved verbatim. |
 | `headless` | `bool` | `false` | Default execution mode (`true` = run without TUI). |
 | `probe_limit` | `int` | `0` | Maximum candidates to test per cycle (`0` = test all candidates). |
 | `flag_mode` | `string` | `"auto"` | Country flag presentation mode: `"auto"`, `"unicode"`, or `"ascii"`. |
@@ -437,7 +479,7 @@ Configuration is stored in JSON format (default `./config.json`). A template is 
 | Policy | Configuration Fields | Runtime Behavior |
 | :--- | :--- | :--- |
 | **Hot-Reloadable** | `sources`<br>`fetch_interval`<br>`probe_limit`<br>`flag_mode`<br>`serve.format`<br>`test.health_url`<br>`test.health_timeout`<br>`test.gemini.url`<br>`test.gemini.block_phrases`<br>`test.timeout`<br>`test.dial_timeout`<br>`test.concurrency`<br>`test.rate_limit_rps`<br>`test.max_retries`<br>`test.retry_backoff`<br>`test.max_inconclusive_cycles`<br>`publishing.enabled`<br>`publishing.repository`<br>`publishing.branch`<br>`publishing.remote_url` | Applied immediately to running subsystems (Scheduler, Tester, Subserver, Publisher) upon save without restarting the process. |
-| **Restart Required** | `serve.listen`<br>`serve.path`<br>`state_file`<br>`headless` | Saved to `config.json` immediately; flagged in the Config Center as pending restart because network sockets, snapshot paths, or process modes cannot be rebound safely while running. |
+| **Restart Required** | `serve.listen`<br>`serve.path`<br>`state_file`<br>`headless` | Saved to the active configuration file immediately; flagged in the Config Center as pending restart because network sockets, snapshot paths, or process modes cannot be rebound safely while running. |
 
 ---
 
@@ -567,8 +609,12 @@ When `publishing.enabled` is `true`, `gemsub` commits and pushes updated configu
 
 ## State Persistence
 
-- Persisted state is saved to `state_file` (default `./gemsub_state.json`) and automatically compressed with gzip as `./gemsub_state.json.gz`.
-- Writes occur via a temporary file followed by an atomic rename, preventing file corruption across power loss or crashes.
+- Candidate test history, reliability scores, and health samples are stored in runtime state, strictly separated from user configuration.
+- Persisted state is saved to `state_file`. When left empty (`""`, recommended), it resolves to the platform-aware canonical path:
+  - **Linux / Unix:** `$XDG_STATE_HOME/gemsub/state.json.gz` when `$XDG_STATE_HOME` is set to an absolute path; falls back to `$HOME/.local/state/gemsub/state.json.gz` if unset, empty, or relative.
+  - **Windows:** `%LocalAppData%\gemsub\state.json.gz` (user's local application data).
+- If an explicit `state_file` is specified in configuration, it is used verbatim (relative paths remain relative to CWD) and saved with `.gz` compression.
+- Writes occur via a temporary file followed by an atomic rename, preventing file corruption across power loss or crashes. Parent directories are created automatically with secure permissions (`0o700` on Unix).
 - On startup, `gemsub` restores candidate records, reliability scores, and historical test samples before resuming scheduler probing. Restored passing candidates are served immediately on startup without waiting for a new cycle to finish.
 
 ---

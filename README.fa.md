@@ -66,7 +66,18 @@ Upstream Sources (HTTP URLs / Local Files)
       /sub/gemini, /healthz)            meta.json)
 ```
 
-بخش **Store** مرجع واحد و قطعی وضعیت کاندیداها، سلامت، امتیازدهی و عضویت در پروجکشن‌ها است. لایه‌های نمایش (TUI) و تحویل (Subserver و Publisher) مستقیماً از این پروجکشن‌های معتبر استفاده کرده و هیچ منطق طبقه‌بندی یا امتیازدهی مجزایی در آن‌ها بازتولید نمی‌شود.
+مخزن **Store** تنها مرجع رسمی و معتبر وضعیت کاندیداها، سلامت، امتیازدهی و عضویت در پروجکشن‌ها است. لایه‌های نمایش (رابط کاربری TUI) و تحویل داده (ساب‌سرور، پابلیشر گیت) مستقیماً این پروجکشن‌های معتبر را بدون تکرار منطق دسته‌بندی یا امتیازدهی مصرف می‌کنند.
+
+### تفکیک فایل‌سیستم و لایه‌ها (Filesystem & Layout Separation)
+
+نرم‌افزار `gemsub` تفکیک دقیقی میان فایل‌های اجرایی، پیکربندی کاربر و وضعیت زمان اجرا برقرار می‌کند:
+
+| بخش | مسیر پیش‌فرض لینوکس | مسیر پیش‌فرض ویندوز | هدف |
+| :--- | :--- | :--- | :--- |
+| **باینری** | `~/.local/bin/gemsub`<br>یا `/usr/local/bin/gemsub` | `.\gemsub.exe`<br>یا مسیری در `%PATH%` | فایل اجرایی برنامه. |
+| **پیکربندی** | `~/.config/gemsub/config.json` | `%AppData%\gemsub\config.json` | تنظیمات کاربر (`sources`، پورت لیسن، بازه زمانی پروب‌ها). |
+| **وضعیت اجرا** | `~/.local/state/gemsub/state.json.gz` | `%LocalAppData%\gemsub\state.json.gz` | تاریخچه معتبر تست کاندیداها، امتیازات پایداری و نمونه‌های سلامت شبکه. |
+| **اورراید صریح** | `gemsub -config <path>` | `.\gemsub.exe -config <path>` | تغییر مسیر اختیاری از طریق CLI؛ مسیرهای نسبی نسبت به دایرکتوری جاری محاسبه می‌شوند. |
 
 ---
 
@@ -85,11 +96,11 @@ gemsub
 2. **Primary Subscription Source:** دریافت و اعتبارسنجی اولیه آدرس منبع سابسکریپشن بالادستی.
 3. **Local Subserver Setup:** تنظیم آدرس شبکه محلی (پیش‌فرض `127.0.0.1:8765`) و مسیر سابسکریپشن (پیش‌فرض `/sub`).
 4. **Testing & Gemini Defaults:** تنظیم نرخ همروندی پروب‌ها، محدودیت زمانی (Timeout) و نشانی هدف.
-5. **Review & Save:** بررسی تنظیمات تولیدشده، ثبت اتمیک در `config.json` و شروع بلافاصله زمان‌بندی و پروب کاندیداها.
+5. **Review & Save:** بررسی تنظیمات تولیدشده، ثبت اتمیک در مسیر استاندارد پیکربندی کاربر (`~/.config/gemsub/config.json` در لینوکس، `%AppData%\gemsub\config.json` در ویندوز) و شروع بلافاصله زمان‌بندی و پروب کاندیداها.
 
 ### ۲. اجرای اولیه در حالت Headless
 
-در حالت headless وجود فایل پیکربندی الزامی است. در صورت نبود `config.json`:
+در حالت headless وجود فایل پیکربندی الزامی است. در صورت نبود فایل در مسیر استاندارد:
 
 ```bash
 gemsub -headless
@@ -98,28 +109,49 @@ gemsub -headless
 برنامه با کد خطای ۱ متوقف شده و راهنمایی زیر را چاپ می‌کند:
 
 ```text
-Configuration file not found: ./config.json
+Configuration file not found: /home/user/.config/gemsub/config.json
 
 To configure gemsub:
   1. Run gemsub interactively without --headless to launch the onboarding wizard: gemsub
-  2. Or create ./config.json manually by copying config.example.json:
-     cp config.example.json ./config.json
+  2. Or create /home/user/.config/gemsub/config.json manually by copying config.example.json:
+     mkdir -p ~/.config/gemsub && cp config.example.json ~/.config/gemsub/config.json
+```
+
+در ویندوز (PowerShell 7+):
+```powershell
+New-Item -ItemType Directory -Force "$env:APPDATA\gemsub"
+Copy-Item config.example.json "$env:APPDATA\gemsub\config.json"
 ```
 
 ### ۳. پیکربندی دستی
 
-همچنین می‌توانید فایل پیکربندی را به‌صورت دستی از قالب آماده الگوبرداری کنید:
+همچنین می‌توانید فایل پیکربندی را به‌صورت دستی در مسیر استاندارد ایجاد کنید:
 
 ```bash
-cp config.example.json config.json
-gemsub -config config.json
+mkdir -p ~/.config/gemsub
+cp config.example.json ~/.config/gemsub/config.json
+gemsub
 ```
 
-یا مستقیماً به‌عنوان یک دیمن پس‌زمینه اجرا نمایید:
+یا در حالت headless با پیکربندی پیش‌فرض اجرا نمایید:
 
 ```bash
-gemsub -headless -config config.json
+gemsub -headless
 ```
+
+#### اورراید صریح مسیر پیکربندی
+برای استفاده از یک فایل پیکربندی در مسیری دلخواه، از فلگ `-config` استفاده کنید:
+
+```bash
+# مسیر نسبی نسبت به دایرکتوری جاری کاری (نسبی به CWD باقی می‌ماند)
+gemsub -config ./my-config.json
+
+# مسیر مطلق
+gemsub -headless -config /etc/gemsub/config.json
+```
+
+> [!NOTE]
+> مسیرهای صریح مشخص‌شده با فلگ `-config` عیناً و بدون تغییر استفاده می‌شوند و از طریق منطق پیش‌فرض XDG یا AppData حل نمی‌شوند. مسیرهای نسبی نسبت به دایرکتوری جاری کاری معتبر هستند.
 
 پس از راه‌اندازی، فیدهای اعتبارسنجی‌شده بلافاصله در دسترس هستند:
 
@@ -205,6 +237,41 @@ curl -sSfL https://raw.githubusercontent.com/amirreza-a2a/gemsub/main/scripts/in
 
 ---
 
+### ویندوز
+
+آرشیوهای مستقل ZIP برای ویندوز ۶۴ بیتی در معماری‌های x86_64 و ARM64 در دسترس هستند.
+
+#### نصب دستی
+
+۱. آرشیو متناسب با معماری سیستم خود را از صفحه ریلیزهای گیت‌هاب دانلود کنید:
+   - `x86_64` (پردازنده‌های ۶۴ بیتی Intel/AMD): `gemsub_Windows_x86_64.zip`
+   - `arm64` (پردازنده‌های ۶۴ بیتی ARM): `gemsub_Windows_arm64.zip`
+۲. فایل `checksums.txt` را دانلود کرده و چکسام SHA-256 را در پاورشل بررسی کنید:
+   ```powershell
+   Get-FileHash .\gemsub_Windows_x86_64.zip -Algorithm SHA256
+   ```
+۳. فایل را استخراج نمایید:
+   ```powershell
+   Expand-Archive .\gemsub_Windows_x86_64.zip -DestinationPath .\gemsub
+   cd .\gemsub
+   ```
+۴. برنامه `gemsub.exe` را در Windows Terminal یا PowerShell اجرا کنید:
+   ```powershell
+   # حالت تعاملی (ویزارد اولیه یا TUI، ذخیره در %AppData%\gemsub\config.json)
+   .\gemsub.exe
+
+   # حالت دیمن بدون رابط (استفاده از مسیر پیش‌فرض %AppData%\gemsub\config.json)
+   .\gemsub.exe -headless
+
+   # حالت دیمن با اورراید صریح مسیر فایل پیکربندی
+   .\gemsub.exe -headless -config .\config.json
+   ```
+
+> [!NOTE]
+> **پیش‌نیاز انتشار گیت:** در صورت فعال بودن قابلیت انتشار خودکار گیت (`publishing.enabled: true` یا `-publish`)، نرم‌افزار [Git for Windows](https://git-scm.com/download/win) باید نصب بوده و در متغیر `%PATH%` سیستم تعریف شده باشد.
+
+---
+
 ### کامپایل از سورس‌کد
 
 #### پیش‌نیازها
@@ -232,7 +299,7 @@ make build
 ```text
 Usage of gemsub:
   -config string
-        path to config file (default "./config.json")
+        path to config file
   -flag-mode string
         country flag presentation mode: auto, unicode, ascii
   -headless
@@ -245,6 +312,9 @@ Usage of gemsub:
   -version
         print version information and exit
 ```
+
+> [!NOTE]
+> در صورت حذف فلگ `-config`، برنامه مسیر استاندارد کانونی کاربر را بر اساس پلتفرم انتخاب می‌کند. با ارسال مقدار صریح `-config <path>`، مسیر ارائه‌شده عیناً استفاده می‌شود (مسیرهای نسبی نسبت به دایرکتوری جاری در نظر گرفته می‌شوند).
 
 ---
 
@@ -320,7 +390,11 @@ Usage of gemsub:
 
 ## پیکربندی
 
-پیکربندی در قالب یک فایل JSON ذخیره می‌شود (پیش‌فرض `./config.json`). فایل نمونه در `config.example.json` قرار دارد.
+پیکربندی در قالب یک فایل JSON ذخیره می‌شود. در صورت عدم تعیین مسیر صریح با فلگ `-config`، برنامه مسیر استاندارد کانونی کاربر را انتخاب می‌کند:
+- **لینوکس / یونیکس:** در صورت تنظیم بودن `$XDG_CONFIG_HOME` با یک مسیر مطلق، مسیر `$XDG_CONFIG_HOME/gemsub/config.json` استفاده می‌شود؛ در صورت خالی بودن، تنظیم نشدن یا نسبی بودن، مسیر پیش‌فرض `$HOME/.config/gemsub/config.json` به کار می‌رود.
+- **ویندوز:** مسیر `%AppData%\gemsub\config.json` (دایرکتوری داده‌های رومینگ کاربر Roaming AppData).
+
+فایل نمونه در `config.example.json` قرار دارد.
 
 ```json
 {
@@ -362,7 +436,7 @@ Usage of gemsub:
     "branch": "main",
     "remote_url": "git@github.com:your-user/your-subscriptions.git"
   },
-  "state_file": "./gemsub_state.json",
+  "state_file": "",
   "headless": false,
   "probe_limit": 0,
   "flag_mode": "auto"
@@ -393,7 +467,7 @@ Usage of gemsub:
 | `publishing.repository` | `string` | `""` | مسیر فایل‌سیستم مخزن محلی گیت (در صورت فعال بودن انتشار الزامی است). |
 | `publishing.branch` | `string` | `"main"` | شاخه هدف گیت برای ثبت کامیت‌های انتشار. |
 | `publishing.remote_url` | `string` | `""` | آدرس مخزن ریموت گیت جهت اعتبارسنجی ایمنی مبدا (در صورت فعال بودن انتشار الزامی است). |
-| `state_file` | `string` | `"./gemsub_state.json"` | مسیر فایل ذخیره اسنپ‌شات وضعیت کاندیداها (به‌صورت فشرده با پسوند `.json.gz` ذخیره می‌شود). |
+| `state_file` | `string` | `""` | مسیر فایل ذخیره اسنپ‌شات وضعیت کاندیداها (به‌صورت فشرده با پسوند `.json.gz` ذخیره می‌شود). در صورت خالی بودن (`""`)، از مسیر استاندارد سیستم (`~/.local/state/gemsub/state.json.gz` در لینوکس، `%LocalAppData%\gemsub\state.json.gz` در ویندوز) استفاده می‌شود. مسیرهای غیرخالی عیناً استفاده خواهند شد. |
 | `headless` | `bool` | `false` | حالت اجرای پیش‌فرض (`true` یعنی اجرای بدون رابط TUI). |
 | `probe_limit` | `int` | `0` | سقف تعداد کاندیداهای تحت تست در هر چرخه (`0` یعنی تمام کاندیداها). |
 | `flag_mode` | `string` | `"auto"` | شیوه نمایش پرچم کشورها در رابط کاربری: `"auto"`، `"unicode"` یا `"ascii"`. |
@@ -405,7 +479,7 @@ Usage of gemsub:
 | سیاست | فیلدهای پیکربندی | رفتار اجرایی |
 | :--- | :--- | :--- |
 | **Hot-Reloadable** | `sources`<br>`fetch_interval`<br>`probe_limit`<br>`flag_mode`<br>`serve.format`<br>`test.health_url`<br>`test.health_timeout`<br>`test.gemini.url`<br>`test.gemini.block_phrases`<br>`test.timeout`<br>`test.dial_timeout`<br>`test.concurrency`<br>`test.rate_limit_rps`<br>`test.max_retries`<br>`test.retry_backoff`<br>`test.max_inconclusive_cycles`<br>`publishing.enabled`<br>`publishing.repository`<br>`publishing.branch`<br>`publishing.remote_url` | به‌محض ذخیره، بلافاصله در زیرسیستم‌های فعال (Scheduler، Tester، Subserver، Publisher) بدون نیاز به توقف و ری‌استارت اعمال می‌شوند. |
-| **Restart Required** | `serve.listen`<br>`serve.path`<br>`state_file`<br>`headless` | تنظیمات بلافاصله در `config.json` ذخیره می‌شوند؛ اما در مرکز پیکربندی به‌عنوان نیازمند ری‌استارت علامت می‌خورند زیرا سوکت‌های شبکه، مسیر اسنپ‌شات و حالت پردازش در زمان اجرا بدون ایجاد ریسک قابل تغییر مجدد نیستند. |
+| **Restart Required** | `serve.listen`<br>`serve.path`<br>`state_file`<br>`headless` | تنظیمات بلافاصله در فایل پیکربندی فعال ذخیره می‌شوند؛ اما در مرکز پیکربندی به‌عنوان نیازمند ری‌استارت علامت می‌خورند زیرا سوکت‌های شبکه، مسیر اسنپ‌شات و حالت پردازش در زمان اجرا بدون ایجاد ریسک قابل تغییر مجدد نیستند. |
 
 ---
 
@@ -535,8 +609,12 @@ curl -s "http://127.0.0.1:8765/healthz"
 
 ## ماندگاری وضعیت (State Persistence)
 
-- وضعیت داده‌ها در فایل مشخص‌شده در `state_file` (پیش‌فرض `./gemsub_state.json`) ذخیره شده و به‌طور خودکار با فرمت gzip به‌شکل `./gemsub_state.json.gz` فشرده می‌شود.
-- نوشتن فایل ابتدا روی یک فایل موقت انجام شده و سپس با تغییر نام اتمیک جایگزین می‌گردد تا از خرابی داده‌ها در اثر قطع ناگهانی برق یا کرش جلوگیری شود.
+- تاریخچه ارزیابی کاندیداها، امتیازات پایداری و نمونه‌های سلامت شبکه در وضعیت زمان اجرا نگهداری شده و کاملاً از پیکربندی کاربر تفکیک شده‌اند.
+- وضعیت داده‌ها در فایل مشخص‌شده در `state_file` ذخیره می‌شود. در صورت خالی ماندن (`""`، توصیه می‌شود)، مسیر استاندارد پلتفرم استفاده خواهد شد:
+  - **لینوکس / یونیکس:** در صورت تنظیم بودن `$XDG_STATE_HOME` با یک مسیر مطلق، مسیر `$XDG_STATE_HOME/gemsub/state.json.gz` استفاده می‌شود؛ در صورت خالی بودن، تنظیم نشدن یا نسبی بودن، مسیر پیش‌فرض `$HOME/.local/state/gemsub/state.json.gz` به کار می‌رود.
+  - **ویندوز:** مسیر `%LocalAppData%\gemsub\state.json.gz` (دایرکتوری داده‌های محلی کاربر Local AppData).
+- اگر مسیر صریحی در `state_file` تعریف شود، عیناً استفاده شده (مسیرهای نسبی نسبت به دایرکتوری جاری در نظر گرفته می‌شوند) و با پسوند `.gz` ذخیره می‌گردد.
+- نوشتن فایل ابتدا روی یک فایل موقت انجام شده و سپس با تغییر نام اتمیک جایگزین می‌گردد تا از خرابی داده‌ها در اثر قطع ناگهانی برق یا کرش جلوگیری شود. دایرکتوری‌های والد به‌صورت خودکار با مجوزهای امن (`0o700` در یونیکس) ایجاد می‌شوند.
 - در زمان راه‌اندازی، برنامه وضعیت کاندیداها، امتیازات پایداری و نمونه‌های تاریخی را قبل از شروع چرخه‌های جدید بازیابی می‌کند. کاندیداهای معتبرِ بازیابی‌شده بلافاصله در دسترس ساب‌سرور قرار می‌گیرند و کلاینت‌ها نیازی به صبر کردن برای اتمام اولین چرخه نخواهند داشت.
 
 ---

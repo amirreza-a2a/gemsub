@@ -66,11 +66,22 @@ Upstream Sources (HTTP URLs / Local Files)
       /sub/gemini, /healthz)            meta.json)
 ```
 
-Хранилище **Store** является единственным авторитетным источником состояния кандидатов, их работоспособности, оценки надежности и принадлежности к проекциям. Слои представления (TUI) и доставки (Subserver, Publisher) используют эти канонические проекции напрямую, не дублируя логику классификации или ранжирования.
+Компонент **Store** является единым достоверным источником состояния кандидатов, их работоспособности, скоринга и принадлежности к проекциям. Уровни представления (интерфейс TUI) и доставки (сервер подписок Subserver, модуль публикации Publisher) используют эти проекции напрямую, не дублируя логику классификации или ранжирования.
+
+### Разделение файловой системы и уровней (Filesystem & Layout Separation)
+
+`gemsub` строго разделяет бинарные файлы, пользовательскую конфигурацию и состояние времени выполнения:
+
+| Компонент | Путь по умолчанию (Linux) | Путь по умолчанию (Windows) | Назначение |
+| :--- | :--- | :--- | :--- |
+| **Бинарный файл** | `~/.local/bin/gemsub`<br>или `/usr/local/bin/gemsub` | `.\gemsub.exe`<br>или каталог в `%PATH%` | Исполняемый файл приложения. |
+| **Конфигурация** | `~/.config/gemsub/config.json` | `%AppData%\gemsub\config.json` | Настройки пользователя (`sources`, порт сервера, интервалы проверок). |
+| **Состояние рантайма** | `~/.local/state/gemsub/state.json.gz` | `%LocalAppData%\gemsub\state.json.gz` | Достоверная история проверок кандидатов, оценки надежности и метрики сети. |
+| **Явное переопределение** | `gemsub -config <path>` | `.\gemsub.exe -config <path>` | Опциональное переопределение через CLI; относительные пути разрешаются относительно текущего рабочего каталога (CWD). |
 
 ---
 
-## Быстрый старт
+## Быстрый старт (Quick Start)
 
 ### 1. Интерактивный первый запуск (Onboarding Wizard)
 
@@ -85,11 +96,11 @@ gemsub
 2. **Primary Subscription Source:** Добавление и валидация первого входящего URL подписки.
 3. **Local Subserver Setup:** Настройка локального адреса прослушивания (по умолчанию `127.0.0.1:8765`) и пути к подписке (по умолчанию `/sub`).
 4. **Testing & Gemini Defaults:** Настройка параллелизма проверок, таймаутов и целевых URL.
-5. **Review & Save:** Проверка параметров, атомарное сохранение в `config.json` и мгновенный запуск фонового цикла тестирования.
+5. **Review & Save:** Проверка параметров, атомарное сохранение в стандартный канонический путь конфигурации (`~/.config/gemsub/config.json` в Linux, `%AppData%\gemsub\config.json` в Windows) и мгновенный запуск фонового цикла тестирования.
 
 ### 2. Первый запуск в фоновом режиме (Headless)
 
-В режиме без интерфейса наличие файла конфигурации обязательно. Если файл `config.json` отсутствует:
+В режиме без интерфейса наличие файла конфигурации обязательно. Если конфигурационный файл отсутствует по стандартному пути:
 
 ```bash
 gemsub -headless
@@ -98,28 +109,49 @@ gemsub -headless
 `gemsub` завершит работу с кодом 1 и выведет подсказку:
 
 ```text
-Configuration file not found: ./config.json
+Configuration file not found: /home/user/.config/gemsub/config.json
 
 To configure gemsub:
   1. Run gemsub interactively without --headless to launch the onboarding wizard: gemsub
-  2. Or create ./config.json manually by copying config.example.json:
-     cp config.example.json ./config.json
+  2. Or create /home/user/.config/gemsub/config.json manually by copying config.example.json:
+     mkdir -p ~/.config/gemsub && cp config.example.json ~/.config/gemsub/config.json
+```
+
+В Windows (PowerShell 7+):
+```powershell
+New-Item -ItemType Directory -Force "$env:APPDATA\gemsub"
+Copy-Item config.example.json "$env:APPDATA\gemsub\config.json"
 ```
 
 ### 3. Ручная настройка
 
-Вы также можете создать конфигурационный файл вручную из примера:
+Вы также можете создать конфигурационный файл вручную по каноническому пути:
 
 ```bash
-cp config.example.json config.json
-gemsub -config config.json
+mkdir -p ~/.config/gemsub
+cp config.example.json ~/.config/gemsub/config.json
+gemsub
 ```
 
-Либо сразу запустить программу как фоновый демон:
+Либо запустить в фоновом режиме со стандартной конфигурацией:
 
 ```bash
-gemsub -headless -config config.json
+gemsub -headless
 ```
+
+#### Явное переопределение пути к конфигурации
+Чтобы использовать конфигурационный файл по произвольному пути, укажите флаг `-config`:
+
+```bash
+# Относительный путь (остается относительным к текущему каталогу вызова CWD)
+gemsub -config ./my-config.json
+
+# Абсолютный путь
+gemsub -headless -config /etc/gemsub/config.json
+```
+
+> [!NOTE]
+> Пути, переданные через флаг `-config`, используются буквально (verbatim) и не разрешаются через стандартные каталоги XDG или AppData. Относительные пути разрешаются относительно текущего рабочего каталога.
 
 После запуска проверенные ленты подписок сразу же становятся доступны:
 
@@ -205,6 +237,41 @@ curl -sSfL https://raw.githubusercontent.com/amirreza-a2a/gemsub/main/scripts/in
 
 ---
 
+### Windows
+
+Официальные автономные zip-архивы доступны для 64-битных систем Windows на архитектурах x86_64 и ARM64.
+
+#### Ручная установка
+
+1. Скачайте архив релиза для вашей архитектуры со страницы релизов GitHub:
+   - `x86_64` (64-битные процессоры Intel/AMD): `gemsub_Windows_x86_64.zip`
+   - `arm64` (64-битные процессоры ARM): `gemsub_Windows_arm64.zip`
+2. Скачайте `checksums.txt` и проверьте хеш SHA-256 в PowerShell:
+   ```powershell
+   Get-FileHash .\gemsub_Windows_x86_64.zip -Algorithm SHA256
+   ```
+3. Распакуйте архив:
+   ```powershell
+   Expand-Archive .\gemsub_Windows_x86_64.zip -DestinationPath .\gemsub
+   cd .\gemsub
+   ```
+4. Запустите `gemsub.exe` в Windows Terminal или PowerShell:
+   ```powershell
+   # Интерактивный режим (мастер настройки или TUI, сохранение в %AppData%\gemsub\config.json)
+   .\gemsub.exe
+
+   # Фоновый режим (использует стандартный путь %AppData%\gemsub\config.json)
+   .\gemsub.exe -headless
+
+   # Фоновый режим с явным переопределением пути к файлу конфигурации
+   .\gemsub.exe -headless -config .\config.json
+   ```
+
+> [!NOTE]
+> **Требование для Git-публикации:** Если включена автоматическая публикация в Git (`publishing.enabled: true` или `-publish`), в системе должен быть установлен [Git for Windows](https://git-scm.com/download/win), доступный через переменную окружения `%PATH%`.
+
+---
+
 ### Сборка из исходного кода
 
 #### Требования
@@ -232,7 +299,7 @@ make build
 ```text
 Usage of gemsub:
   -config string
-        path to config file (default "./config.json")
+        path to config file
   -flag-mode string
         country flag presentation mode: auto, unicode, ascii
   -headless
@@ -245,6 +312,9 @@ Usage of gemsub:
   -version
         print version information and exit
 ```
+
+> [!NOTE]
+> Если флаг `-config` не указан, `gemsub` разрешает стандартный канонический путь пользователя для текущей платформы. При передаче явного значения `-config <path>` переданный путь используется буквально (относительные пути рассчитываются относительно каталога вызова).
 
 ---
 
@@ -320,7 +390,11 @@ TUI обеспечивает мониторинг в реальном време
 
 ## Конфигурация
 
-Конфигурация хранится в формате JSON (по умолчанию `./config.json`). Шаблон с комментариями представлен в файле `config.example.json`.
+Конфигурация хранится в формате JSON. Если путь не задан явно с помощью флага `-config`, `gemsub` разрешает канонический путь пользователя:
+- **Linux / Unix:** `$XDG_CONFIG_HOME/gemsub/config.json`, если переменная `$XDG_CONFIG_HOME` содержит абсолютный путь; если переменная не задана, пуста или содержит относительный путь, используется путь по умолчанию `$HOME/.config/gemsub/config.json`.
+- **Windows:** `%AppData%\gemsub\config.json` (каталог перемещаемых данных пользователя Roaming AppData).
+
+Шаблон представлен в файле `config.example.json`.
 
 ```json
 {
@@ -362,7 +436,7 @@ TUI обеспечивает мониторинг в реальном време
     "branch": "main",
     "remote_url": "git@github.com:your-user/your-subscriptions.git"
   },
-  "state_file": "./gemsub_state.json",
+  "state_file": "",
   "headless": false,
   "probe_limit": 0,
   "flag_mode": "auto"
@@ -393,7 +467,7 @@ TUI обеспечивает мониторинг в реальном време
 | `publishing.repository` | `string` | `""` | Локальный путь к целевому репозиторию Git (обязателен при включенной публикации). |
 | `publishing.branch` | `string` | `"main"` | Ветка Git для фиксации коммитов публикации. |
 | `publishing.remote_url` | `string` | `""` | URL удаленного репозитория Git для проверки безопасности источника origin (обязателен при включенной публикации). |
-| `state_file` | `string` | `"./gemsub_state.json"` | Путь к файлу снапшота состояния (автоматически сохраняется в сжатом виде с расширением `.json.gz`). |
+| `state_file` | `string` | `""` | Путь к файлу снапшота состояния (автоматически сохраняется в сжатом виде с расширением `.json.gz`). Если пусто (`""`), используется канонический путь платформы (`~/.local/state/gemsub/state.json.gz` в Linux, `%LocalAppData%\gemsub\state.json.gz` в Windows). Явно указанный непустой путь сохраняется буквально. |
 | `headless` | `bool` | `false` | Режим работы по умолчанию (`true` — запуск без графического интерфейса TUI). |
 | `probe_limit` | `int` | `0` | Лимит количества проверяемых кандидатов за один цикл (`0` — проверять всех). |
 | `flag_mode` | `string` | `"auto"` | Режим отображения флагов стран в TUI: `"auto"`, `"unicode"` или `"ascii"`. |
@@ -405,7 +479,7 @@ TUI обеспечивает мониторинг в реальном време
 | Политика | Параметры конфигурации | Поведение |
 | :--- | :--- | :--- |
 | **Hot-Reloadable** | `sources`<br>`fetch_interval`<br>`probe_limit`<br>`flag_mode`<br>`serve.format`<br>`test.health_url`<br>`test.health_timeout`<br>`test.gemini.url`<br>`test.gemini.block_phrases`<br>`test.timeout`<br>`test.dial_timeout`<br>`test.concurrency`<br>`test.rate_limit_rps`<br>`test.max_retries`<br>`test.retry_backoff`<br>`test.max_inconclusive_cycles`<br>`publishing.enabled`<br>`publishing.repository`<br>`publishing.branch`<br>`publishing.remote_url` | Применяются сразу после сохранения во всех запущенных подсистемах (Scheduler, Tester, Subserver, Publisher) без перезапуска процесса. |
-| **Restart Required** | `serve.listen`<br>`serve.path`<br>`state_file`<br>`headless` | Немедленно записываются в `config.json`, но помечаются в центре конфигурации как ожидающие перезапуска, поскольку открытые сокеты, пути к снапшотам и режим процесса невозможно безопасно переинициализировать на лету. |
+| **Restart Required** | `serve.listen`<br>`serve.path`<br>`state_file`<br>`headless` | Немедленно записываются в активный файл конфигурации, но помечаются в центре конфигурации как ожидающие перезапуска, поскольку открытые сокеты, пути к снапшотам и режим процесса невозможно безопасно переинициализировать на лету. |
 
 ---
 
@@ -535,8 +609,12 @@ curl -s "http://127.0.0.1:8765/healthz"
 
 ## Сохранение состояния (State Persistence)
 
-- Состояние сохраняется в файл, указанный в `state_file` (по умолчанию `./gemsub_state.json`), и автоматически сжимается с помощью gzip в файл `./gemsub_state.json.gz`.
-- Запись производится во временный файл с последующим атомарным переименованием, что исключает повреждение данных при внезапном сбое питания или остановке процесса.
+- История проверок кандидатов, оценки надежности и метрики сети хранятся в состоянии времени выполнения и строго отделены от пользовательской конфигурации.
+- Состояние сохраняется в файл, указанный в `state_file`. Если значение не заполнено (`""`, рекомендуется), используется канонический путь платформы:
+  - **Linux / Unix:** `$XDG_STATE_HOME/gemsub/state.json.gz`, если переменная `$XDG_STATE_HOME` содержит абсолютный путь; если переменная не задана, пуста или содержит относительный путь, используется путь по умолчанию `$HOME/.local/state/gemsub/state.json.gz`.
+  - **Windows:** `%LocalAppData%\gemsub\state.json.gz` (каталог локальных данных пользователя Local AppData).
+- Если в `state_file` задан явный путь, он используется буквально (относительные пути рассчитываются относительно CWD) и сохраняется со сжатием `.gz`.
+- Запись производится во временный файл с последующим атомарным переименованием, что исключает повреждение данных при внезапном сбое питания или остановке процесса. Родительские каталоги создаются автоматически с безопасными правами доступа (`0o700` в Unix).
 - При запуске программа восстанавливает историю, оценки надежности и список узлов до начала нового цикла тестирования. Восстановленные рабочие узлы сразу же становятся доступны для клиентов через сервер подписок.
 
 ---
