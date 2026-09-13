@@ -1,27 +1,20 @@
 // Package parser turns share links (vless://, vmess://, trojan://,
-// ss://) into sing-box outbound option structs that internal/tester
-// can dial through directly, without ever shelling out to an
-// external sing-box process.
-//
-// NOTE: this file depends on github.com/sagernet/sing-box/option,
-// which this sandbox cannot fetch (its dependency tree pulls in
-// golang.org/x/... packages from a host not reachable here). The
-// field names below match the option package's public API as
-// documented at https://sing-box.sagernet.org/configuration/outbound/
-// but have not been compiled against the real module. Run
-// `go mod tidy && go build ./...` after fetching dependencies and
-// fix any field-name drift against your installed sing-box version
-// before relying on this.
+// ss://, hysteria2://, hy2://, tuic://) into sing-box outbound option
+// structs that internal/tester can dial through directly, without ever
+// shelling out to an external sing-box process.
 package parser
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/gofrs/uuid/v5"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
 )
@@ -52,6 +45,10 @@ func Parse(link string) (Candidate, error) {
 		outbound, warnings, err = parseURIStyle(link, "trojan")
 	case strings.HasPrefix(link, "ss://"):
 		outbound, err = parseShadowsocks(link)
+	case strings.HasPrefix(link, "hysteria2://"), strings.HasPrefix(link, "hy2://"):
+		outbound, warnings, err = parseHysteria2(link)
+	case strings.HasPrefix(link, "tuic://"):
+		outbound, warnings, err = parseTUIC(link)
 	default:
 		return Candidate{}, fmt.Errorf("unsupported scheme in %q", link)
 	}
@@ -393,4 +390,444 @@ func b64Decode(s string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+// --- hysteria2 / hy2 ---
+
+func parseHysteria2(link string) (option.Outbound, []string, error) {
+	var prefix string
+	if strings.HasPrefix(link, "hysteria2://") {
+		prefix = "hysteria2://"
+	} else if strings.HasPrefix(link, "hy2://") {
+		prefix = "hy2://"
+	} else {
+		return option.Outbound{}, nil, fmt.Errorf("unsupported scheme in %q", link)
+	}
+
+	userinfo, host, portPart, rawQuery, err := splitURI(link, prefix)
+	if err != nil {
+		return option.Outbound{}, nil, fmt.Errorf("hysteria2: %w", err)
+	}
+
+	rawQuery = strings.ReplaceAll(rawQuery, "&amp;", "&")
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return option.Outbound{}, nil, fmt.Errorf("hysteria2: query: %w", err)
+	}
+
+	password := userinfo
+	if password == "" {
+		password = q.Get("auth")
+	}
+
+	opts := option.Hysteria2OutboundOptions{
+		ServerOptions: option.ServerOptions{
+			Server: host,
+		},
+		Password: password,
+	}
+
+	mport := q.Get("mport")
+	if mport == "" {
+		mport = q.Get("ports")
+	}
+
+	if mport != "" {
+		ports, err := parsePortHopping(mport)
+		if err != nil {
+			return option.Outbound{}, nil, fmt.Errorf("hysteria2: mport: %w", err)
+		}
+		opts.ServerPorts = badoption.Listable[string](ports)
+	} else if portPart != "" {
+		if strings.Contains(portPart, ",") || strings.Contains(portPart, "-") || strings.Contains(portPart, ":") {
+			ports, err := parsePortHopping(portPart)
+			if err != nil {
+				return option.Outbound{}, nil, fmt.Errorf("hysteria2: port: %w", err)
+			}
+			opts.ServerPorts = badoption.Listable[string](ports)
+		} else {
+			p, err := strconv.ParseUint(portPart, 10, 16)
+			if err != nil || p == 0 {
+				return option.Outbound{}, nil, fmt.Errorf("hysteria2: invalid port %q", portPart)
+			}
+			opts.ServerPort = uint16(p)
+		}
+	} else {
+		opts.ServerPort = 443
+	}
+
+	obfs := q.Get("obfs")
+	obfsPassword := q.Get("obfs-password")
+	if obfs != "" || obfsPassword != "" {
+		if obfs == "" {
+			return option.Outbound{}, nil, fmt.Errorf("hysteria2: missing obfs type")
+		}
+		if obfsPassword == "" {
+			return option.Outbound{}, nil, fmt.Errorf("hysteria2: missing obfs-password")
+		}
+		switch obfs {
+		case "salamander", "gecko":
+			opts.Obfs = &option.Hysteria2Obfs{
+				Type:     obfs,
+				Password: obfsPassword,
+			}
+		default:
+			return option.Outbound{}, nil, fmt.Errorf("hysteria2: unsupported obfs type %q", obfs)
+		}
+	}
+
+	sni := q.Get("sni")
+	if sni == "" {
+		sni = host
+	}
+
+	insecure := false
+	insecureVal := q.Get("insecure")
+	if insecureVal == "" {
+		insecureVal = q.Get("allow_insecure")
+	}
+	if insecureVal == "" {
+		insecureVal = q.Get("allowInsecure")
+	}
+	if insecureVal != "" {
+		b, err := parseBoolParam(insecureVal)
+		if err != nil {
+			return option.Outbound{}, nil, fmt.Errorf("hysteria2: insecure: %w", err)
+		}
+		insecure = b
+	}
+
+	tlsOpts := &option.OutboundTLSOptions{
+		Enabled:    true,
+		ServerName: sni,
+		Insecure:   insecure,
+	}
+
+	if pin := q.Get("pinSHA256"); pin != "" {
+		var rawPin []byte
+		pinClean := strings.TrimSpace(pin)
+		if b, err := hex.DecodeString(pinClean); err == nil && len(b) == 32 {
+			rawPin = b
+		} else if b, err := base64.StdEncoding.DecodeString(pinClean); err == nil && len(b) == 32 {
+			rawPin = b
+		} else if b, err := base64.RawStdEncoding.DecodeString(pinClean); err == nil && len(b) == 32 {
+			rawPin = b
+		} else {
+			if b, err := hex.DecodeString(pinClean); err == nil {
+				rawPin = b
+			} else {
+				return option.Outbound{}, nil, fmt.Errorf("hysteria2: invalid pinSHA256 %q", pin)
+			}
+		}
+		tlsOpts.CertificatePublicKeySHA256 = badoption.Listable[[]byte]{rawPin}
+	}
+
+	if alpnStr := q.Get("alpn"); alpnStr != "" {
+		var alpnList []string
+		for _, a := range strings.Split(alpnStr, ",") {
+			if a = strings.TrimSpace(a); a != "" {
+				alpnList = append(alpnList, a)
+			}
+		}
+		if len(alpnList) > 0 {
+			tlsOpts.ALPN = badoption.Listable[string](alpnList)
+		}
+	}
+
+	opts.TLS = tlsOpts
+
+	return option.Outbound{
+		Type:    "hysteria2",
+		Options: &opts,
+	}, nil, nil
+}
+
+// --- tuic ---
+
+func parseTUIC(link string) (option.Outbound, []string, error) {
+	if !strings.HasPrefix(link, "tuic://") {
+		return option.Outbound{}, nil, fmt.Errorf("unsupported scheme in %q", link)
+	}
+
+	userinfo, host, portPart, rawQuery, err := splitURI(link, "tuic://")
+	if err != nil {
+		return option.Outbound{}, nil, fmt.Errorf("tuic: %w", err)
+	}
+
+	parts := strings.SplitN(userinfo, ":", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return option.Outbound{}, nil, fmt.Errorf("tuic: invalid userinfo: expected <uuid>:<password>")
+	}
+	rawUUID, password := parts[0], parts[1]
+
+	parsedUUID, err := uuid.FromString(rawUUID)
+	if err != nil {
+		return option.Outbound{}, nil, fmt.Errorf("tuic: invalid userinfo: expected <uuid>:<password>")
+	}
+
+	if portPart == "" {
+		return option.Outbound{}, nil, fmt.Errorf("tuic: missing port in %q", link)
+	}
+	port, err := strconv.ParseUint(portPart, 10, 16)
+	if err != nil || port == 0 {
+		return option.Outbound{}, nil, fmt.Errorf("tuic: invalid port %q", portPart)
+	}
+
+	rawQuery = strings.ReplaceAll(rawQuery, "&amp;", "&")
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return option.Outbound{}, nil, fmt.Errorf("tuic: query: %w", err)
+	}
+
+	opts := option.TUICOutboundOptions{
+		ServerOptions: option.ServerOptions{
+			Server:     host,
+			ServerPort: uint16(port),
+		},
+		UUID:     parsedUUID.String(),
+		Password: password,
+	}
+
+	cc := q.Get("congestion_control")
+	if cc == "" {
+		cc = q.Get("congestion-controller")
+	}
+	if cc != "" {
+		switch strings.ToLower(cc) {
+		case "bbr", "cubic", "new_reno":
+			opts.CongestionControl = strings.ToLower(cc)
+		default:
+			return option.Outbound{}, nil, fmt.Errorf("tuic: invalid congestion_control %q", cc)
+		}
+	}
+
+	udpRelay := q.Get("udp_relay_mode")
+	if udpRelay == "" {
+		udpRelay = q.Get("udp-relay-mode")
+	}
+	if udpRelay != "" {
+		switch strings.ToLower(udpRelay) {
+		case "native", "quic":
+			opts.UDPRelayMode = strings.ToLower(udpRelay)
+		default:
+			return option.Outbound{}, nil, fmt.Errorf("tuic: invalid udp_relay_mode %q", udpRelay)
+		}
+	}
+
+	udpStream := q.Get("udp_over_stream")
+	if udpStream == "" {
+		udpStream = q.Get("udp-over-stream")
+	}
+	if udpStream != "" {
+		b, err := parseBoolParam(udpStream)
+		if err != nil {
+			return option.Outbound{}, nil, fmt.Errorf("tuic: udp_over_stream: %w", err)
+		}
+		opts.UDPOverStream = b
+	}
+	if opts.UDPOverStream && opts.UDPRelayMode != "" {
+		return option.Outbound{}, nil, fmt.Errorf("tuic: udp_over_stream conflicts with udp_relay_mode")
+	}
+
+	zeroRTT := q.Get("zero_rtt_handshake")
+	if zeroRTT == "" {
+		zeroRTT = q.Get("reduce_rtt")
+	}
+	if zeroRTT == "" {
+		zeroRTT = q.Get("zero-rtt-handshake")
+	}
+	if zeroRTT != "" {
+		b, err := parseBoolParam(zeroRTT)
+		if err != nil {
+			return option.Outbound{}, nil, fmt.Errorf("tuic: zero_rtt_handshake: %w", err)
+		}
+		opts.ZeroRTTHandshake = b
+	}
+
+	hb := q.Get("heartbeat")
+	if hb == "" {
+		hb = q.Get("heartbeat-interval")
+	}
+	if hb != "" {
+		d, err := time.ParseDuration(hb)
+		if err != nil {
+			if sec, errSec := strconv.Atoi(hb); errSec == nil && sec > 0 {
+				d = time.Duration(sec) * time.Second
+			} else {
+				return option.Outbound{}, nil, fmt.Errorf("tuic: invalid heartbeat %q: %w", hb, err)
+			}
+		}
+		opts.Heartbeat = badoption.Duration(d)
+	}
+
+	sni := q.Get("sni")
+	if sni == "" {
+		sni = q.Get("peer")
+	}
+	disableSNI := q.Get("disable_sni")
+	if disableSNI == "" {
+		disableSNI = q.Get("disable-sni")
+	}
+	if disableSNI != "" {
+		b, err := parseBoolParam(disableSNI)
+		if err != nil {
+			return option.Outbound{}, nil, fmt.Errorf("tuic: disable_sni: %w", err)
+		}
+		if b {
+			sni = ""
+		} else if sni == "" {
+			sni = host
+		}
+	} else if sni == "" {
+		sni = host
+	}
+
+	insecure := false
+	insecureVal := q.Get("allow_insecure")
+	if insecureVal == "" {
+		insecureVal = q.Get("insecure")
+	}
+	if insecureVal == "" {
+		insecureVal = q.Get("allowInsecure")
+	}
+	if insecureVal == "" {
+		insecureVal = q.Get("skip-cert-verify")
+	}
+	if insecureVal != "" {
+		b, err := parseBoolParam(insecureVal)
+		if err != nil {
+			return option.Outbound{}, nil, fmt.Errorf("tuic: allow_insecure: %w", err)
+		}
+		insecure = b
+	}
+
+	alpnList := []string{"h3"}
+	if alpnStr := q.Get("alpn"); alpnStr != "" {
+		var parsedALPN []string
+		for _, a := range strings.Split(alpnStr, ",") {
+			if a = strings.TrimSpace(a); a != "" {
+				parsedALPN = append(parsedALPN, a)
+			}
+		}
+		if len(parsedALPN) > 0 {
+			alpnList = parsedALPN
+		}
+	}
+
+	opts.TLS = &option.OutboundTLSOptions{
+		Enabled:    true,
+		ServerName: sni,
+		Insecure:   insecure,
+		ALPN:       badoption.Listable[string](alpnList),
+	}
+
+	return option.Outbound{
+		Type:    "tuic",
+		Options: &opts,
+	}, nil, nil
+}
+
+// splitURI splits a URI without relying on url.Parse's host-port digit checks,
+// handling IPv6 brackets, multi-port ranges, userinfo, and trailing query/fragment.
+func splitURI(link, prefix string) (userinfo, host, portPart, rawQuery string, err error) {
+	raw := strings.TrimPrefix(link, prefix)
+	if i := strings.Index(raw, "#"); i >= 0 {
+		raw = raw[:i]
+	}
+	if i := strings.Index(raw, "?"); i >= 0 {
+		rawQuery = raw[i+1:]
+		raw = raw[:i]
+	}
+	raw = strings.TrimSuffix(raw, "/")
+
+	if at := strings.LastIndex(raw, "@"); at >= 0 {
+		userinfo = raw[:at]
+		raw = raw[at+1:]
+	}
+
+	if unescaped, err := url.PathUnescape(userinfo); err == nil {
+		userinfo = unescaped
+	}
+
+	if strings.HasPrefix(raw, "[") {
+		endBracket := strings.Index(raw, "]")
+		if endBracket < 0 {
+			return "", "", "", "", fmt.Errorf("malformed ipv6 address in %q", raw)
+		}
+		host = raw[1:endBracket]
+		rest := raw[endBracket+1:]
+		if strings.HasPrefix(rest, ":") {
+			portPart = rest[1:]
+		} else if rest != "" {
+			return "", "", "", "", fmt.Errorf("malformed authority %q", raw)
+		}
+	} else {
+		colon := strings.Index(raw, ":")
+		if colon >= 0 {
+			host = raw[:colon]
+			portPart = raw[colon+1:]
+		} else {
+			host = raw
+		}
+	}
+
+	if host == "" {
+		return "", "", "", "", fmt.Errorf("missing host in %q", link)
+	}
+
+	return userinfo, host, portPart, rawQuery, nil
+}
+
+func parseBoolParam(val string) (bool, error) {
+	switch strings.ToLower(val) {
+	case "1", "true", "yes":
+		return true, nil
+	case "0", "false", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean value %q", val)
+	}
+}
+
+func parsePortHopping(s string) ([]string, error) {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "-") {
+			rangeParts := strings.Split(part, "-")
+			if len(rangeParts) != 2 {
+				return nil, fmt.Errorf("bad port range: %q", part)
+			}
+			start, err1 := strconv.ParseUint(strings.TrimSpace(rangeParts[0]), 10, 16)
+			end, err2 := strconv.ParseUint(strings.TrimSpace(rangeParts[1]), 10, 16)
+			if err1 != nil || err2 != nil || start == 0 || end == 0 || start > end {
+				return nil, fmt.Errorf("bad port range: %q", part)
+			}
+			out = append(out, fmt.Sprintf("%d:%d", start, end))
+		} else if strings.Contains(part, ":") {
+			rangeParts := strings.Split(part, ":")
+			if len(rangeParts) != 2 {
+				return nil, fmt.Errorf("bad port range: %q", part)
+			}
+			start, err1 := strconv.ParseUint(strings.TrimSpace(rangeParts[0]), 10, 16)
+			end, err2 := strconv.ParseUint(strings.TrimSpace(rangeParts[1]), 10, 16)
+			if err1 != nil || err2 != nil || start == 0 || end == 0 || start > end {
+				return nil, fmt.Errorf("bad port range: %q", part)
+			}
+			out = append(out, fmt.Sprintf("%d:%d", start, end))
+		} else {
+			p, err := strconv.ParseUint(part, 10, 16)
+			if err != nil || p == 0 {
+				return nil, fmt.Errorf("bad port: %q", part)
+			}
+			out = append(out, fmt.Sprintf("%d", p))
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty port list")
+	}
+	return out, nil
 }

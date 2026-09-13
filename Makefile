@@ -5,10 +5,10 @@ BINARY := gemsub
 all: build
 
 build:
-	go build -tags with_utls -ldflags "-s -w" -o $(BINARY) ./cmd/gemsub
+	go build -tags "with_utls with_quic" -ldflags "-s -w" -o $(BINARY) ./cmd/gemsub
 
 test:
-	go test -tags with_utls -count=1 ./...
+	go test -tags "with_utls with_quic" -count=1 ./...
 
 clean:
 	rm -f $(BINARY)
