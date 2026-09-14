@@ -272,6 +272,39 @@ func TestProbe_DialConnectionRefused(t *testing.T) {
 	}
 }
 
+// 7b. Dial/Transport Failure (Connection Reset / EOF / Server Closed Idle Connection)
+func TestProbe_ConnectionReset(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"io.EOF", io.EOF},
+		{"connection reset by peer", errors.New("read tcp: connection reset by peer")},
+		{"broken pipe", errors.New("write: broken pipe")},
+		{"server closed idle connection", errors.New("http: server closed idle connection")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return nil, tc.err
+			}
+
+			res := transport.Probe(context.Background(), dialFn, transport.Config{
+				HealthURL:     "http://127.0.0.1:1/generate_204",
+				HealthTimeout: 2 * time.Second,
+			})
+
+			if res.OK {
+				t.Fatal("expected OK=false on reset error, got true")
+			}
+			if res.Category != store.ErrReset {
+				t.Errorf("expected ErrReset, got %v (reason: %v)", res.Category, res.Error)
+			}
+		})
+	}
+}
+
 // 8. TLS Failure: verifies both synthetic error mapping and real TLS certificate validation failure
 func TestProbe_TLSFailure(t *testing.T) {
 	t.Run("SyntheticError", func(t *testing.T) {

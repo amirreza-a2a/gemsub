@@ -113,7 +113,7 @@ func ClassifyDialError(err error) ClassificationResult {
 			Reason:    errStr,
 			Retryable: false,
 		}
-	case strings.Contains(lower, "eof") || strings.Contains(lower, "reset by peer") || strings.Contains(lower, "broken pipe"):
+	case strings.Contains(lower, "eof") || strings.Contains(lower, "reset by peer") || strings.Contains(lower, "broken pipe") || strings.Contains(lower, "server closed idle connection"):
 		return ClassificationResult{
 			Status:    store.StatusFailed,
 			Category:  store.ErrReset,

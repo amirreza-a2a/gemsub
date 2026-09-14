@@ -233,7 +233,7 @@ func classifyDialError(err error, ctx context.Context) store.ErrorCategory {
 		return store.ErrReality
 	case strings.Contains(lower, "tls: handshake failure") || strings.Contains(lower, "remote error: tls") || strings.Contains(lower, "x509:"):
 		return store.ErrTLS
-	case strings.Contains(lower, "eof") || strings.Contains(lower, "reset by peer") || strings.Contains(lower, "broken pipe"):
+	case strings.Contains(lower, "eof") || strings.Contains(lower, "reset by peer") || strings.Contains(lower, "broken pipe") || strings.Contains(lower, "server closed idle connection"):
 		return store.ErrReset
 	case strings.Contains(lower, "utls") || strings.Contains(lower, "fingerprint"):
 		return store.ErrConfig

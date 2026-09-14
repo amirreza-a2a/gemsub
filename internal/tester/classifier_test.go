@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -109,6 +110,35 @@ func TestClassifyDialError(t *testing.T) {
 	resReality := tester.ClassifyDialError(errors.New("reality verification failed"))
 	if resReality.Category != store.ErrReality || resReality.Retryable || resReality.Status != store.StatusFailed {
 		t.Errorf("expected non-retryable reality error, got %+v", resReality)
+	}
+}
+
+func TestClassifyDialError_ConnectionReset(t *testing.T) {
+	testCases := []struct {
+		name string
+		err  error
+	}{
+		{"io.EOF", io.EOF},
+		{"io.ErrUnexpectedEOF", io.ErrUnexpectedEOF},
+		{"connection reset by peer", errors.New("read: connection reset by peer")},
+		{"broken pipe", errors.New("write: broken pipe")},
+		{"server closed idle connection plain", errors.New("http: server closed idle connection")},
+		{"wrapped url.Error server closed idle connection", &url.Error{Op: "Get", URL: "http://127.0.0.1:59563/", Err: errors.New("http: server closed idle connection")}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := tester.ClassifyDialError(tc.err)
+			if res.Category != store.ErrReset {
+				t.Errorf("expected category ErrReset, got %s (reason: %q)", res.Category, res.Reason)
+			}
+			if res.Status != store.StatusFailed {
+				t.Errorf("expected StatusFailed, got %s", res.Status)
+			}
+			if res.Retryable {
+				t.Errorf("expected Retryable=false")
+			}
+		})
 	}
 }
 
