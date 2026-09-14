@@ -81,6 +81,10 @@ type Result struct {
 	TransportOK             bool          `json:"transport_ok,omitempty"`
 	TransportLatency        time.Duration `json:"transport_latency,omitempty"`
 	TransportEvidenceKnown  bool          `json:"transport_evidence_known,omitempty"`
+	// Jitter is the sample standard deviation of probe round-trip latencies.
+	// Note: a value of 0 is ambiguous and indicates either zero measurable variation
+	// or that jitter was not measured / had insufficient samples (< 2).
+	Jitter time.Duration `json:"jitter,omitempty"`
 }
 
 // Snapshot is the full persisted state.
@@ -519,6 +523,7 @@ func (s *Store) Load() error {
 			TransportOK:            r.TransportOK,
 			TransportLatency:       r.TransportLatency,
 			TransportEvidenceKnown: r.TransportEvidenceKnown,
+			Jitter:                 r.Jitter,
 		}
 		rec.History.Push(sample)
 
@@ -821,6 +826,10 @@ func writeSnapshotJSON(w io.Writer, snap Snapshot) error {
 		if rec.Latest.TransportEvidenceKnown {
 			scratch = append(scratch, `,"transport_evidence_known":true`...)
 		}
+		if rec.Latest.Jitter > 0 {
+			scratch = append(scratch, `,"jitter":`...)
+			scratch = strconv.AppendInt(scratch, int64(rec.Latest.Jitter), 10)
+		}
 		if len(rec.Latest.Warnings) > 0 {
 			scratch = append(scratch, `,"warnings":[`...)
 			for wIdx, w := range rec.Latest.Warnings {
@@ -870,6 +879,10 @@ func writeSnapshotJSON(w io.Writer, snap Snapshot) error {
 			}
 			if smp.TransportEvidenceKnown {
 				scratch = append(scratch, `,"transport_evidence_known":true`...)
+			}
+			if smp.Jitter > 0 {
+				scratch = append(scratch, `,"jitter":`...)
+				scratch = strconv.AppendInt(scratch, int64(smp.Jitter), 10)
 			}
 			scratch = append(scratch, '}')
 		}
@@ -1457,6 +1470,12 @@ func fastDecodeSnapshot(data []byte) (*Snapshot, bool) {
 													return nil, false
 												}
 												rec.Latest.TransportEvidenceKnown = tek
+											case "jitter":
+												jit, ok := p.parseInt()
+												if !ok {
+													return nil, false
+												}
+												rec.Latest.Jitter = time.Duration(jit)
 											case "warnings":
 												if !p.consume('[') {
 													return nil, false
@@ -1619,6 +1638,12 @@ func fastDecodeSnapshot(data []byte) (*Snapshot, bool) {
 																		return nil, false
 																	}
 																	smp.TransportEvidenceKnown = tek
+																case "jitter":
+																	jit, ok := p.parseInt()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.Jitter = time.Duration(jit)
 																default:
 																	if !p.skipValue() {
 																		return nil, false
@@ -1803,6 +1828,7 @@ func (s *Store) PutWithTransition(r Result) {
 		TransportOK:            r.TransportOK,
 		TransportLatency:       r.TransportLatency,
 		TransportEvidenceKnown: r.TransportEvidenceKnown,
+		Jitter:                 r.Jitter,
 	}
 
 	rec.History.Push(sample)

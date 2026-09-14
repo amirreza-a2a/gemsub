@@ -28,6 +28,7 @@ type TestConfig struct {
 	MaxRetriesRaw         *int         `json:"max_retries,omitempty"` // nil = omitted → default 2; 0 = no retries
 	RetryBackoffRaw       string       `json:"retry_backoff,omitempty"`
 	MaxInconclusiveCycles int          `json:"max_inconclusive_cycles,omitempty"`
+	JitterSamplesRaw      *int         `json:"jitter_samples,omitempty"` // nil = omitted → default 3; 0 = disabled
 
 	// Parsed fields, populated by Validate.
 	HealthTimeout time.Duration `json:"-"`
@@ -35,6 +36,7 @@ type TestConfig struct {
 	DialTimeout   time.Duration `json:"-"`
 	RetryBackoff  time.Duration `json:"-"`
 	MaxRetries    int           `json:"-"` // Resolved retry count: 0 = exactly one attempt
+	JitterSamples int           `json:"-"` // Resolved sample count: 0 = disabled
 }
 
 type ServeConfig struct {
@@ -214,6 +216,14 @@ func (c *Config) Validate() error {
 		c.Test.MaxRetries = *c.Test.MaxRetriesRaw
 	}
 
+	if c.Test.JitterSamplesRaw == nil {
+		c.Test.JitterSamples = 3 // default 3 samples
+	} else if *c.Test.JitterSamplesRaw < 0 {
+		return fmt.Errorf("test.jitter_samples must not be negative, got %d", *c.Test.JitterSamplesRaw)
+	} else {
+		c.Test.JitterSamples = *c.Test.JitterSamplesRaw
+	}
+
 	if c.Test.MaxInconclusiveCycles <= 0 {
 		c.Test.MaxInconclusiveCycles = 2
 	}
@@ -284,6 +294,10 @@ func (t *TestConfig) Clone() *TestConfig {
 	if t.MaxRetriesRaw != nil {
 		v := *t.MaxRetriesRaw
 		cp.MaxRetriesRaw = &v
+	}
+	if t.JitterSamplesRaw != nil {
+		v := *t.JitterSamplesRaw
+		cp.JitterSamplesRaw = &v
 	}
 	return &cp
 }

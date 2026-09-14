@@ -105,6 +105,7 @@ func ProbeWithExecutor(ctx context.Context, cand parser.Candidate, cfg *config.T
 	result.TransportOK = lastClassResult.TransportOK
 	result.TransportLatency = lastClassResult.TransportLatency
 	result.TransportEvidenceKnown = lastClassResult.TransportEvidenceKnown
+	result.Jitter = lastClassResult.Jitter
 
 	// If retries were exhausted on a retryable error, mark as Inconclusive
 	if lastClassResult.Retryable && result.Attempts > maxRetries {
@@ -232,6 +233,40 @@ func executeAttempt(ctx context.Context, cand parser.Candidate, cfg *config.Test
 	classResult.TransportEvidenceKnown = true
 	classResult.TransportOK = true
 	classResult.TransportLatency = tr.Latency
+
+	// Jitter sampling insertion window: Box is still alive and dialFn is valid.
+	if classResult.Status == store.StatusPassed && cfg.JitterSamples > 0 {
+		healthURL := cfg.HealthURL
+		if healthURL == "" {
+			healthURL = transport.DefaultHealthURL
+		}
+		sampleTimeout := 2 * time.Second
+		if cfg.HealthTimeout > 0 && cfg.HealthTimeout < sampleTimeout {
+			sampleTimeout = cfg.HealthTimeout
+		}
+
+		samples := make([]time.Duration, 0, cfg.JitterSamples+1)
+		if tr.Latency > 0 {
+			samples = append(samples, tr.Latency)
+		}
+
+		for s := 0; s < cfg.JitterSamples; s++ {
+			if attemptCtx.Err() != nil {
+				break
+			}
+			sRes := transport.Probe(attemptCtx, dialFn, transport.Config{
+				HealthURL:     healthURL,
+				HealthTimeout: sampleTimeout,
+			})
+			if sRes.OK && sRes.Latency > 0 {
+				samples = append(samples, sRes.Latency)
+			}
+		}
+
+		if len(samples) >= 2 {
+			classResult.Jitter = ComputeSampleStandardDeviation(samples)
+		}
+	}
 
 	return classResult, classResult.Retryable, geminiResult.RetryAfter
 }

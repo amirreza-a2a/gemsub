@@ -472,3 +472,90 @@ func TestConfigJson_LoadsSuccessfully(t *testing.T) {
 		t.Errorf("expected legacy block_phrases to populate Gemini.BlockPhrases")
 	}
 }
+
+func TestJitterSamples_OmittedDefaultsTo3(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Test.JitterSamples != 3 {
+		t.Errorf("expected default JitterSamples=3 when omitted, got %d", cfg.Test.JitterSamples)
+	}
+}
+
+func TestJitterSamples_ExplicitZeroDisables(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	testCfg := cfgMap["test"].(map[string]interface{})
+	testCfg["jitter_samples"] = 0
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Test.JitterSamples != 0 {
+		t.Errorf("expected JitterSamples=0 for explicit zero, got %d", cfg.Test.JitterSamples)
+	}
+}
+
+func TestJitterSamples_ExplicitValue(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	testCfg := cfgMap["test"].(map[string]interface{})
+	testCfg["jitter_samples"] = 5
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Test.JitterSamples != 5 {
+		t.Errorf("expected JitterSamples=5, got %d", cfg.Test.JitterSamples)
+	}
+}
+
+func TestJitterSamples_NegativeReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	testCfg := cfgMap["test"].(map[string]interface{})
+	testCfg["jitter_samples"] = -1
+	path := writeTestConfig(t, dir, cfgMap)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected error for negative jitter_samples, got nil")
+	}
+	if !strings.Contains(err.Error(), "jitter_samples") {
+		t.Errorf("expected error message to mention jitter_samples, got %q", err.Error())
+	}
+}
+
+func TestTestConfig_Clone_DeepCopiesJitterSamplesRaw(t *testing.T) {
+	five := 5
+	tc := &config.TestConfig{
+		JitterSamplesRaw: &five,
+		JitterSamples:    5,
+	}
+
+	cloned := tc.Clone()
+	if cloned == nil {
+		t.Fatal("expected non-nil cloned config")
+	}
+	if cloned.JitterSamplesRaw == tc.JitterSamplesRaw {
+		t.Fatal("expected JitterSamplesRaw pointer to be deep-copied, got identical pointer")
+	}
+	if *cloned.JitterSamplesRaw != 5 {
+		t.Fatalf("expected cloned JitterSamplesRaw value 5, got %d", *cloned.JitterSamplesRaw)
+	}
+
+	// Mutate original and assert clone is unaffected
+	*tc.JitterSamplesRaw = 10
+	if *cloned.JitterSamplesRaw != 5 {
+		t.Errorf("mutating original pointer altered cloned pointer: got %d", *cloned.JitterSamplesRaw)
+	}
+}

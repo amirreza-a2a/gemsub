@@ -19,6 +19,10 @@ type ProbeSample struct {
 	TransportOK            bool          `json:"transport_ok,omitempty"`
 	TransportLatency       time.Duration `json:"transport_latency,omitempty"`
 	TransportEvidenceKnown bool          `json:"transport_evidence_known,omitempty"`
+	// Jitter is the sample standard deviation of probe round-trip latencies.
+	// Note: a value of 0 is ambiguous and indicates either zero measurable variation
+	// or that jitter was not measured / had insufficient samples (< 2).
+	Jitter time.Duration `json:"jitter,omitempty"`
 }
 
 // BoundedHistory is a fixed-capacity circular buffer of probe samples with strict O(1) memory per candidate.

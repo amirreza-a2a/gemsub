@@ -29,6 +29,7 @@ type ClassificationResult struct {
 	TransportOK            bool
 	TransportLatency       time.Duration
 	TransportEvidenceKnown bool
+	Jitter                 time.Duration
 }
 
 // ClassifyDialError determines whether an error encountered during dial or HTTP
