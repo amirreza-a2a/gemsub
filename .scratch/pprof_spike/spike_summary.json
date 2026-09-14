@@ -1,0 +1,20 @@
+{
+  "avg_fresh_samp_ms": 1130.1496666666667,
+  "avg_lifecycle_ms": 3.643,
+  "avg_reused_samp_ms": 1041.464,
+  "avg_spinup_ms": 3.601,
+  "avg_teardown_ms": 0.042,
+  "avg_total_ms": 778.817,
+  "avg_transport_ms": 625.226,
+  "candidates_tested": 60,
+  "concurrency": 40,
+  "connected_count": 6,
+  "pct_box_lifecycle": 0.4678351560423737,
+  "pct_network_io": 99.53216484395763,
+  "pool_wall_time_ms": 9973,
+  "sample_count": 18,
+  "spinup_allocs": 2689,
+  "spinup_bytes": 1012205,
+  "teardown_allocs": 106,
+  "teardown_bytes": 4987
+}

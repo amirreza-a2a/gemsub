@@ -18,3 +18,4 @@ gemini_response.html
 
 # GoReleaser build artifacts
 /dist/
+*.pprof
