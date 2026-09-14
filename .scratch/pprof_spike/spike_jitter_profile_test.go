@@ -22,14 +22,14 @@ import (
 )
 
 type probeTimingRecord struct {
-	link            string
-	status          store.Status
-	transportOK     bool
-	boxSpinUp       time.Duration
-	transportNet    time.Duration
-	geminiNet       time.Duration
-	boxTeardown     time.Duration
-	totalAttempt    time.Duration
+	link         string
+	status       store.Status
+	transportOK  bool
+	boxSpinUp    time.Duration
+	transportNet time.Duration
+	geminiNet    time.Duration
+	boxTeardown  time.Duration
+	totalAttempt time.Duration
 	// Compare N=3 extra samples
 	reusedSamples   [3]time.Duration
 	freshBoxSamples [3]time.Duration
@@ -336,24 +336,24 @@ func TestProfilingSpike_JitterLifecycle(t *testing.T) {
 
 	// Save JSON findings
 	findingsJSON, _ := json.MarshalIndent(map[string]interface{}{
-		"candidates_tested":   n,
-		"concurrency":         cfg.Concurrency,
-		"pool_wall_time_ms":   totalPoolTime.Milliseconds(),
-		"avg_spinup_ms":       float64(avgSpinUp.Microseconds()) / 1000.0,
-		"avg_teardown_ms":     float64(avgTeardown.Microseconds()) / 1000.0,
-		"avg_lifecycle_ms":    float64(avgLifecycle.Microseconds()) / 1000.0,
-		"avg_transport_ms":    float64(avgTransport.Microseconds()) / 1000.0,
-		"avg_total_ms":        float64(avgTotalPerCand.Microseconds()) / 1000.0,
-		"pct_box_lifecycle":   pctLifecycle,
-		"pct_network_io":      pctNetwork,
-		"spinup_allocs":       spinUpAllocs / 10,
-		"spinup_bytes":        spinUpBytes / 10,
-		"teardown_allocs":     teardownAllocs / 10,
-		"teardown_bytes":      teardownBytes / 10,
-		"connected_count":     countTransportOK,
-		"sample_count":        sampleCount,
-		"avg_reused_samp_ms":  float64(sumReusedSample.Microseconds()) / float64(sampleCount) / 1000.0,
-		"avg_fresh_samp_ms":   float64(sumFreshSample.Microseconds()) / float64(sampleCount) / 1000.0,
+		"candidates_tested":  n,
+		"concurrency":        cfg.Concurrency,
+		"pool_wall_time_ms":  totalPoolTime.Milliseconds(),
+		"avg_spinup_ms":      float64(avgSpinUp.Microseconds()) / 1000.0,
+		"avg_teardown_ms":    float64(avgTeardown.Microseconds()) / 1000.0,
+		"avg_lifecycle_ms":   float64(avgLifecycle.Microseconds()) / 1000.0,
+		"avg_transport_ms":   float64(avgTransport.Microseconds()) / 1000.0,
+		"avg_total_ms":       float64(avgTotalPerCand.Microseconds()) / 1000.0,
+		"pct_box_lifecycle":  pctLifecycle,
+		"pct_network_io":     pctNetwork,
+		"spinup_allocs":      spinUpAllocs / 10,
+		"spinup_bytes":       spinUpBytes / 10,
+		"teardown_allocs":    teardownAllocs / 10,
+		"teardown_bytes":     teardownBytes / 10,
+		"connected_count":    countTransportOK,
+		"sample_count":       sampleCount,
+		"avg_reused_samp_ms": float64(sumReusedSample.Microseconds()) / float64(sampleCount) / 1000.0,
+		"avg_fresh_samp_ms":  float64(sumFreshSample.Microseconds()) / float64(sampleCount) / 1000.0,
 	}, "", "  ")
 
 	_ = os.WriteFile(filepath.Join(outDir, "spike_summary.json"), findingsJSON, 0644)
