@@ -995,3 +995,164 @@ func TestTwoStage_P_AttemptTimeoutShorterThanHealthTimeout_DuringStage1(t *testi
 		t.Errorf("timeout should not be retryable")
 	}
 }
+
+func TestStage2_ConcurrentMultiTarget_GeminiAndClaude(t *testing.T) {
+	var healthCalls, geminiCalls, claudeCalls int64
+
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&healthCalls, 1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer healthSrv.Close()
+
+	geminiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&geminiCalls, 1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("<html><head><title>Gemini</title></head><body><script>WIZ_global_data = {\"vXmutd\":\"\\\"US\\\"\"};</script></body></html>"))
+	}))
+	defer geminiSrv.Close()
+
+	claudeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&claudeCalls, 1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("<html><head><title>Claude</title></head><body>Hello Claude</body></html>"))
+	}))
+	defer claudeSrv.Close()
+
+	cand := newDirectCandidate("multi-target-both")
+	cfg := &config.TestConfig{
+		HealthURL:     healthSrv.URL,
+		HealthTimeout: 1 * time.Second,
+		TargetURL:     geminiSrv.URL,
+		Timeout:       2 * time.Second,
+		DialTimeout:   1 * time.Second,
+		Claude: config.ClaudeConfig{
+			Enabled:     true,
+			URL:         claudeSrv.URL,
+			Timeout:     1 * time.Second,
+			DialTimeout: 1 * time.Second,
+		},
+	}
+
+	classRes, _, _ := executeAttempt(context.Background(), cand, cfg)
+
+	if atomic.LoadInt64(&healthCalls) == 0 {
+		t.Errorf("expected Stage 1 health check to be called")
+	}
+	if atomic.LoadInt64(&geminiCalls) == 0 {
+		t.Errorf("expected Gemini probe to be called")
+	}
+	if atomic.LoadInt64(&claudeCalls) == 0 {
+		t.Errorf("expected Claude probe to be called")
+	}
+
+	if classRes.Status != store.StatusPassed {
+		t.Errorf("expected StatusPassed, got %s", classRes.Status)
+	}
+
+	geminiRes, ok := classRes.Services["gemini"]
+	if !ok || geminiRes.Status != store.StatusPassed {
+		t.Errorf("expected valid Gemini TargetResult in Services, got %v", geminiRes)
+	}
+
+	claudeRes, ok := classRes.Services["claude"]
+	if !ok || claudeRes.Status != store.StatusPassed {
+		t.Errorf("expected valid Claude TargetResult in Services, got %v", claudeRes)
+	}
+}
+
+func TestStage2_ClaudeDisabled_SkipsProbe(t *testing.T) {
+	var geminiCalls, claudeCalls int64
+
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer healthSrv.Close()
+
+	geminiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&geminiCalls, 1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("<html><head><title>Gemini</title></head><body><script>WIZ_global_data = {\"vXmutd\":\"\\\"US\\\"\"};</script></body></html>"))
+	}))
+	defer geminiSrv.Close()
+
+	claudeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&claudeCalls, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer claudeSrv.Close()
+
+	cand := newDirectCandidate("multi-target-no-claude")
+	cfg := &config.TestConfig{
+		HealthURL:     healthSrv.URL,
+		HealthTimeout: 1 * time.Second,
+		TargetURL:     geminiSrv.URL,
+		Timeout:       2 * time.Second,
+		DialTimeout:   1 * time.Second,
+		Claude: config.ClaudeConfig{
+			Enabled: false,
+			URL:     claudeSrv.URL,
+		},
+	}
+
+	classRes, _, _ := executeAttempt(context.Background(), cand, cfg)
+
+	if atomic.LoadInt64(&geminiCalls) == 0 {
+		t.Errorf("expected Gemini probe to be called")
+	}
+	if atomic.LoadInt64(&claudeCalls) != 0 {
+		t.Errorf("expected Claude probe NOT to be called when disabled; got %d calls", claudeCalls)
+	}
+
+	if _, ok := classRes.Services["gemini"]; !ok {
+		t.Errorf("expected Gemini in Services")
+	}
+	if _, ok := classRes.Services["claude"]; ok {
+		t.Errorf("unexpected Claude in Services when disabled")
+	}
+}
+
+func TestStage1_Failure_PopulatesFailedServices(t *testing.T) {
+	closedPort := getClosedPort(t)
+	cfg := &config.TestConfig{
+		HealthURL:     fmt.Sprintf("http://127.0.0.1:%d/generate_204", closedPort),
+		HealthTimeout: 1 * time.Second,
+		TargetURL:     "http://127.0.0.1:1/",
+		Timeout:       2 * time.Second,
+		DialTimeout:   1 * time.Second,
+		MaxRetries:    0,
+		Claude: config.ClaudeConfig{
+			Enabled: true,
+			URL:     "http://127.0.0.1:1/",
+		},
+	}
+
+	cand := newDirectCandidate("stage1-failure-services")
+	classRes, _, _ := executeAttempt(context.Background(), cand, cfg)
+
+	if classRes.Status != store.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %s", classRes.Status)
+	}
+	if classRes.TransportOK {
+		t.Fatalf("expected TransportOK to be false")
+	}
+
+	geminiSvc, ok := classRes.Services["gemini"]
+	if !ok {
+		t.Fatalf("expected gemini in Services")
+	}
+	if geminiSvc.Status != store.StatusFailed {
+		t.Errorf("expected gemini StatusFailed, got %s", geminiSvc.Status)
+	}
+
+	claudeSvc, ok := classRes.Services["claude"]
+	if !ok {
+		t.Fatalf("expected claude in Services")
+	}
+	if claudeSvc.Status != store.StatusFailed {
+		t.Errorf("expected claude StatusFailed, got %s", claudeSvc.Status)
+	}
+	if claudeSvc.Category != classRes.Category {
+		t.Errorf("expected claude Category %s, got %s", classRes.Category, claudeSvc.Category)
+	}
+}

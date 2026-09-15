@@ -15,10 +15,21 @@ type GeminiConfig struct {
 	BlockPhrases []string `json:"block_phrases,omitempty"`
 }
 
+type ClaudeConfig struct {
+	EnabledRaw     *bool         `json:"enabled,omitempty"`
+	URL            string        `json:"url,omitempty"`
+	TimeoutRaw     string        `json:"timeout,omitempty"`
+	DialTimeoutRaw string        `json:"dial_timeout,omitempty"`
+	Enabled        bool          `json:"-"`
+	Timeout        time.Duration `json:"-"`
+	DialTimeout    time.Duration `json:"-"`
+}
+
 type TestConfig struct {
 	HealthURL             string       `json:"health_url,omitempty"`
 	HealthTimeoutRaw      string       `json:"health_timeout,omitempty"`
 	Gemini                GeminiConfig `json:"gemini,omitempty"`
+	Claude                ClaudeConfig `json:"claude,omitempty"`
 	TargetURL             string       `json:"target_url,omitempty"`
 	BlockPhrases          []string     `json:"block_phrases,omitempty"`
 	TimeoutRaw            string       `json:"timeout"`
@@ -208,6 +219,43 @@ func (c *Config) Validate() error {
 		c.Test.RetryBackoff = retryBackoff
 	}
 
+	// Claude defaults and parsing
+	if c.Test.Claude.EnabledRaw == nil {
+		c.Test.Claude.Enabled = true
+	} else {
+		c.Test.Claude.Enabled = *c.Test.Claude.EnabledRaw
+	}
+
+	if c.Test.Claude.URL == "" {
+		c.Test.Claude.URL = "https://claude.ai/"
+	}
+
+	if c.Test.Claude.TimeoutRaw == "" {
+		c.Test.Claude.Timeout = 10 * time.Second
+	} else {
+		claudeTimeout, err := time.ParseDuration(c.Test.Claude.TimeoutRaw)
+		if err != nil {
+			return fmt.Errorf("test.claude.timeout: %w", err)
+		}
+		if claudeTimeout <= 0 {
+			return fmt.Errorf("test.claude.timeout must be positive")
+		}
+		c.Test.Claude.Timeout = claudeTimeout
+	}
+
+	if c.Test.Claude.DialTimeoutRaw == "" {
+		c.Test.Claude.DialTimeout = 5 * time.Second
+	} else {
+		claudeDialTimeout, err := time.ParseDuration(c.Test.Claude.DialTimeoutRaw)
+		if err != nil {
+			return fmt.Errorf("test.claude.dial_timeout: %w", err)
+		}
+		if claudeDialTimeout <= 0 {
+			return fmt.Errorf("test.claude.dial_timeout must be positive")
+		}
+		c.Test.Claude.DialTimeout = claudeDialTimeout
+	}
+
 	if c.Test.MaxRetriesRaw == nil {
 		c.Test.MaxRetries = 2 // backward-compatible default
 	} else if *c.Test.MaxRetriesRaw < 0 {
@@ -298,6 +346,10 @@ func (t *TestConfig) Clone() *TestConfig {
 	if t.JitterSamplesRaw != nil {
 		v := *t.JitterSamplesRaw
 		cp.JitterSamplesRaw = &v
+	}
+	if t.Claude.EnabledRaw != nil {
+		v := *t.Claude.EnabledRaw
+		cp.Claude.EnabledRaw = &v
 	}
 	return &cp
 }

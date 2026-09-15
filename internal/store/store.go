@@ -64,6 +64,15 @@ func (c ErrorCategory) IsTargetSpecific() bool {
 	return c == ErrRegionBlocked || c == ErrTargetDenied
 }
 
+// TargetResult contains the compatibility status, error classification, latency, and reliability score for a specific service target.
+type TargetResult struct {
+	Status     Status        `json:"status"`
+	Category   ErrorCategory `json:"category,omitempty"`
+	StatusCode int           `json:"status_code,omitempty"`
+	Latency    time.Duration `json:"latency,omitempty"`
+	Score      float64       `json:"score,omitempty"`
+}
+
 // Result is the outcome of testing a single candidate link.
 type Result struct {
 	Link                    string        `json:"link,omitempty"`
@@ -85,6 +94,8 @@ type Result struct {
 	// Note: a value of 0 is ambiguous and indicates either zero measurable variation
 	// or that jitter was not measured / had insufficient samples (< 2).
 	Jitter time.Duration `json:"jitter,omitempty"`
+	// Services contains discrete target probe outcomes keyed by service identifier (e.g. "gemini", "claude").
+	Services map[string]TargetResult `json:"services,omitempty"`
 }
 
 // Snapshot is the full persisted state.
@@ -191,42 +202,68 @@ func (s *Store) isAbsentLocked(rec *CandidateRecord) (bool, string) {
 	return false, ""
 }
 
-// servabilityGateLocked evaluates the 4 operational policy gates for candidate servability
-// and returns both the decision and human-readable explanation.
+// servabilityGateLockedFor evaluates the 4 operational policy gates for candidate servability for a specific service target.
 // mu must be locked (RLock or Lock) by caller.
-func (s *Store) servabilityGateLocked(rec *CandidateRecord) (bool, string) {
+func (s *Store) servabilityGateLockedFor(rec *CandidateRecord, service string) (bool, string) {
 	if rec == nil {
 		return false, "No record"
 	}
+	if service == "" {
+		service = "gemini"
+	}
 
-	// Gate 1: Source Presence Gate
+	// Gate 1: Source Presence Gate (global to candidate)
 	// Disqualified if candidate is absent in active cycle or absent from upstream without reappearing.
 	if absent, reason := s.isAbsentLocked(rec); absent {
 		return false, reason
 	}
 
-	// Gate 2: Target Policy Override
-	// Disqualified if latest conclusive target observation is StatusFailed with ErrRegionBlocked or ErrTargetDenied.
-	if sample, ok := rec.History.LatestConclusive(); ok {
-		if sample.Status == StatusFailed && (sample.Category == ErrRegionBlocked || sample.Category == ErrTargetDenied) {
-			return false, "Target policy: " + string(sample.Category)
+	// Gate 2: Target Policy Override (per-service)
+	if service == "gemini" {
+		if sample, ok := rec.History.LatestConclusive(); ok {
+			if sample.Status == StatusFailed && (sample.Category == ErrRegionBlocked || sample.Category == ErrTargetDenied) {
+				return false, "Target policy: " + string(sample.Category)
+			}
+		} else if rec.Latest.Status == StatusFailed && (rec.Latest.Category == ErrRegionBlocked || rec.Latest.Category == ErrTargetDenied) {
+			return false, "Target policy: " + string(rec.Latest.Category)
 		}
-	} else if rec.Latest.Status == StatusFailed && (rec.Latest.Category == ErrRegionBlocked || rec.Latest.Category == ErrTargetDenied) {
-		return false, "Target policy: " + string(rec.Latest.Category)
+	} else if service == "claude" {
+		if sample, ok := rec.History.LatestConclusiveFor("claude"); ok {
+			if sample.Status == StatusFailed && (sample.Category == ErrRegionBlocked || sample.Category == ErrTargetDenied) {
+				return false, "Target policy (claude): " + string(sample.Category)
+			}
+		} else if claudeRes, ok := rec.Services["claude"]; ok {
+			if claudeRes.Status == StatusFailed && (claudeRes.Category == ErrRegionBlocked || claudeRes.Category == ErrTargetDenied) {
+				return false, "Target policy (claude): " + string(claudeRes.Category)
+			}
+		} else if claudeRes, ok := rec.Latest.Services["claude"]; ok {
+			if claudeRes.Status == StatusFailed && (claudeRes.Category == ErrRegionBlocked || claudeRes.Category == ErrTargetDenied) {
+				return false, "Target policy (claude): " + string(claudeRes.Category)
+			}
+		}
 	}
 
-	// Gate 3: Cold Start Gate
+	// Gate 3: Cold Start Gate (global to candidate)
 	// Disqualified until minimum observation count is reached.
 	if rec.History.Count < s.cfg.MinObservationsForServing {
 		return false, "Cold start: needs observation"
 	}
 
-	// Gate 4: Reliability Score Threshold Gate
-	// Disqualified if recency-weighted score is below threshold.
-	if rec.Score < s.cfg.MinServableScore {
-		// Legacy Last-Known-Good compatibility: if migrated from legacy state with prior pass
-		// and inconclusive count within limit, preserve servability until probed in new cycle.
-		if rec.Latest.Status == StatusInconclusive && rec.Latest.PreviouslyPassed && rec.Latest.ConsecutiveInconclusive <= s.cfg.MaxAbsentCycles && rec.History.Count == 1 {
+	// Gate 4: Reliability Score Threshold Gate (per-service)
+	score := rec.Score
+	if service == "claude" {
+		if claudeRes, ok := rec.Services["claude"]; ok && claudeRes.Score > 0 {
+			score = claudeRes.Score
+		} else if claudeRes, ok := rec.Latest.Services["claude"]; ok && claudeRes.Score > 0 {
+			score = claudeRes.Score
+		} else if rec.History.Count > 0 {
+			score = rec.History.ComputeScoreFor(s.cfg.DecayLambda, s.cfg.CategoryWeights, "claude")
+		}
+	}
+
+	if score < s.cfg.MinServableScore {
+		// Legacy Last-Known-Good compatibility for gemini
+		if service == "gemini" && rec.Latest.Status == StatusInconclusive && rec.Latest.PreviouslyPassed && rec.Latest.ConsecutiveInconclusive <= s.cfg.MaxAbsentCycles && rec.History.Count == 1 {
 			return true, "Servable (grace period)"
 		}
 		return false, "Score below threshold"
@@ -235,10 +272,23 @@ func (s *Store) servabilityGateLocked(rec *CandidateRecord) (bool, string) {
 	return true, "Servable"
 }
 
-// isServableRecordLocked evaluates the 4 operational policy gates for candidate servability.
+// servabilityGateLocked evaluates the 4 operational policy gates for Gemini candidate servability
+// and returns both the decision and human-readable explanation.
+// mu must be locked (RLock or Lock) by caller.
+func (s *Store) servabilityGateLocked(rec *CandidateRecord) (bool, string) {
+	return s.servabilityGateLockedFor(rec, "gemini")
+}
+
+// isServableRecordLocked evaluates the 4 operational policy gates for Gemini candidate servability.
 // mu must be locked (RLock or Lock) by caller.
 func (s *Store) isServableRecordLocked(rec *CandidateRecord) bool {
-	servable, _ := s.servabilityGateLocked(rec)
+	return s.isServableRecordLockedFor(rec, "gemini")
+}
+
+// isServableRecordLockedFor evaluates the 4 operational policy gates for candidate servability for a given service.
+// mu must be locked (RLock or Lock) by caller.
+func (s *Store) isServableRecordLockedFor(rec *CandidateRecord, service string) bool {
+	servable, _ := s.servabilityGateLockedFor(rec, service)
 	return servable
 }
 
@@ -249,11 +299,25 @@ func (s *Store) ServabilityGate(rec *CandidateRecord) (bool, string) {
 	return s.servabilityGateLocked(rec)
 }
 
-// IsServableRecord returns true if the candidate record satisfies all servability policy gates.
+// ServabilityGateFor returns the servability decision and gate explanation for a record and service.
+func (s *Store) ServabilityGateFor(rec *CandidateRecord, service string) (bool, string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.servabilityGateLockedFor(rec, service)
+}
+
+// IsServableRecord returns true if the candidate record satisfies all servability policy gates for Gemini.
 func (s *Store) IsServableRecord(rec *CandidateRecord) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.isServableRecordLocked(rec)
+}
+
+// IsServableRecordFor returns true if the candidate record satisfies all servability policy gates for the service.
+func (s *Store) IsServableRecordFor(rec *CandidateRecord, service string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isServableRecordLockedFor(rec, service)
 }
 
 // networkHealthyStateLocked checks whether a record is network-healthy, and returns both
@@ -465,6 +529,32 @@ func (s *Store) Load() error {
 				rec.Latest.ConsecutiveInconclusive = rec.History.ConsecutiveInconclusive()
 			}
 
+			if rec.Services == nil {
+				rec.Services = make(map[string]TargetResult)
+			}
+			rec.Services["gemini"] = TargetResult{
+				Status:     rec.Latest.Status,
+				Category:   rec.Latest.Category,
+				StatusCode: rec.Latest.StatusCode,
+				Latency:    rec.Latest.Latency,
+				Score:      rec.Score,
+			}
+			if lastSmp, ok := rec.History.Last(); ok && lastSmp.ClaudeStatus != "" {
+				claudeScore := rec.History.ComputeScoreFor(s.cfg.DecayLambda, s.cfg.CategoryWeights, "claude")
+				rec.Services["claude"] = TargetResult{
+					Status:   lastSmp.ClaudeStatus,
+					Category: lastSmp.ClaudeCategory,
+					Latency:  lastSmp.ClaudeLatency,
+					Score:    claudeScore,
+				}
+			}
+			if rec.Latest.Services == nil {
+				rec.Latest.Services = make(map[string]TargetResult, len(rec.Services))
+			}
+			for k, v := range rec.Services {
+				rec.Latest.Services[k] = v
+			}
+
 			s.records[rec.CanonicalLink] = rec
 		}
 		return nil
@@ -534,8 +624,21 @@ func (s *Store) Load() error {
 
 		rec.Score = rec.History.ComputeScore(s.cfg.DecayLambda, s.cfg.CategoryWeights)
 
+		rec.Services = map[string]TargetResult{
+			"gemini": {
+				Status:     r.Status,
+				Category:   r.Category,
+				StatusCode: r.StatusCode,
+				Latency:    r.Latency,
+				Score:      rec.Score,
+			},
+		}
+
 		// Projection invariants: Passed reflects actual observation outcome
 		r.Passed = (r.Status == StatusPassed)
+		r.Services = map[string]TargetResult{
+			"gemini": rec.Services["gemini"],
+		}
 		rec.Latest = r
 		// Preserve legacy LKG metadata on Latest for backward compatibility
 		rec.Latest.PreviouslyPassed = r.PreviouslyPassed
@@ -883,6 +986,18 @@ func writeSnapshotJSON(w io.Writer, snap Snapshot) error {
 			if smp.Jitter > 0 {
 				scratch = append(scratch, `,"jitter":`...)
 				scratch = strconv.AppendInt(scratch, int64(smp.Jitter), 10)
+			}
+			if smp.ClaudeStatus != "" {
+				scratch = append(scratch, `,"claude_status":`...)
+				scratch = appendJSONString(scratch, string(smp.ClaudeStatus))
+			}
+			if smp.ClaudeCategory != "" {
+				scratch = append(scratch, `,"claude_category":`...)
+				scratch = appendJSONString(scratch, string(smp.ClaudeCategory))
+			}
+			if smp.ClaudeLatency > 0 {
+				scratch = append(scratch, `,"claude_latency":`...)
+				scratch = strconv.AppendInt(scratch, int64(smp.ClaudeLatency), 10)
 			}
 			scratch = append(scratch, '}')
 		}
@@ -1644,6 +1759,24 @@ func fastDecodeSnapshot(data []byte) (*Snapshot, bool) {
 																		return nil, false
 																	}
 																	smp.Jitter = time.Duration(jit)
+																case "claude_status":
+																	s, ok := p.parseStringBytes()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.ClaudeStatus = Status(s)
+																case "claude_category":
+																	s, ok := p.parseStringBytes()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.ClaudeCategory = ErrorCategory(s)
+																case "claude_latency":
+																	clat, ok := p.parseInt()
+																	if !ok {
+																		return nil, false
+																	}
+																	smp.ClaudeLatency = time.Duration(clat)
 																default:
 																	if !p.skipValue() {
 																		return nil, false
@@ -1831,8 +1964,50 @@ func (s *Store) PutWithTransition(r Result) {
 		Jitter:                 r.Jitter,
 	}
 
+	if claudeRes, ok := r.Services["claude"]; ok {
+		sample.ClaudeStatus = claudeRes.Status
+		sample.ClaudeCategory = claudeRes.Category
+		sample.ClaudeLatency = claudeRes.Latency
+	} else if (r.TransportEvidenceKnown && !r.TransportOK) || (r.Status == StatusFailed && !r.Category.IsTargetSpecific()) {
+		sample.ClaudeStatus = r.Status
+		sample.ClaudeCategory = r.Category
+		sample.ClaudeLatency = r.Latency
+	}
+
 	rec.History.Push(sample)
 	rec.Score = rec.History.ComputeScore(s.cfg.DecayLambda, s.cfg.CategoryWeights)
+
+	// Populate rec.Services
+	if rec.Services == nil {
+		rec.Services = make(map[string]TargetResult)
+	}
+	if len(r.Services) > 0 {
+		for k, v := range r.Services {
+			rec.Services[k] = v
+		}
+	} else if (r.TransportEvidenceKnown && !r.TransportOK) || (r.Status == StatusFailed && !r.Category.IsTargetSpecific()) {
+		for k := range rec.Services {
+			if k != "gemini" {
+				rec.Services[k] = TargetResult{
+					Status:     r.Status,
+					Category:   r.Category,
+					StatusCode: r.StatusCode,
+					Latency:    r.Latency,
+				}
+			}
+		}
+	}
+	rec.Services["gemini"] = TargetResult{
+		Status:     r.Status,
+		Category:   r.Category,
+		StatusCode: r.StatusCode,
+		Latency:    r.Latency,
+		Score:      rec.Score,
+	}
+	if claudeRes, ok := rec.Services["claude"]; ok {
+		claudeRes.Score = rec.History.ComputeScoreFor(s.cfg.DecayLambda, s.cfg.CategoryWeights, "claude")
+		rec.Services["claude"] = claudeRes
+	}
 
 	// Derive HasPassed and LastPassedLatency dynamically from authoritative history.
 	// Ranking latency derives strictly from the most recent StatusPassed sample currently
@@ -1854,6 +2029,13 @@ func (s *Store) PutWithTransition(r Result) {
 	// Preserve existing warnings if new result doesn't provide any
 	if len(r.Warnings) == 0 && exists && len(rec.Latest.Warnings) > 0 {
 		r.Warnings = rec.Latest.Warnings
+	}
+
+	if r.Services == nil {
+		r.Services = make(map[string]TargetResult, len(rec.Services))
+	}
+	for k, v := range rec.Services {
+		r.Services[k] = v
 	}
 
 	rec.Latest = r
@@ -1938,14 +2120,14 @@ func (s *Store) FinishCycle() {
 	s.revision++
 }
 
-// Passing returns the active links of all servable candidates, in stable sorted order.
-func (s *Store) Passing() []string {
+// PassingFor returns the active links of all servable candidates for a specific service target, in stable sorted order.
+func (s *Store) PassingFor(service string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var out []string
 	for _, rec := range s.records {
-		if s.isServableRecordLocked(rec) {
+		if s.isServableRecordLockedFor(rec, service) {
 			out = append(out, rec.ActiveLink)
 		}
 	}
@@ -1953,14 +2135,19 @@ func (s *Store) Passing() []string {
 	return out
 }
 
-// PassingRanked returns the active links of all servable candidates.
+// Passing returns the active links of all Gemini-servable candidates, in stable sorted order.
+func (s *Store) Passing() []string {
+	return s.PassingFor("gemini")
+}
+
+// PassingForRanked returns the active links of all servable candidates for a specific service target.
 // Ranking policy precedence:
 //  1. Proven candidates (HasPassed == true) strictly outrank unproven candidates (HasPassed == false),
 //     preventing candidates without confirmed passes from outranking proven ones via score or latency.
 //  2. Reliability score descending.
 //  3. Last passed latency ascending (unproven candidates sort worst at math.MaxInt64).
 //  4. ActiveLink ascending for deterministic tie-breaking.
-func (s *Store) PassingRanked() []string {
+func (s *Store) PassingForRanked(service string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1973,15 +2160,34 @@ func (s *Store) PassingRanked() []string {
 
 	servable := make([]rankedRecord, 0, len(s.records))
 	for _, rec := range s.records {
-		if s.isServableRecordLocked(rec) {
+		if s.isServableRecordLockedFor(rec, service) {
+			score := rec.Score
 			lat := rec.LastPassedLatency
 			hasPassed := rec.HasPassed
+
+			if service == "claude" {
+				if claudeRes, ok := rec.Services["claude"]; ok {
+					if claudeRes.Score > 0 {
+						score = claudeRes.Score
+					}
+					if claudeRes.Latency > 0 {
+						lat = claudeRes.Latency
+					}
+				} else if rec.History.Count > 0 {
+					score = rec.History.ComputeScoreFor(s.cfg.DecayLambda, s.cfg.CategoryWeights, "claude")
+				}
+				hasPassed = rec.History.PreviouslyPassedFor("claude")
+				if l, ok := rec.History.LastPassedLatencyFor("claude"); ok {
+					lat = l
+				}
+			}
+
 			if !hasPassed {
 				lat = time.Duration(math.MaxInt64)
 			}
 			servable = append(servable, rankedRecord{
 				activeLink: rec.ActiveLink,
-				score:      rec.Score,
+				score:      score,
 				latency:    lat,
 				hasPassed:  hasPassed,
 			})
@@ -2007,6 +2213,11 @@ func (s *Store) PassingRanked() []string {
 		out[i] = r.activeLink
 	}
 	return out
+}
+
+// PassingRanked returns the active links of all Gemini-servable candidates in ranked order.
+func (s *Store) PassingRanked() []string {
+	return s.PassingForRanked("gemini")
 }
 
 // NetworkPassing returns the active links of all candidates with verified network/transport health,

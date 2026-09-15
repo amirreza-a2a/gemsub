@@ -15,6 +15,9 @@ type ProbeSample struct {
 	Category               ErrorCategory `json:"category"`
 	StatusCode             int           `json:"status_code,omitempty"`
 	Latency                time.Duration `json:"latency,omitempty"`
+	ClaudeStatus           Status        `json:"claude_status,omitempty"`
+	ClaudeCategory         ErrorCategory `json:"claude_category,omitempty"`
+	ClaudeLatency          time.Duration `json:"claude_latency,omitempty"`
 	Attempts               int           `json:"attempts"`
 	TransportOK            bool          `json:"transport_ok,omitempty"`
 	TransportLatency       time.Duration `json:"transport_latency,omitempty"`
@@ -358,6 +361,137 @@ func (h *BoundedHistory) ComputeScore(decayLambda float64, weights map[ErrorCate
 		} else if customW, ok := weights[sample.Category]; ok {
 			w = customW
 		} else if sample.Status == StatusInconclusive {
+			w = 0.4
+		}
+
+		num += decay * w
+		den += decay
+	}
+
+	if den == 0.0 {
+		return 0.0
+	}
+	return num / den
+}
+
+// SampleServiceOutcome extracts the status and error category for a specific service target from a ProbeSample.
+func SampleServiceOutcome(sample ProbeSample, service string) (Status, ErrorCategory) {
+	if service == "claude" {
+		if sample.ClaudeStatus != "" {
+			return sample.ClaudeStatus, sample.ClaudeCategory
+		}
+		// If Claude status is not explicitly recorded, check if this was a transport failure.
+		// A network/transport failure affects all service targets equally.
+		if (sample.TransportEvidenceKnown && !sample.TransportOK) || (sample.Status == StatusFailed && !sample.Category.IsTargetSpecific()) {
+			return sample.Status, sample.Category
+		}
+		return StatusInconclusive, ErrTimeout
+	}
+	return sample.Status, sample.Category
+}
+
+// LatestConclusiveFor returns the most recent conclusive (StatusPassed or StatusFailed) sample for the given service.
+func (h *BoundedHistory) LatestConclusiveFor(service string) (ProbeSample, bool) {
+	if h.Count == 0 {
+		return ProbeSample{}, false
+	}
+	if service == "gemini" || service == "" {
+		return h.LatestConclusive()
+	}
+	if service == "claude" {
+		for i := h.Count - 1; i >= 0; i-- {
+			idx := (h.Start + i) % h.Capacity
+			s := h.Samples[idx]
+			if s.ClaudeStatus == StatusPassed || s.ClaudeStatus == StatusFailed {
+				res := s
+				res.Status = s.ClaudeStatus
+				res.Category = s.ClaudeCategory
+				res.Latency = s.ClaudeLatency
+				return res, true
+			}
+			// If transport failed, it is also a conclusive failure for Claude
+			if (s.TransportEvidenceKnown && !s.TransportOK) || (s.Status == StatusFailed && !s.Category.IsTargetSpecific()) {
+				return s, true
+			}
+		}
+		return ProbeSample{}, false
+	}
+	return ProbeSample{}, false
+}
+
+// LastPassedLatencyFor returns the latency of the most recent StatusPassed sample for the given service.
+func (h *BoundedHistory) LastPassedLatencyFor(service string) (time.Duration, bool) {
+	if h.Count == 0 {
+		return 0, false
+	}
+	if service == "gemini" || service == "" {
+		return h.LastPassedLatency()
+	}
+	if service == "claude" {
+		for i := h.Count - 1; i >= 0; i-- {
+			idx := (h.Start + i) % h.Capacity
+			if h.Samples[idx].ClaudeStatus == StatusPassed {
+				return h.Samples[idx].ClaudeLatency, true
+			}
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+// PreviouslyPassedFor returns whether the given service previously passed in history.
+func (h *BoundedHistory) PreviouslyPassedFor(service string) bool {
+	if h.Count == 0 {
+		return false
+	}
+	if service == "gemini" || service == "" {
+		return h.PreviouslyPassed()
+	}
+	if service == "claude" {
+		for i := h.Count - 1; i >= 0; i-- {
+			idx := (h.Start + i) % h.Capacity
+			switch h.Samples[idx].ClaudeStatus {
+			case StatusPassed:
+				return true
+			case StatusFailed:
+				return false
+			}
+		}
+		return false
+	}
+	return false
+}
+
+// ComputeScoreFor calculates the deterministic recency-weighted reliability score for a specific service target:
+func (h *BoundedHistory) ComputeScoreFor(decayLambda float64, weights map[ErrorCategory]float64, service string) float64 {
+	if h.Count == 0 {
+		return 0.0
+	}
+	if service == "gemini" || service == "" {
+		return h.ComputeScore(decayLambda, weights)
+	}
+	if decayLambda <= 0.0 || decayLambda > 1.0 {
+		decayLambda = 0.75
+	}
+
+	var num, den float64
+	k := h.Count
+
+	for i := 0; i < k; i++ {
+		idx := (h.Start + i) % h.Capacity
+		sample := h.Samples[idx]
+
+		status, category := SampleServiceOutcome(sample, service)
+
+		power := float64(k - 1 - i)
+		decay := math.Pow(decayLambda, power)
+
+		w := 0.1 // baseline transport failure fallback
+		if status == StatusPassed {
+			w = 1.0
+		} else if customW, ok := weights[category]; ok {
+			w = customW
+		} else if status == StatusInconclusive {
 			w = 0.4
 		}
 

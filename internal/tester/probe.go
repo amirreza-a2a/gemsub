@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -33,6 +34,7 @@ import (
 	"gemsub/internal/config"
 	"gemsub/internal/parser"
 	"gemsub/internal/store"
+	"gemsub/internal/tester/claude"
 	"gemsub/internal/tester/gemini"
 	"gemsub/internal/tester/transport"
 )
@@ -106,6 +108,7 @@ func ProbeWithExecutor(ctx context.Context, cand parser.Candidate, cfg *config.T
 	result.TransportLatency = lastClassResult.TransportLatency
 	result.TransportEvidenceKnown = lastClassResult.TransportEvidenceKnown
 	result.Jitter = lastClassResult.Jitter
+	result.Services = lastClassResult.Services
 
 	// If retries were exhausted on a retryable error, mark as Inconclusive
 	if lastClassResult.Retryable && result.Attempts > maxRetries {
@@ -118,6 +121,26 @@ func ProbeWithExecutor(ctx context.Context, cand parser.Candidate, cfg *config.T
 	return result
 }
 
+func failedServicesResult(status store.Status, category store.ErrorCategory, statusCode int, latency time.Duration, claudeEnabled bool) map[string]store.TargetResult {
+	services := map[string]store.TargetResult{
+		"gemini": {
+			Status:     status,
+			Category:   category,
+			StatusCode: statusCode,
+			Latency:    latency,
+		},
+	}
+	if claudeEnabled {
+		services["claude"] = store.TargetResult{
+			Status:     status,
+			Category:   category,
+			StatusCode: statusCode,
+			Latency:    latency,
+		}
+	}
+	return services
+}
+
 func executeAttempt(ctx context.Context, cand parser.Candidate, cfg *config.TestConfig) (ClassificationResult, bool, *time.Duration) {
 	attemptCtx, cancelAttempt := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancelAttempt()
@@ -125,6 +148,7 @@ func executeAttempt(ctx context.Context, cand parser.Candidate, cfg *config.Test
 	dialFn, closeBox, err := buildDialer(attemptCtx, cand, cfg.DialTimeout)
 	if err != nil {
 		classErr := ClassifyDialError(fmt.Errorf("build outbound: %w", err))
+		classErr.Services = failedServicesResult(classErr.Status, classErr.Category, classErr.StatusCode, 0, cfg.Claude.Enabled)
 		return classErr, classErr.Retryable, nil
 	}
 	defer closeBox()
@@ -155,6 +179,7 @@ func executeAttempt(ctx context.Context, cand parser.Candidate, cfg *config.Test
 			TransportEvidenceKnown: true,
 			TransportOK:            false,
 			TransportLatency:       tr.Latency,
+			Services:               failedServicesResult(store.StatusInconclusive, store.ErrTimeout, 0, tr.Latency, cfg.Claude.Enabled),
 		}, false, nil
 	}
 
@@ -195,17 +220,42 @@ func executeAttempt(ctx context.Context, cand parser.Candidate, cfg *config.Test
 		classResult.TransportEvidenceKnown = true
 		classResult.TransportOK = false
 		classResult.TransportLatency = tr.Latency
+		classResult.Services = failedServicesResult(classResult.Status, classResult.Category, classResult.StatusCode, tr.Latency, cfg.Claude.Enabled)
 
 		return classResult, classResult.Retryable, tr.RetryAfter
 	}
 
-	// --- Stage 2: Gemini Application ---
-	geminiResult := gemini.Probe(attemptCtx, dialFn, gemini.Config{
-		URL:          cfg.TargetURL,
-		BlockPhrases: cfg.BlockPhrases,
-		Timeout:      cfg.Timeout,
-		DialTimeout:  cfg.DialTimeout,
-	})
+	// --- Stage 2: Target Application Probes ---
+	var (
+		geminiResult gemini.Result
+		claudeResult claude.ProbeResult
+		wg           sync.WaitGroup
+	)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		geminiResult = gemini.Probe(attemptCtx, dialFn, gemini.Config{
+			URL:          cfg.TargetURL,
+			BlockPhrases: cfg.BlockPhrases,
+			Timeout:      cfg.Timeout,
+			DialTimeout:  cfg.DialTimeout,
+		})
+	}()
+
+	if cfg.Claude.Enabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			claudeResult = claude.Probe(attemptCtx, dialFn, claude.Config{
+				URL:         cfg.Claude.URL,
+				Timeout:     cfg.Claude.Timeout,
+				DialTimeout: cfg.Claude.DialTimeout,
+			})
+		}()
+	}
+
+	wg.Wait()
 
 	var classResult ClassificationResult
 	if geminiResult.Err != nil {
@@ -228,6 +278,35 @@ func executeAttempt(ctx context.Context, cand parser.Candidate, cfg *config.Test
 			Retryable:  geminiResult.Retryable,
 		}
 	}
+
+	services := make(map[string]store.TargetResult)
+	services["gemini"] = store.TargetResult{
+		Status:     classResult.Status,
+		Category:   classResult.Category,
+		StatusCode: classResult.StatusCode,
+		Latency:    geminiResult.Latency,
+	}
+
+	if cfg.Claude.Enabled {
+		claudeStatus := claudeResult.Status
+		claudeCategory := claudeResult.Category
+		if claudeResult.Err != nil {
+			clErrRes := ClassifyDialError(claudeResult.Err)
+			claudeStatus = clErrRes.Status
+			claudeCategory = clErrRes.Category
+			if ctx.Err() != nil || errors.Is(claudeResult.Err, context.DeadlineExceeded) || errors.Is(claudeResult.Err, context.Canceled) || claudeCategory == store.ErrTimeout {
+				claudeStatus = store.StatusInconclusive
+				claudeCategory = store.ErrTimeout
+			}
+		}
+		services["claude"] = store.TargetResult{
+			Status:     claudeStatus,
+			Category:   claudeCategory,
+			StatusCode: claudeResult.StatusCode,
+			Latency:    claudeResult.Latency,
+		}
+	}
+	classResult.Services = services
 
 	// Stage 1 proved transport health. Preserve explicit transport evidence.
 	classResult.TransportEvidenceKnown = true

@@ -513,7 +513,7 @@ The canonical local register for non-blocking findings, deferred hardening items
 - **Status:** Monitoring
 - **Origin:** Ticket 18/21/22 race verification and Post-Ticket-23 architecture audit
 - **Problem:**
-  Running `go test -race` against tests that instantiate live `box.Box` instances via `sing-box` (e.g. `TestEndToEnd_PositivePath` or `TestExecuteAttempt_TransportErrorsNotCollapsed`) detects a data race in `github.com/sagernet/sing-box@v1.14.0/route/network.go:574` inside the interface monitor during concurrent Box startup and shutdown.
+  Running `go test -race` against tests that instantiate live `box.Box` instances via `sing-box` (e.g. `TestEndToEnd_PositivePath`, `TestExecuteAttempt_TransportErrorsNotCollapsed`, or `TestStage2_ConcurrentMultiTarget_GeminiAndClaude`) detects a data race in `github.com/sagernet/sing-box@v1.14.0/route/network.go:574` inside the interface monitor during concurrent Box startup and shutdown.
 - **Impact:**
   This is an upstream dependency issue, not a `gemsub`-native concurrency defect. It prevents clean `-race` execution on tests creating live outbound boxes unless upstream patches it or `gemsub` upgrades to a fixed version.
 - **Proposed Future Remediation:**

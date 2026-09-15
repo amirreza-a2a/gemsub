@@ -559,3 +559,85 @@ func TestTestConfig_Clone_DeepCopiesJitterSamplesRaw(t *testing.T) {
 		t.Errorf("mutating original pointer altered cloned pointer: got %d", *cloned.JitterSamplesRaw)
 	}
 }
+
+func TestClaudeConfig_DefaultsWhenOmitted(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if !cfg.Test.Claude.Enabled {
+		t.Errorf("expected Claude.Enabled to default to true, got false")
+	}
+	if cfg.Test.Claude.URL != "https://claude.ai/" {
+		t.Errorf("expected Claude.URL to default to https://claude.ai/, got %q", cfg.Test.Claude.URL)
+	}
+	if cfg.Test.Claude.Timeout != 10*time.Second {
+		t.Errorf("expected Claude.Timeout to default to 10s, got %v", cfg.Test.Claude.Timeout)
+	}
+	if cfg.Test.Claude.DialTimeout != 5*time.Second {
+		t.Errorf("expected Claude.DialTimeout to default to 5s, got %v", cfg.Test.Claude.DialTimeout)
+	}
+}
+
+func TestClaudeConfig_ExplicitOverrides(t *testing.T) {
+	dir := t.TempDir()
+	cfgMap := baseConfig()
+	testCfg := cfgMap["test"].(map[string]interface{})
+	testCfg["claude"] = map[string]interface{}{
+		"enabled":      false,
+		"url":          "https://custom.claude.ai/",
+		"timeout":      "15s",
+		"dial_timeout": "6s",
+	}
+	path := writeTestConfig(t, dir, cfgMap)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if cfg.Test.Claude.Enabled {
+		t.Errorf("expected Claude.Enabled to be false, got true")
+	}
+	if cfg.Test.Claude.URL != "https://custom.claude.ai/" {
+		t.Errorf("expected Claude.URL https://custom.claude.ai/, got %q", cfg.Test.Claude.URL)
+	}
+	if cfg.Test.Claude.Timeout != 15*time.Second {
+		t.Errorf("expected Claude.Timeout 15s, got %v", cfg.Test.Claude.Timeout)
+	}
+	if cfg.Test.Claude.DialTimeout != 6*time.Second {
+		t.Errorf("expected Claude.DialTimeout 6s, got %v", cfg.Test.Claude.DialTimeout)
+	}
+}
+
+func TestTestConfig_Clone_DeepCopiesClaude(t *testing.T) {
+	f := false
+	tc := &config.TestConfig{
+		Claude: config.ClaudeConfig{
+			EnabledRaw: &f,
+			Enabled:    false,
+			URL:        "https://claude.ai/",
+		},
+	}
+
+	cloned := tc.Clone()
+	if cloned == nil {
+		t.Fatal("expected non-nil cloned config")
+	}
+	if cloned.Claude.EnabledRaw == tc.Claude.EnabledRaw {
+		t.Fatal("expected Claude.EnabledRaw pointer to be deep-copied, got identical pointer")
+	}
+	if *cloned.Claude.EnabledRaw != false {
+		t.Fatalf("expected cloned EnabledRaw to be false")
+	}
+
+	*tc.Claude.EnabledRaw = true
+	if *cloned.Claude.EnabledRaw != false {
+		t.Errorf("mutating original pointer altered cloned pointer")
+	}
+}

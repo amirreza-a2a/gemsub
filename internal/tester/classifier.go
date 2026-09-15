@@ -30,6 +30,7 @@ type ClassificationResult struct {
 	TransportLatency       time.Duration
 	TransportEvidenceKnown bool
 	Jitter                 time.Duration
+	Services               map[string]store.TargetResult
 }
 
 // ClassifyDialError determines whether an error encountered during dial or HTTP

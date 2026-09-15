@@ -30,6 +30,18 @@ func buildReferenceStore(tb testing.TB, count int) (*store.Store, string) {
 			TransportOK:            true,
 			TransportLatency:       time.Duration(20+(i%50)) * time.Millisecond,
 			TransportEvidenceKnown: true,
+			Services: map[string]store.TargetResult{
+				"gemini": {
+					Status:   store.StatusPassed,
+					Category: store.ErrNone,
+					Latency:  time.Duration(40+(i%100)) * time.Millisecond,
+				},
+				"claude": {
+					Status:   store.StatusPassed,
+					Category: store.ErrNone,
+					Latency:  time.Duration(50+(i%100)) * time.Millisecond,
+				},
+			},
 		})
 	}
 	st.FinishCycle()
@@ -82,6 +94,9 @@ func TestPersistence_EmpiricalGates_56k(t *testing.T) {
 	// 2. Candidate count fidelity
 	if len(stReload.Passing()) != datasetCount {
 		t.Errorf("candidate count mismatch: got %d, want %d", len(stReload.Passing()), datasetCount)
+	}
+	if len(stReload.PassingFor("claude")) != datasetCount {
+		t.Errorf("claude candidate count mismatch: got %d, want %d", len(stReload.PassingFor("claude")), datasetCount)
 	}
 }
 
