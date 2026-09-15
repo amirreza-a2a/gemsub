@@ -267,7 +267,7 @@ func TestClassifyResponse_RealFixture(t *testing.T) {
 		}
 	}
 	if err != nil {
-		t.Fatalf("could not read real fixture response.html: %v", err)
+		t.Skipf("skipping test: real fixture response.html not present (gitignored): %v", err)
 	}
 
 	resp := &http.Response{
