@@ -15,6 +15,7 @@
 # Test configurations (ephemeral)
 /test-config.json
 gemini_response.html
+examples/stage2_inspector/response.html
 
 # GoReleaser build artifacts
 /dist/
