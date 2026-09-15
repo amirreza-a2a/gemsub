@@ -4372,21 +4372,26 @@ func TestAdapter_Publishing_ViewModelAndControls(t *testing.T) {
 		Duration:   250 * time.Millisecond,
 	})
 
-	deadline := time.Now().Add(500 * time.Millisecond)
-	isDirty := false
+	deadline := time.Now().Add(1 * time.Second)
+	sawDirty := false
 	for time.Now().Before(deadline) {
 		if ad.CheckAndResetDirty() {
-			isDirty = true
+			sawDirty = true
+		}
+		vm = ad.ConfigCenter()
+		pubVM = vm.Publishing()
+		if pubVM.LastCommit == "fedcba9" && pubVM.PublishCount == 1 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !isDirty {
+	if ad.CheckAndResetDirty() {
+		sawDirty = true
+	}
+	if !sawDirty {
 		t.Errorf("expected dirty flag set after events.PublishingFinished")
 	}
 
-	vm = ad.ConfigCenter()
-	pubVM = vm.Publishing()
 	if pubVM.LastCommit != "fedcba9" {
 		t.Errorf("expected LastCommit=fedcba9, got %q", pubVM.LastCommit)
 	}
@@ -4403,20 +4408,25 @@ func TestAdapter_Publishing_ViewModelAndControls(t *testing.T) {
 		FailedAt: time.Now(),
 		Error:    "failed to push to https://secret_token_abc@github.com/example/repo.git: network timeout",
 	})
-	deadline = time.Now().Add(500 * time.Millisecond)
-	isDirty = false
+	deadline = time.Now().Add(1 * time.Second)
+	sawDirty = false
 	for time.Now().Before(deadline) {
 		if ad.CheckAndResetDirty() {
-			isDirty = true
+			sawDirty = true
+		}
+		vm = ad.ConfigCenter()
+		pubVM = vm.Publishing()
+		if pubVM.FailCount == 1 && strings.Contains(pubVM.LastError, "***") {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !isDirty {
+	if ad.CheckAndResetDirty() {
+		sawDirty = true
+	}
+	if !sawDirty {
 		t.Errorf("expected dirty flag set after events.PublishingFailed")
 	}
-	vm = ad.ConfigCenter()
-	pubVM = vm.Publishing()
 	if strings.Contains(pubVM.LastError, "secret_token_abc") {
 		t.Fatalf("leaked secret in pubVM.LastError: %q", pubVM.LastError)
 	}
