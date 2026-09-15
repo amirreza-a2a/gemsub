@@ -154,18 +154,20 @@ func (s *Server) handleSub(w http.ResponseWriter, r *http.Request) {
 		path = "/"
 	}
 
-	var isGenericRoute, isGeminiRoute, isBaseRoute bool
+	var isGenericRoute, isGeminiRoute, isClaudeRoute, isBaseRoute bool
 	if base == "/" {
 		isBaseRoute = (path == "/")
 		isGenericRoute = (path == "/generic")
 		isGeminiRoute = (path == "/gemini")
+		isClaudeRoute = (path == "/claude")
 	} else {
 		isBaseRoute = (path == base)
 		isGenericRoute = (path == base+"/generic")
 		isGeminiRoute = (path == base+"/gemini")
+		isClaudeRoute = (path == base+"/claude")
 	}
 
-	if !isBaseRoute && !isGenericRoute && !isGeminiRoute {
+	if !isBaseRoute && !isGenericRoute && !isGeminiRoute && !isClaudeRoute {
 		http.NotFound(w, r)
 		return
 	}
@@ -174,7 +176,7 @@ func (s *Server) handleSub(w http.ResponseWriter, r *http.Request) {
 
 	// Validate projection query parameter if present
 	projParam := strings.TrimSpace(strings.ToLower(q.Get("projection")))
-	if projParam != "" && projParam != "generic" && projParam != "gemini" {
+	if projParam != "" && projParam != "generic" && projParam != "gemini" && projParam != "claude" {
 		http.Error(w, "invalid projection: "+projParam, http.StatusBadRequest)
 		return
 	}
@@ -188,9 +190,13 @@ func (s *Server) handleSub(w http.ResponseWriter, r *http.Request) {
 		projection = "generic"
 	} else if isGeminiRoute {
 		projection = "gemini"
+	} else if isClaudeRoute {
+		projection = "claude"
 	} else if isBaseRoute {
 		if projParam == "generic" {
 			projection = "generic"
+		} else if projParam == "claude" {
+			projection = "claude"
 		} else {
 			projection = "gemini"
 		}
@@ -232,6 +238,8 @@ func (s *Server) handleSub(w http.ResponseWriter, r *http.Request) {
 	var links []string
 	if projection == "generic" {
 		links = s.st.NetworkPassing()
+	} else if projection == "claude" {
+		links = s.st.PassingFor("claude")
 	} else {
 		links = s.st.Passing()
 	}

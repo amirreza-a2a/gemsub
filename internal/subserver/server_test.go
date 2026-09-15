@@ -708,6 +708,8 @@ func TestServer_PathSegmentRouting(t *testing.T) {
 		"/sub/generic/",
 		"/sub/gemini",
 		"/sub/gemini/",
+		"/sub/claude",
+		"/sub/claude/",
 	}
 	for _, r := range validRoutes {
 		status, _ := fetchBody(t, fmt.Sprintf("http://%s%s", addr, r))
@@ -728,5 +730,225 @@ func TestServer_PathSegmentRouting(t *testing.T) {
 		if status != http.StatusNotFound {
 			t.Errorf("expected 404 NotFound for route %s, got %d", r, status)
 		}
+	}
+}
+
+func TestServer_ClaudeProjection_RoutingPrecedenceAndFilters(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "claude_server_test.json"), 2)
+
+	claudePass := "vless://claude-pass@example.com:443#ClaudePass"
+	geminiPass := "vmess://gemini-pass@example.com:443#GeminiPass"
+	bothPass := "trojan://both-pass@example.com:443#BothPass"
+	transportFail := "vless://fail@example.com:443#Fail"
+
+	now := time.Now()
+
+	// 1. Claude PASS, Gemini Blocked
+	st.PutWithTransition(store.Result{
+		Link:                   claudePass,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TestedAt:               now,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		Services: map[string]store.TargetResult{
+			"claude": {
+				Status:   store.StatusPassed,
+				Category: store.ErrNone,
+				Latency:  40 * time.Millisecond,
+			},
+		},
+	})
+
+	// 2. Gemini PASS, Claude Blocked
+	st.PutWithTransition(store.Result{
+		Link:                   geminiPass,
+		Status:                 store.StatusPassed,
+		Category:               store.ErrNone,
+		TestedAt:               now,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		Services: map[string]store.TargetResult{
+			"gemini": {
+				Status:   store.StatusPassed,
+				Category: store.ErrNone,
+				Latency:  50 * time.Millisecond,
+			},
+			"claude": {
+				Status:   store.StatusFailed,
+				Category: store.ErrRegionBlocked,
+			},
+		},
+	})
+
+	// 3. Both PASS
+	st.PutWithTransition(store.Result{
+		Link:                   bothPass,
+		Status:                 store.StatusPassed,
+		Category:               store.ErrNone,
+		TestedAt:               now,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		Services: map[string]store.TargetResult{
+			"gemini": {
+				Status:   store.StatusPassed,
+				Category: store.ErrNone,
+				Latency:  30 * time.Millisecond,
+			},
+			"claude": {
+				Status:   store.StatusPassed,
+				Category: store.ErrNone,
+				Latency:  35 * time.Millisecond,
+			},
+		},
+	})
+
+	// 4. Transport Fail
+	st.PutWithTransition(store.Result{
+		Link:                   transportFail,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrTimeout,
+		TestedAt:               now,
+		TransportEvidenceKnown: true,
+		TransportOK:            false,
+	})
+
+	st.FinishCycle()
+
+	cfg := &config.ServeConfig{Path: "/sub", Format: "raw"}
+	addr, cleanup := startTestServer(t, cfg, st)
+	defer cleanup()
+
+	tests := []struct {
+		name           string
+		pathAndQuery   string
+		expectedStatus int
+		isBase64       bool
+		wantNodes      []string
+		doNotWantNodes []string
+	}{
+		{
+			name:           "Dedicated route /sub/claude serves Claude projection",
+			pathAndQuery:   "/sub/claude",
+			expectedStatus: http.StatusOK,
+			wantNodes:      []string{claudePass, bothPass},
+			doNotWantNodes: []string{geminiPass, transportFail},
+		},
+		{
+			name:           "Dedicated route /sub/claude/ serves Claude projection",
+			pathAndQuery:   "/sub/claude/",
+			expectedStatus: http.StatusOK,
+			wantNodes:      []string{claudePass, bothPass},
+			doNotWantNodes: []string{geminiPass, transportFail},
+		},
+		{
+			name:           "Query param /sub?projection=claude serves Claude projection",
+			pathAndQuery:   "/sub?projection=claude",
+			expectedStatus: http.StatusOK,
+			wantNodes:      []string{claudePass, bothPass},
+			doNotWantNodes: []string{geminiPass, transportFail},
+		},
+		{
+			name:           "Route precedence: /sub/claude?projection=gemini -> claude",
+			pathAndQuery:   "/sub/claude?projection=gemini",
+			expectedStatus: http.StatusOK,
+			wantNodes:      []string{claudePass, bothPass},
+			doNotWantNodes: []string{geminiPass, transportFail},
+		},
+		{
+			name:           "Route precedence: /sub/gemini?projection=claude -> gemini",
+			pathAndQuery:   "/sub/gemini?projection=claude",
+			expectedStatus: http.StatusOK,
+			wantNodes:      []string{geminiPass, bothPass},
+			doNotWantNodes: []string{claudePass, transportFail},
+		},
+		{
+			name:           "Protocol filter on Claude: ?proto=vless",
+			pathAndQuery:   "/sub/claude?proto=vless",
+			expectedStatus: http.StatusOK,
+			wantNodes:      []string{claudePass},
+			doNotWantNodes: []string{bothPass, geminiPass, transportFail},
+		},
+		{
+			name:           "Protocol filter on Claude: ?proto=trojan",
+			pathAndQuery:   "/sub/claude?proto=trojan",
+			expectedStatus: http.StatusOK,
+			wantNodes:      []string{bothPass},
+			doNotWantNodes: []string{claudePass, geminiPass, transportFail},
+		},
+		{
+			name:           "Format override on Claude: ?format=base64",
+			pathAndQuery:   "/sub/claude?format=base64",
+			expectedStatus: http.StatusOK,
+			isBase64:       true,
+			wantNodes:      []string{claudePass, bothPass},
+			doNotWantNodes: []string{geminiPass, transportFail},
+		},
+		{
+			name:           "Unknown projection returns HTTP 400",
+			pathAndQuery:   "/sub?projection=unknown",
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "Invalid projection returns HTTP 400 even on dedicated route",
+			pathAndQuery:   "/sub/claude?projection=invalid",
+			expectedStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			status, body := fetchBody(t, fmt.Sprintf("http://%s%s", addr, tc.pathAndQuery))
+			if status != tc.expectedStatus {
+				t.Fatalf("expected status %d, got %d for %s (body: %s)", tc.expectedStatus, status, tc.pathAndQuery, body)
+			}
+			if status == http.StatusOK {
+				body = decodeBody(t, body, tc.isBase64)
+			}
+			for _, want := range tc.wantNodes {
+				if !strings.Contains(body, want) {
+					t.Errorf("expected body to contain %q, got:\n%s", want, body)
+				}
+			}
+			for _, notWant := range tc.doNotWantNodes {
+				if strings.Contains(body, notWant) {
+					t.Errorf("expected body NOT to contain %q, got:\n%s", notWant, body)
+				}
+			}
+		})
+	}
+}
+
+func TestServer_ClaudeProjection_BaseSlash(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "claude_base_slash.json"), 2)
+
+	claudePass := "vless://claude@example.com:443#Claude"
+	st.PutWithTransition(store.Result{
+		Link:                   claudePass,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		Services: map[string]store.TargetResult{
+			"claude": {
+				Status:   store.StatusPassed,
+				Category: store.ErrNone,
+			},
+		},
+	})
+	st.FinishCycle()
+
+	cfg := &config.ServeConfig{Path: "/", Format: "raw"}
+	addr, cleanup := startTestServer(t, cfg, st)
+	defer cleanup()
+
+	status, body := fetchBody(t, fmt.Sprintf("http://%s/claude", addr))
+	if status != http.StatusOK {
+		t.Fatalf("expected 200 OK for /claude when base is /, got %d", status)
+	}
+	if !strings.Contains(body, claudePass) {
+		t.Errorf("expected body to contain %q, got %s", claudePass, body)
 	}
 }

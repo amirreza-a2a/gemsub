@@ -1,6 +1,7 @@
 package publisher_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -2439,5 +2440,240 @@ func TestPublisher_Publish_CapturesExactCommitBeforePush_ImmuneToLaterHEADChange
 	}
 	if pub.LastCommit(context.Background()) != secondPubSHA {
 		t.Fatalf("expected disk HEAD to match new published commit %q", secondPubSHA)
+	}
+}
+
+func TestPublisher_ClaudeProjection_FilesAndMetadata(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+
+	now := time.Now()
+	claudeVless := "vless://user@claude-1.example.com:443#Claude1"
+	claudeVmess := "vmess://user@claude-2.example.com:443#Claude2"
+	claudeTrojan := "trojan://user@claude-3.example.com:443#Claude3"
+	geminiOnly := "vless://user@gemini-only.example.com:443#GeminiOnly"
+	transportDead := "vless://user@dead.example.com:443#Dead"
+
+	// 1. Both Gemini and Claude pass
+	st.PutWithTransition(store.Result{
+		Link:                   claudeVless,
+		Status:                 store.StatusPassed,
+		Category:               store.ErrNone,
+		TestedAt:               now,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		Services: map[string]store.TargetResult{
+			"gemini": {Status: store.StatusPassed, Category: store.ErrNone},
+			"claude": {Status: store.StatusPassed, Category: store.ErrNone},
+		},
+	})
+
+	// 2. Claude passes, Gemini blocked
+	st.PutWithTransition(store.Result{
+		Link:                   claudeVmess,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrRegionBlocked,
+		TestedAt:               now,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		Services: map[string]store.TargetResult{
+			"gemini": {Status: store.StatusFailed, Category: store.ErrRegionBlocked},
+			"claude": {Status: store.StatusPassed, Category: store.ErrNone},
+		},
+	})
+
+	// 3. Both pass (Trojan)
+	st.PutWithTransition(store.Result{
+		Link:                   claudeTrojan,
+		Status:                 store.StatusPassed,
+		Category:               store.ErrNone,
+		TestedAt:               now,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		Services: map[string]store.TargetResult{
+			"gemini": {Status: store.StatusPassed, Category: store.ErrNone},
+			"claude": {Status: store.StatusPassed, Category: store.ErrNone},
+		},
+	})
+
+	// 4. Gemini passes, Claude blocked
+	st.PutWithTransition(store.Result{
+		Link:                   geminiOnly,
+		Status:                 store.StatusPassed,
+		Category:               store.ErrNone,
+		TestedAt:               now,
+		TransportEvidenceKnown: true,
+		TransportOK:            true,
+		Services: map[string]store.TargetResult{
+			"gemini": {Status: store.StatusPassed, Category: store.ErrNone},
+			"claude": {Status: store.StatusFailed, Category: store.ErrRegionBlocked},
+		},
+	})
+
+	// 5. Transport dead
+	st.PutWithTransition(store.Result{
+		Link:                   transportDead,
+		Status:                 store.StatusFailed,
+		Category:               store.ErrTimeout,
+		TestedAt:               now,
+		TransportEvidenceKnown: true,
+		TransportOK:            false,
+	})
+
+	st.FinishCycle()
+
+	cfg := &config.PublishingConfig{
+		Enabled:    true,
+		Repository: tmpDir,
+	}
+	pub := publisher.New(cfg, st)
+
+	files, err := pub.GenerateFiles()
+	if err != nil {
+		t.Fatalf("GenerateFiles failed: %v", err)
+	}
+
+	// Verify Claude file existence and partitioning
+	claudeAll := string(files[publisher.FileClaudeAll])
+	if !strings.Contains(claudeAll, claudeVless) || !strings.Contains(claudeAll, claudeVmess) || !strings.Contains(claudeAll, claudeTrojan) {
+		t.Errorf("FileClaudeAll missing expected links: %s", claudeAll)
+	}
+	if strings.Contains(claudeAll, geminiOnly) || strings.Contains(claudeAll, transportDead) {
+		t.Errorf("FileClaudeAll contains unexpected links: %s", claudeAll)
+	}
+
+	claudeVLESSContent := string(files[publisher.FileClaudeVLESS])
+	if strings.TrimSpace(claudeVLESSContent) != claudeVless {
+		t.Errorf("FileClaudeVLESS expected %q, got %q", claudeVless, claudeVLESSContent)
+	}
+
+	claudeVMessContent := string(files[publisher.FileClaudeVMess])
+	if strings.TrimSpace(claudeVMessContent) != claudeVmess {
+		t.Errorf("FileClaudeVMess expected %q, got %q", claudeVmess, claudeVMessContent)
+	}
+
+	claudeTrojanContent := string(files[publisher.FileClaudeTrojan])
+	if strings.TrimSpace(claudeTrojanContent) != claudeTrojan {
+		t.Errorf("FileClaudeTrojan expected %q, got %q", claudeTrojan, claudeTrojanContent)
+	}
+
+	// Verify Gemini files are unaffected
+	geminiAll := string(files[publisher.FileGeminiAll])
+	if !strings.Contains(geminiAll, claudeVless) || !strings.Contains(geminiAll, claudeTrojan) || !strings.Contains(geminiAll, geminiOnly) {
+		t.Errorf("FileGeminiAll missing expected links: %s", geminiAll)
+	}
+	if strings.Contains(geminiAll, claudeVmess) {
+		t.Errorf("FileGeminiAll should not contain claudeVmess (blocked on gemini): %s", geminiAll)
+	}
+
+	// Verify metadata
+	var meta publisher.Metadata
+	if err := json.Unmarshal(files[publisher.FileMeta], &meta); err != nil {
+		t.Fatalf("unmarshal meta.json failed: %v", err)
+	}
+
+	if meta.ClaudeTotal != 3 {
+		t.Errorf("expected ClaudeTotal=3, got %d", meta.ClaudeTotal)
+	}
+	if meta.ClaudeVLESS != 1 {
+		t.Errorf("expected ClaudeVLESS=1, got %d", meta.ClaudeVLESS)
+	}
+	if meta.ClaudeVMess != 1 {
+		t.Errorf("expected ClaudeVMess=1, got %d", meta.ClaudeVMess)
+	}
+	if meta.ClaudeTrojan != 1 {
+		t.Errorf("expected ClaudeTrojan=1, got %d", meta.ClaudeTrojan)
+	}
+
+	if meta.Claude == nil {
+		t.Fatalf("expected meta.Claude object to be non-nil")
+	}
+	if meta.Claude.Total != 3 || meta.Claude.VLESSCount != 1 || meta.Claude.VMessCount != 1 || meta.Claude.TrojanCount != 1 {
+		t.Errorf("expected Claude object {Total:3, VLESS:1, VMess:1, Trojan:1}, got %+v", meta.Claude)
+	}
+}
+
+func TestPublisher_ClaudeProjection_ByteDeterministicSnapshotRegression(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := store.New(filepath.Join(tmpDir, "state.json"), 2)
+
+	// Add candidates in non-sorted order
+	candidates := []string{
+		"vless://user@z-node.example.com:443#ZNode",
+		"vmess://user@a-node.example.com:443#ANode",
+		"trojan://user@m-node.example.com:443#MNode",
+		"vless://user@b-node.example.com:443#BNode",
+	}
+
+	now := time.Now()
+	for _, link := range candidates {
+		st.PutWithTransition(store.Result{
+			Link:                   link,
+			Status:                 store.StatusPassed,
+			Category:               store.ErrNone,
+			TestedAt:               now,
+			TransportEvidenceKnown: true,
+			TransportOK:            true,
+			Services: map[string]store.TargetResult{
+				"gemini": {Status: store.StatusPassed, Category: store.ErrNone},
+				"claude": {Status: store.StatusPassed, Category: store.ErrNone},
+			},
+		})
+	}
+	st.FinishCycle()
+
+	cfg := &config.PublishingConfig{
+		Enabled:    true,
+		Repository: tmpDir,
+	}
+	pub := publisher.New(cfg, st)
+
+	// Run 1
+	files1, err := pub.GenerateFiles()
+	if err != nil {
+		t.Fatalf("GenerateFiles 1 failed: %v", err)
+	}
+
+	// Run 2 (same store state)
+	files2, err := pub.GenerateFiles()
+	if err != nil {
+		t.Fatalf("GenerateFiles 2 failed: %v", err)
+	}
+
+	// Verify all subscription files are byte-for-byte identical
+	checkFiles := []string{
+		publisher.FileGenericAll,
+		publisher.FileGenericVLESS,
+		publisher.FileGenericVMess,
+		publisher.FileGenericTrojan,
+		publisher.FileGeminiAll,
+		publisher.FileGeminiVLESS,
+		publisher.FileGeminiVMess,
+		publisher.FileGeminiTrojan,
+		publisher.FileClaudeAll,
+		publisher.FileClaudeVLESS,
+		publisher.FileClaudeVMess,
+		publisher.FileClaudeTrojan,
+	}
+
+	for _, f := range checkFiles {
+		c1, ok1 := files1[f]
+		c2, ok2 := files2[f]
+		if !ok1 || !ok2 {
+			t.Fatalf("file %s missing in output", f)
+		}
+		if !bytes.Equal(c1, c2) {
+			t.Errorf("file %s is not byte-deterministic between runs:\nRun1:\n%s\nRun2:\n%s", f, c1, c2)
+		}
+
+		// Verify alphabetical sorting within the file
+		lines := strings.Split(strings.TrimSpace(string(c1)), "\n")
+		if len(lines) > 1 {
+			for i := 1; i < len(lines); i++ {
+				if lines[i-1] >= lines[i] {
+					t.Errorf("file %s is not sorted alphabetically: %q >= %q", f, lines[i-1], lines[i])
+				}
+			}
+		}
 	}
 }

@@ -26,6 +26,7 @@ import (
 const (
 	DirGeneric = "generic"
 	DirGemini  = "gemini"
+	DirClaude  = "claude"
 
 	FileAll    = "all.txt"
 	FileVLESS  = "vless.txt"
@@ -42,6 +43,11 @@ const (
 	FileGeminiVLESS  = "gemini/vless.txt"
 	FileGeminiVMess  = "gemini/vmess.txt"
 	FileGeminiTrojan = "gemini/trojan.txt"
+
+	FileClaudeAll    = "claude/all.txt"
+	FileClaudeVLESS  = "claude/vless.txt"
+	FileClaudeVMess  = "claude/vmess.txt"
+	FileClaudeTrojan = "claude/trojan.txt"
 )
 
 var targetFiles = []string{
@@ -53,6 +59,10 @@ var targetFiles = []string{
 	FileGeminiVLESS,
 	FileGeminiVMess,
 	FileGeminiTrojan,
+	FileClaudeAll,
+	FileClaudeVLESS,
+	FileClaudeVMess,
+	FileClaudeTrojan,
 	FileMeta,
 }
 
@@ -65,6 +75,10 @@ var subscriptionFiles = []string{
 	FileGeminiVLESS,
 	FileGeminiVMess,
 	FileGeminiTrojan,
+	FileClaudeAll,
+	FileClaudeVLESS,
+	FileClaudeVMess,
+	FileClaudeTrojan,
 }
 
 var legacyRootFiles = []string{
@@ -72,6 +86,14 @@ var legacyRootFiles = []string{
 	FileVLESS,
 	FileVMess,
 	FileTrojan,
+}
+
+// ProjectionMetrics represents protocol distribution counts for a specific projection.
+type ProjectionMetrics struct {
+	Total       int `json:"total"`
+	VLESSCount  int `json:"vless_count"`
+	VMessCount  int `json:"vmess_count"`
+	TrojanCount int `json:"trojan_count"`
 }
 
 // Metadata contains non-secret summary information about the published cycle.
@@ -88,6 +110,13 @@ type Metadata struct {
 	GeminiVLESS  int `json:"gemini_vless"`
 	GeminiVMess  int `json:"gemini_vmess"`
 	GeminiTrojan int `json:"gemini_trojan"`
+
+	ClaudeTotal  int `json:"claude_total"`
+	ClaudeVLESS  int `json:"claude_vless"`
+	ClaudeVMess  int `json:"claude_vmess"`
+	ClaudeTrojan int `json:"claude_trojan"`
+
+	Claude *ProjectionMetrics `json:"claude,omitempty"`
 
 	// Legacy fields mapped to Gemini projection for backward compatibility.
 	TotalServable int `json:"total_servable"`
@@ -335,6 +364,7 @@ func (p *Publisher) rollback(ctx context.Context, repoDir string, snapshot map[s
 		// Clean up empty projection directories if created.
 		_ = os.Remove(filepath.Join(repoDir, DirGeneric))
 		_ = os.Remove(filepath.Join(repoDir, DirGemini))
+		_ = os.Remove(filepath.Join(repoDir, DirClaude))
 	}
 
 	// 4. For files that existed before publication:
@@ -354,7 +384,7 @@ func (p *Publisher) rollback(ctx context.Context, repoDir string, snapshot map[s
 // Ordering policy rationale:
 // Both Store.NetworkPassing() and Store.Passing() provide candidate links in stable sorted
 // alphabetical order. We preserve deterministic alphabetical ordering within each publication
-// file (generic/* and gemini/*).
+// file (generic/*, gemini/*, and claude/*).
 // Using latency or reliability-ranked ordering (e.g. NetworkPassingRanked or PassingRanked)
 // would introduce line-ordering churn on every cycle due to slight network jitter even when
 // the set of passing candidates has not changed. Alphabetical sorting guarantees byte-for-byte
@@ -398,7 +428,7 @@ func partitionLinks(rawLinks []string, projectionName string) (all, vless, vmess
 	return unique, vlessLinks, vmessLinks, trojanLinks
 }
 
-// RenderSubscriptionFiles returns rendered contents of generic/* and gemini/* subscription files
+// RenderSubscriptionFiles returns rendered contents of generic/*, gemini/*, and claude/* subscription files
 // and metadata counts based on current Store projections.
 func (p *Publisher) RenderSubscriptionFiles() (map[string][]byte, Metadata) {
 	// 1. Generic projection: sourced directly from Store.NetworkPassing()
@@ -406,6 +436,9 @@ func (p *Publisher) RenderSubscriptionFiles() (map[string][]byte, Metadata) {
 
 	// 2. Gemini projection: sourced directly from Store.Passing()
 	gemAll, gemVLESS, gemVMess, gemTrojan := partitionLinks(p.st.Passing(), DirGemini)
+
+	// 3. Claude projection: sourced directly from Store.PassingFor("claude")
+	claudeAll, claudeVLESS, claudeVMess, claudeTrojan := partitionLinks(p.st.PassingFor("claude"), DirClaude)
 
 	stats := p.st.Stats()
 	genAt := stats.LastCycle
@@ -424,6 +457,16 @@ func (p *Publisher) RenderSubscriptionFiles() (map[string][]byte, Metadata) {
 		GeminiVLESS:   len(gemVLESS),
 		GeminiVMess:   len(gemVMess),
 		GeminiTrojan:  len(gemTrojan),
+		ClaudeTotal:   len(claudeAll),
+		ClaudeVLESS:   len(claudeVLESS),
+		ClaudeVMess:   len(claudeVMess),
+		ClaudeTrojan:  len(claudeTrojan),
+		Claude: &ProjectionMetrics{
+			Total:       len(claudeAll),
+			VLESSCount:  len(claudeVLESS),
+			VMessCount:  len(claudeVMess),
+			TrojanCount: len(claudeTrojan),
+		},
 
 		// Legacy fields mapped to Gemini projection for backward compatibility
 		TotalServable: len(gemAll),
@@ -442,6 +485,11 @@ func (p *Publisher) RenderSubscriptionFiles() (map[string][]byte, Metadata) {
 		FileGeminiVLESS:  renderList(gemVLESS),
 		FileGeminiVMess:  renderList(gemVMess),
 		FileGeminiTrojan: renderList(gemTrojan),
+
+		FileClaudeAll:    renderList(claudeAll),
+		FileClaudeVLESS:  renderList(claudeVLESS),
+		FileClaudeVMess:  renderList(claudeVMess),
+		FileClaudeTrojan: renderList(claudeTrojan),
 	}
 
 	return files, meta
@@ -670,6 +718,15 @@ func (p *Publisher) Publish(ctx context.Context) (err error) {
 				existingParsed.GeminiVLESS == meta.GeminiVLESS &&
 				existingParsed.GeminiVMess == meta.GeminiVMess &&
 				existingParsed.GeminiTrojan == meta.GeminiTrojan &&
+				existingParsed.ClaudeTotal == meta.ClaudeTotal &&
+				existingParsed.ClaudeVLESS == meta.ClaudeVLESS &&
+				existingParsed.ClaudeVMess == meta.ClaudeVMess &&
+				existingParsed.ClaudeTrojan == meta.ClaudeTrojan &&
+				existingParsed.Claude != nil &&
+				existingParsed.Claude.Total == meta.Claude.Total &&
+				existingParsed.Claude.VLESSCount == meta.Claude.VLESSCount &&
+				existingParsed.Claude.VMessCount == meta.Claude.VMessCount &&
+				existingParsed.Claude.TrojanCount == meta.Claude.TrojanCount &&
 				existingParsed.TotalServable == meta.GeminiTotal &&
 				existingParsed.VLESSCount == meta.GeminiVLESS &&
 				existingParsed.VMessCount == meta.GeminiVMess &&
