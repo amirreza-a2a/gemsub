@@ -480,6 +480,121 @@ func TestAdapter_LatencySemantics(t *testing.T) {
 	}
 }
 
+func TestAdapter_JitterSemantics(t *testing.T) {
+	ad, st, _, _ := setupTestAdapter(t)
+
+	// Candidate 1: Passed probe with non-zero Jitter (HasPassed = true)
+	cPassedWithJitter := "vless://passed-jitter@1.1.1.1:443#PassedWithJitter"
+	st.PutWithTransition(store.Result{
+		Link:     cPassedWithJitter,
+		Status:   store.StatusPassed,
+		Latency:  120 * time.Millisecond,
+		Jitter:   25 * time.Millisecond,
+		TestedAt: time.Now(),
+	})
+
+	// Candidate 2: Failed probe with non-zero Jitter (HasPassed = false)
+	// Must still format JitterFormatted because it comes from rec.Latest without HasPassed gate
+	cFailedWithJitter := "vless://failed-jitter@2.2.2.2:443#FailedWithJitter"
+	st.PutWithTransition(store.Result{
+		Link:     cFailedWithJitter,
+		Status:   store.StatusFailed,
+		Latency:  350 * time.Millisecond,
+		Jitter:   15 * time.Millisecond,
+		TestedAt: time.Now(),
+	})
+
+	// Candidate 3: Passed probe with zero Jitter (HasPassed = true, Jitter = 0)
+	cPassedZeroJitter := "vless://passed-zero@3.3.3.3:443#PassedZeroJitter"
+	st.PutWithTransition(store.Result{
+		Link:     cPassedZeroJitter,
+		Status:   store.StatusPassed,
+		Latency:  90 * time.Millisecond,
+		Jitter:   0,
+		TestedAt: time.Now(),
+	})
+
+	// Candidate 4: Failed probe with zero Jitter (HasPassed = false, Jitter = 0)
+	cFailedZeroJitter := "vless://failed-zero@4.4.4.4:443#FailedZeroJitter"
+	st.PutWithTransition(store.Result{
+		Link:     cFailedZeroJitter,
+		Status:   store.StatusFailed,
+		Latency:  400 * time.Millisecond,
+		Jitter:   0,
+		TestedAt: time.Now(),
+	})
+
+	rows := ad.CandidateRowsWindow(viewmodel.FilterAll, 0, 10)
+	rowMap := make(map[string]viewmodel.CandidateRowViewModel, len(rows))
+	for _, r := range rows {
+		rowMap[r.Remark] = r
+	}
+
+	// Verify Candidate 1
+	r1, ok := rowMap["PassedWithJitter"]
+	if !ok {
+		t.Fatal("missing row for PassedWithJitter")
+	}
+	if r1.JitterFormatted != "25ms" {
+		t.Errorf("expected PassedWithJitter row JitterFormatted '25ms', got %q", r1.JitterFormatted)
+	}
+	d1, ok := ad.CandidateDetail(r1.ID)
+	if !ok {
+		t.Fatal("missing detail for PassedWithJitter")
+	}
+	if d1.Jitter != 25*time.Millisecond {
+		t.Errorf("expected PassedWithJitter detail Jitter 25ms, got %v", d1.Jitter)
+	}
+
+	// Verify Candidate 2 (Failed probe, HasPassed = false, Jitter > 0)
+	r2, ok := rowMap["FailedWithJitter"]
+	if !ok {
+		t.Fatal("missing row for FailedWithJitter")
+	}
+	if r2.JitterFormatted != "15ms" {
+		t.Errorf("expected FailedWithJitter row JitterFormatted '15ms', got %q", r2.JitterFormatted)
+	}
+	d2, ok := ad.CandidateDetail(r2.ID)
+	if !ok {
+		t.Fatal("missing detail for FailedWithJitter")
+	}
+	if d2.Jitter != 15*time.Millisecond {
+		t.Errorf("expected FailedWithJitter detail Jitter 15ms, got %v", d2.Jitter)
+	}
+
+	// Verify Candidate 3 (Passed probe, HasPassed = true, Jitter = 0)
+	r3, ok := rowMap["PassedZeroJitter"]
+	if !ok {
+		t.Fatal("missing row for PassedZeroJitter")
+	}
+	if r3.JitterFormatted != "---" {
+		t.Errorf("expected PassedZeroJitter row JitterFormatted '---', got %q", r3.JitterFormatted)
+	}
+	d3, ok := ad.CandidateDetail(r3.ID)
+	if !ok {
+		t.Fatal("missing detail for PassedZeroJitter")
+	}
+	if d3.Jitter != 0 {
+		t.Errorf("expected PassedZeroJitter detail Jitter 0, got %v", d3.Jitter)
+	}
+
+	// Verify Candidate 4 (Failed probe, HasPassed = false, Jitter = 0)
+	r4, ok := rowMap["FailedZeroJitter"]
+	if !ok {
+		t.Fatal("missing row for FailedZeroJitter")
+	}
+	if r4.JitterFormatted != "---" {
+		t.Errorf("expected FailedZeroJitter row JitterFormatted '---', got %q", r4.JitterFormatted)
+	}
+	d4, ok := ad.CandidateDetail(r4.ID)
+	if !ok {
+		t.Fatal("missing detail for FailedZeroJitter")
+	}
+	if d4.Jitter != 0 {
+		t.Errorf("expected FailedZeroJitter detail Jitter 0, got %v", d4.Jitter)
+	}
+}
+
 func TestAdapter_ControllerMethods(t *testing.T) {
 	ad, st, _, _ := setupTestAdapter(t)
 

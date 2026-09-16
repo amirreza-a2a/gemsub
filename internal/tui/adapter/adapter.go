@@ -629,6 +629,11 @@ func (a *Adapter) materializeRowViewModel(entry store.CandidateIndexEntry, opaqu
 		latStr = entry.LastPassedLatency.Round(time.Millisecond).String()
 	}
 
+	jitStr := "---"
+	if entry.Jitter > 0 {
+		jitStr = entry.Jitter.Round(time.Millisecond).String()
+	}
+
 	glyphs := ""
 	if entry.HistoryCapacity > 0 {
 		glyphs = FormatHistoryGlyphsFromStatuses(entry.HistoryStatuses, entry.HistoryCount, entry.HistoryCapacity)
@@ -642,6 +647,7 @@ func (a *Adapter) materializeRowViewModel(entry store.CandidateIndexEntry, opaqu
 		Status:                 status,
 		ScoreFormatted:         scoreStr,
 		LatencyFormatted:       latStr,
+		JitterFormatted:        jitStr,
 		HistoryGlyphs:          glyphs,
 		Servable:               entry.Servable,
 		NetworkHealthy:         entry.NetworkHealthy,
@@ -818,6 +824,7 @@ func (a *Adapter) CandidateDetail(opaqueID string) (viewmodel.CandidateDetailVie
 		AbsentCycles:           rec.AbsentCycles,
 		TestedAt:               rec.Latest.TestedAt,
 		Latency:                rec.Latest.Latency,
+		Jitter:                 rec.Latest.Jitter,
 		Attempts:               rec.Latest.Attempts,
 		Warnings:               warnings,
 		Samples:                samples,

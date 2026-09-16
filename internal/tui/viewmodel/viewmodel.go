@@ -46,6 +46,7 @@ type CandidateRowViewModel struct {
 	Status                 string // PASS, FAIL, INCON, PEND, BLOCKED, DENIED
 	ScoreFormatted         string // e.g. "0.85" or "---"
 	LatencyFormatted       string // e.g. "142ms" or "---"
+	JitterFormatted        string // e.g. "12ms" or "---"
 	HistoryGlyphs          string // e.g. "[●●○×●●●●●●]"
 	Servable               bool
 	NetworkHealthy         bool
@@ -94,6 +95,7 @@ type CandidateDetailViewModel struct {
 	AbsentCycles           int
 	TestedAt               time.Time
 	Latency                time.Duration // Duration of latest probe
+	Jitter                 time.Duration
 	Attempts               int
 	Warnings               []string
 	Samples                []SampleViewModel

@@ -2471,6 +2471,7 @@ type CandidateIndexEntry struct {
 	EffectiveLatency       time.Duration
 	HistoryStatuses        [16]byte
 	HistoryCapacity        int
+	Jitter                 time.Duration
 }
 
 // CandidateIndex returns a lightweight slice of presentation index entries for all candidates.
@@ -2540,6 +2541,7 @@ func (s *Store) CandidateIndex() []CandidateIndexEntry {
 			EffectiveLatency:       effLat,
 			HistoryStatuses:        histStatuses,
 			HistoryCapacity:        rec.History.Capacity,
+			Jitter:                 rec.Latest.Jitter,
 		})
 	}
 	return out
