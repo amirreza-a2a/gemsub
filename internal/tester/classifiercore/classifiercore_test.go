@@ -18,26 +18,26 @@ func TestConstants(t *testing.T) {
 
 func TestClassifyCommonHTTPStatus_ExplicitCodes(t *testing.T) {
 	tests := []struct {
-		name          string
-		statusCode    int
-		header        http.Header
-		wantStatus    store.Status
-		wantCat       store.ErrorCategory
-		wantCode      int
-		wantReason    string
-		wantRetry     bool
-		wantRetryDur  *time.Duration
-		wantMatched   bool
+		name         string
+		statusCode   int
+		header       http.Header
+		wantStatus   store.Status
+		wantCat      store.ErrorCategory
+		wantCode     int
+		wantReason   string
+		wantRetry    bool
+		wantRetryDur *time.Duration
+		wantMatched  bool
 	}{
 		{
-			name:         "403 Forbidden",
-			statusCode:   http.StatusForbidden,
-			wantStatus:   store.StatusFailed,
-			wantCat:      store.ErrTargetDenied,
-			wantCode:     http.StatusForbidden,
-			wantReason:   "target HTTP 403 Forbidden",
-			wantRetry:    false,
-			wantMatched:  true,
+			name:        "403 Forbidden",
+			statusCode:  http.StatusForbidden,
+			wantStatus:  store.StatusFailed,
+			wantCat:     store.ErrTargetDenied,
+			wantCode:    http.StatusForbidden,
+			wantReason:  "target HTTP 403 Forbidden",
+			wantRetry:   false,
+			wantMatched: true,
 		},
 		{
 			name:         "429 Too Many Requests without header",
@@ -63,44 +63,44 @@ func TestClassifyCommonHTTPStatus_ExplicitCodes(t *testing.T) {
 			wantMatched:  true,
 		},
 		{
-			name:         "503 Service Unavailable",
-			statusCode:   http.StatusServiceUnavailable,
-			wantStatus:   store.StatusInconclusive,
-			wantCat:      store.ErrTargetError,
-			wantCode:     http.StatusServiceUnavailable,
-			wantReason:   "target HTTP 503 Service Unavailable",
-			wantRetry:    true,
-			wantMatched:  true,
+			name:        "503 Service Unavailable",
+			statusCode:  http.StatusServiceUnavailable,
+			wantStatus:  store.StatusInconclusive,
+			wantCat:     store.ErrTargetError,
+			wantCode:    http.StatusServiceUnavailable,
+			wantReason:  "target HTTP 503 Service Unavailable",
+			wantRetry:   true,
+			wantMatched: true,
 		},
 		{
-			name:         "500 Internal Server Error",
-			statusCode:   http.StatusInternalServerError,
-			wantStatus:   store.StatusInconclusive,
-			wantCat:      store.ErrTargetError,
-			wantCode:     http.StatusInternalServerError,
-			wantReason:   "target HTTP 500",
-			wantRetry:    false,
-			wantMatched:  true,
+			name:        "500 Internal Server Error",
+			statusCode:  http.StatusInternalServerError,
+			wantStatus:  store.StatusInconclusive,
+			wantCat:     store.ErrTargetError,
+			wantCode:    http.StatusInternalServerError,
+			wantReason:  "target HTTP 500",
+			wantRetry:   false,
+			wantMatched: true,
 		},
 		{
-			name:         "502 Bad Gateway",
-			statusCode:   http.StatusBadGateway,
-			wantStatus:   store.StatusInconclusive,
-			wantCat:      store.ErrTargetError,
-			wantCode:     http.StatusBadGateway,
-			wantReason:   "target HTTP 502",
-			wantRetry:    false,
-			wantMatched:  true,
+			name:        "502 Bad Gateway",
+			statusCode:  http.StatusBadGateway,
+			wantStatus:  store.StatusInconclusive,
+			wantCat:     store.ErrTargetError,
+			wantCode:    http.StatusBadGateway,
+			wantReason:  "target HTTP 502",
+			wantRetry:   false,
+			wantMatched: true,
 		},
 		{
-			name:         "504 Gateway Timeout",
-			statusCode:   http.StatusGatewayTimeout,
-			wantStatus:   store.StatusInconclusive,
-			wantCat:      store.ErrTargetError,
-			wantCode:     http.StatusGatewayTimeout,
-			wantReason:   "target HTTP 504",
-			wantRetry:    false,
-			wantMatched:  true,
+			name:        "504 Gateway Timeout",
+			statusCode:  http.StatusGatewayTimeout,
+			wantStatus:  store.StatusInconclusive,
+			wantCat:     store.ErrTargetError,
+			wantCode:    http.StatusGatewayTimeout,
+			wantReason:  "target HTTP 504",
+			wantRetry:   false,
+			wantMatched: true,
 		},
 	}
 
@@ -136,14 +136,14 @@ func TestClassifyCommonHTTPStatus_ExplicitCodes(t *testing.T) {
 
 func TestClassifyCommonHTTPStatus_UnmatchedFallthrough(t *testing.T) {
 	unmatchedCodes := []int{
-		http.StatusOK,                  // 200
-		http.StatusCreated,             // 201
-		http.StatusBadRequest,          // 400
-		http.StatusNotFound,            // 404
-		http.StatusTeapot,              // 418
-		http.StatusNotImplemented,             // 501
-		http.StatusHTTPVersionNotSupported,    // 505
-		599,                                   // 599
+		http.StatusOK,                      // 200
+		http.StatusCreated,                 // 201
+		http.StatusBadRequest,              // 400
+		http.StatusNotFound,                // 404
+		http.StatusTeapot,                  // 418
+		http.StatusNotImplemented,          // 501
+		http.StatusHTTPVersionNotSupported, // 505
+		599,                                // 599
 	}
 
 	for _, code := range unmatchedCodes {

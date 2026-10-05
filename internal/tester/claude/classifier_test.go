@@ -378,12 +378,12 @@ func TestClassifyResponse_OrdinaryPageWithSupportedCountriesLink(t *testing.T) {
 
 func TestClassifyResponse_UnexpectedStatusCodes(t *testing.T) {
 	unmatchedCodes := []int{
-		http.StatusBadRequest,                 // 400
-		http.StatusNotFound,                   // 404
-		http.StatusTeapot,                     // 418
-		http.StatusNotImplemented,             // 501
-		http.StatusHTTPVersionNotSupported,    // 505
-		599,                                   // 599
+		http.StatusBadRequest,              // 400
+		http.StatusNotFound,                // 404
+		http.StatusTeapot,                  // 418
+		http.StatusNotImplemented,          // 501
+		http.StatusHTTPVersionNotSupported, // 505
+		599,                                // 599
 	}
 
 	for _, code := range unmatchedCodes {
