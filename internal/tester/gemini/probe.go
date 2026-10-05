@@ -18,12 +18,10 @@ import (
 	"time"
 
 	"gemsub/internal/store"
+	"gemsub/internal/tester/classifiercore"
 	"gemsub/internal/tester/textutil"
 	"gemsub/internal/tester/transport"
 )
-
-// maxInspectBytes bounds payload inspection to 1MB.
-const maxInspectBytes = 1 << 20
 
 var (
 	// Flexible regex matching the ISO country code inside the vXmutd field of WIZ_global_data.
@@ -31,9 +29,6 @@ var (
 
 	// Matches explicit Gemini restriction flags in client state.
 	locationBlockRegex = regexp.MustCompile(`"LOCATION_REJECTED"|"no_access"|"GEO_RESTRICTED"`)
-
-	// Matches document title case-insensitively.
-	titleRegex = regexp.MustCompile(`(?i)<title[^>]*>([\s\S]*?)</title>`)
 )
 
 // List of ISO country codes restricted by Google AI services.
@@ -129,7 +124,7 @@ func Probe(ctx context.Context, dialFn transport.DialFunc, cfg Config) Result {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxInspectBytes)) // 1MB cap
+	body, err := io.ReadAll(io.LimitReader(resp.Body, classifiercore.MaxInspectBytes)) // 1MB cap
 	if err != nil {
 		return Result{
 			Status:   store.StatusFailed,
@@ -172,48 +167,26 @@ func classifyResponsePayload(resp *http.Response, body []byte, blockPhrases []st
 	}
 
 	statusCode := resp.StatusCode
+	var header http.Header
+	if resp != nil {
+		header = resp.Header
+	}
 
-	switch statusCode {
-	case http.StatusTooManyRequests: // 429
+	if common, ok := classifiercore.ClassifyCommonHTTPStatus(statusCode, header); ok {
 		return Result{
-			Status:     store.StatusInconclusive,
-			Category:   store.ErrTargetRateLimited,
-			StatusCode: 429,
-			Reason:     "target HTTP 429 Too Many Requests",
-			Retryable:  true,
+			Status:     common.Status,
+			Category:   common.Category,
+			StatusCode: common.StatusCode,
+			Reason:     common.Reason,
+			Retryable:  common.Retryable,
+			RetryAfter: common.RetryAfter,
 		}
+	}
 
-	case http.StatusServiceUnavailable: // 503
-		return Result{
-			Status:     store.StatusInconclusive,
-			Category:   store.ErrTargetError,
-			StatusCode: 503,
-			Reason:     "target HTTP 503 Service Unavailable",
-			Retryable:  true,
-		}
-
-	case http.StatusForbidden: // 403
-		return Result{
-			Status:     store.StatusFailed,
-			Category:   store.ErrTargetDenied,
-			StatusCode: 403,
-			Reason:     "target HTTP 403 Forbidden",
-			Retryable:  false,
-		}
-
-	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusGatewayTimeout:
-		return Result{
-			Status:     store.StatusInconclusive,
-			Category:   store.ErrTargetError,
-			StatusCode: statusCode,
-			Reason:     fmt.Sprintf("target HTTP %d", statusCode),
-			Retryable:  false,
-		}
-
-	case http.StatusOK:
-		// Bound inspection to at most maxInspectBytes (1MB).
-		if len(body) > maxInspectBytes {
-			body = body[:maxInspectBytes]
+	if statusCode == http.StatusOK {
+		// Bound inspection to at most MaxInspectBytes (1MB).
+		if len(body) > classifiercore.MaxInspectBytes {
+			body = body[:classifiercore.MaxInspectBytes]
 		}
 
 		// 1. Negative check: Country code verification from WIZ_global_data
@@ -258,16 +231,12 @@ func classifyResponsePayload(resp *http.Response, body []byte, blockPhrases []st
 		}
 
 		// 4. Negative check: Interception / captive portal / CDN challenges
-		if strings.Contains(normalized, "cf-chl-bypass") ||
-			strings.Contains(normalized, "attention required! | cloudflare") ||
-			strings.Contains(normalized, "just a moment...") ||
-			strings.Contains(normalized, "routeros") ||
-			strings.Contains(normalized, "mikrotik") {
+		if cat, reason, ok := classifiercore.DetectInterception(normalized); ok {
 			return Result{
 				Status:     store.StatusFailed,
-				Category:   store.ErrTargetOther,
+				Category:   cat,
 				StatusCode: 200,
-				Reason:     "interception: CDN challenge or captive portal page",
+				Reason:     reason,
 				Retryable:  false,
 			}
 		}
@@ -291,8 +260,8 @@ func classifyResponsePayload(resp *http.Response, body []byte, blockPhrases []st
 
 		// Signal B: Brand & Title signals
 		titleSignal := false
-		if matches := titleRegex.FindSubmatch(body); len(matches) > 1 {
-			titleText := strings.ToLower(string(matches[1]))
+		if title, ok := classifiercore.ExtractTitle(body); ok {
+			titleText := strings.ToLower(title)
 			if strings.Contains(titleText, "gemini") {
 				titleSignal = true
 			}
@@ -330,15 +299,14 @@ func classifyResponsePayload(resp *http.Response, body []byte, blockPhrases []st
 			Reason:     "target response missing verified Gemini origin and application markers (possible interception / false positive)",
 			Retryable:  false,
 		}
+	}
 
-	default:
-		return Result{
-			Status:     store.StatusFailed,
-			Category:   store.ErrTargetOther,
-			StatusCode: statusCode,
-			Reason:     fmt.Sprintf("unexpected HTTP status %d", statusCode),
-			Retryable:  false,
-		}
+	return Result{
+		Status:     store.StatusFailed,
+		Category:   store.ErrTargetOther,
+		StatusCode: statusCode,
+		Reason:     fmt.Sprintf("unexpected HTTP status %d", statusCode),
+		Retryable:  false,
 	}
 }
 
@@ -349,8 +317,5 @@ func classifyResponsePayload(resp *http.Response, body []byte, blockPhrases []st
 // any completed probe must be recorded with a positive duration (falling back
 // to time.Nanosecond).
 func clampLatency(d time.Duration) time.Duration {
-	if d <= 0 {
-		return time.Nanosecond
-	}
-	return d
+	return classifiercore.ClampLatency(d)
 }

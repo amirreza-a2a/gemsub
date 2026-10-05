@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"gemsub/internal/store"
+	"gemsub/internal/tester/classifiercore"
 	"gemsub/internal/tester/transport"
 )
 
@@ -31,10 +32,7 @@ type ProbeResult struct {
 }
 
 func clampLatency(d time.Duration) time.Duration {
-	if d <= 0 {
-		return time.Millisecond
-	}
-	return d
+	return classifiercore.ClampLatency(d)
 }
 
 // Probe executes the Claude application check using an established transport dialer.
@@ -101,7 +99,7 @@ func Probe(ctx context.Context, dialFn transport.DialFunc, cfg Config) ProbeResu
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxInspectBytes))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, classifiercore.MaxInspectBytes))
 	if err != nil {
 		return ProbeResult{
 			Status:     store.StatusFailed,

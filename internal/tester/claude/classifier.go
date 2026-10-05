@@ -8,19 +8,13 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
 	"gemsub/internal/store"
+	"gemsub/internal/tester/classifiercore"
 	"gemsub/internal/tester/textutil"
 )
-
-// maxInspectBytes bounds payload inspection to 1MB.
-const maxInspectBytes = 1 << 20
-
-// titleRegex matches the document title case-insensitively.
-var titleRegex = regexp.MustCompile(`(?i)<title[^>]*>([\s\S]*?)</title>`)
 
 // Result represents the outcome of evaluating an HTTP response for Claude availability.
 type Result struct {
@@ -44,58 +38,37 @@ func ClassifyResponse(resp *http.Response, body []byte) Result {
 	}
 
 	statusCode := resp.StatusCode
-
-	// 2. HTTP 429 Too Many Requests
-	if statusCode == http.StatusTooManyRequests {
-		res := Result{
-			Status:     store.StatusInconclusive,
-			Category:   store.ErrTargetRateLimited,
-			StatusCode: http.StatusTooManyRequests,
-			Reason:     "target HTTP 429 Too Many Requests",
-			Retryable:  true,
-		}
-		if resp.Header != nil {
-			res.RetryAfter = textutil.ParseRetryAfter(resp.Header.Get("Retry-After"))
-		}
-		return res
+	var header http.Header
+	if resp != nil {
+		header = resp.Header
 	}
 
-	// 3. HTTP 5xx Server Error
-	if statusCode >= 500 && statusCode <= 599 {
+	// 2. Common HTTP Status Codes (429, 503, 500, 502, 504, 403)
+	if common, ok := classifiercore.ClassifyCommonHTTPStatus(statusCode, header); ok {
 		return Result{
-			Status:     store.StatusInconclusive,
-			Category:   store.ErrTargetError,
-			StatusCode: statusCode,
-			Reason:     fmt.Sprintf("target HTTP %d", statusCode),
+			Status:     common.Status,
+			Category:   common.Category,
+			StatusCode: common.StatusCode,
+			Reason:     common.Reason,
+			Retryable:  common.Retryable,
+			RetryAfter: common.RetryAfter,
 		}
 	}
 
-	// 4. HTTP 403 Forbidden
-	if statusCode == http.StatusForbidden {
-		return Result{
-			Status:     store.StatusFailed,
-			Category:   store.ErrTargetDenied,
-			StatusCode: http.StatusForbidden,
-			Reason:     "target HTTP 403 Forbidden",
-		}
-	}
-
-	// Bound inspection to at most maxInspectBytes (1MB)
-	if len(body) > maxInspectBytes {
-		body = body[:maxInspectBytes]
+	// Bound inspection to at most MaxInspectBytes (1MB)
+	if len(body) > classifiercore.MaxInspectBytes {
+		body = body[:classifiercore.MaxInspectBytes]
 	}
 
 	normalized := textutil.NormalizeBytes(body)
 
-	// 5. Cloudflare / Interception challenge preemption
-	if strings.Contains(normalized, "cf-chl-bypass") ||
-		strings.Contains(normalized, "attention required! | cloudflare") ||
-		strings.Contains(normalized, "just a moment...") {
+	// 3. Cloudflare / Interception challenge preemption (including routeros and mikrotik)
+	if cat, reason, ok := classifiercore.DetectInterception(normalized); ok {
 		return Result{
 			Status:     store.StatusFailed,
-			Category:   store.ErrTargetOther,
+			Category:   cat,
 			StatusCode: statusCode,
-			Reason:     "interception: Cloudflare challenge or captive portal page",
+			Reason:     reason,
 		}
 	}
 
@@ -148,9 +121,8 @@ func hasSecondaryRegionBlock(rawBody []byte, normalized string) bool {
 	}
 
 	// Fallback 2: <title> containing app unavailable in region
-	if matches := titleRegex.FindSubmatch(rawBody); len(matches) > 1 {
-		titleText := strings.ToLower(string(matches[1]))
-		if strings.Contains(titleText, "app unavailable in region") {
+	if title, ok := classifiercore.ExtractTitle(rawBody); ok {
+		if strings.Contains(strings.ToLower(title), "app unavailable in region") {
 			return true
 		}
 	}

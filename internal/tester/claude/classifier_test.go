@@ -1,6 +1,7 @@
 package claude_test
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -60,7 +61,6 @@ func TestClassifyResponse_HTTP5xx(t *testing.T) {
 		http.StatusBadGateway,
 		http.StatusServiceUnavailable,
 		http.StatusGatewayTimeout,
-		599,
 	}
 
 	for _, code := range codes {
@@ -113,7 +113,7 @@ func TestClassifyResponse_CloudflarePrecedence(t *testing.T) {
 		if res.Category != store.ErrTargetOther {
 			t.Errorf("chal %q: expected ErrTargetOther (precedence over region block), got %v", chal, res.Category)
 		}
-		if res.Reason != "interception: Cloudflare challenge or captive portal page" {
+		if res.Reason != "interception: CDN challenge or captive portal page" {
 			t.Errorf("chal %q: unexpected reason %q", chal, res.Reason)
 		}
 	}
@@ -373,5 +373,105 @@ func TestClassifyResponse_OrdinaryPageWithSupportedCountriesLink(t *testing.T) {
 	}
 	if res.Reason != "ok" {
 		t.Errorf("expected reason 'ok', got %q", res.Reason)
+	}
+}
+
+func TestClassifyResponse_UnexpectedStatusCodes(t *testing.T) {
+	unmatchedCodes := []int{
+		http.StatusBadRequest,                 // 400
+		http.StatusNotFound,                   // 404
+		http.StatusTeapot,                     // 418
+		http.StatusNotImplemented,             // 501
+		http.StatusHTTPVersionNotSupported,    // 505
+		599,                                   // 599
+	}
+
+	for _, code := range unmatchedCodes {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			resp := &http.Response{StatusCode: code}
+			res := claude.ClassifyResponse(resp, nil)
+			if res.Status != store.StatusFailed {
+				t.Errorf("code %d: expected StatusFailed, got %v", code, res.Status)
+			}
+			if res.Category != store.ErrTargetOther {
+				t.Errorf("code %d: expected ErrTargetOther, got %v", code, res.Category)
+			}
+			if res.Retryable {
+				t.Errorf("code %d: expected Retryable == false, got true", code)
+			}
+			wantReason := "unexpected HTTP status " + http.StatusText(code)
+			_ = wantReason
+			if res.Reason != "unexpected HTTP status "+string(rune('0'+code/100))+string(rune('0'+(code/10)%10))+string(rune('0'+code%10)) {
+				// verify reason matches "unexpected HTTP status <code number>"
+				expected := "unexpected HTTP status " + fmt.Sprintf("%d", code)
+				if res.Reason != expected {
+					t.Errorf("code %d: expected reason %q, got %q", code, expected, res.Reason)
+				}
+			}
+		})
+	}
+}
+
+func TestClassifyResponse_Interception_RouterOS_MikroTik(t *testing.T) {
+	phrases := []string{
+		"routeros",
+		"RouterOS v7.1",
+		"mikrotik",
+		"MikroTik RouterOS",
+	}
+
+	for _, phrase := range phrases {
+		t.Run(phrase, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Request: &http.Request{
+					URL: parseURL("https://claude.ai/"),
+				},
+			}
+			body := []byte("<html><body>Welcome to " + phrase + " gateway login</body></html>")
+			res := claude.ClassifyResponse(resp, body)
+
+			if res.Status != store.StatusFailed {
+				t.Errorf("phrase %q: expected StatusFailed, got %v", phrase, res.Status)
+			}
+			if res.Category != store.ErrTargetOther {
+				t.Errorf("phrase %q: expected ErrTargetOther, got %v", phrase, res.Category)
+			}
+			if res.Reason != "interception: CDN challenge or captive portal page" {
+				t.Errorf("phrase %q: expected reason 'interception: CDN challenge or captive portal page', got %q", phrase, res.Reason)
+			}
+		})
+	}
+}
+
+func TestClaude_ClampLatency(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    time.Duration
+		expected time.Duration
+	}{
+		{"100ms preserved", 100 * time.Millisecond, 100 * time.Millisecond},
+		{"1ns preserved", 1 * time.Nanosecond, 1 * time.Nanosecond},
+		{"zero duration clamped to 1ns", 0, 1 * time.Nanosecond},
+		{"negative duration clamped to 1ns", -1 * time.Nanosecond, 1 * time.Nanosecond},
+		{"negative millisecond clamped to 1ns", -1 * time.Millisecond, 1 * time.Nanosecond},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := claude.ClampLatencyForTest(tt.input)
+			if got != tt.expected {
+				t.Errorf("ClampLatencyForTest(%v) = %v; want %v", tt.input, got, tt.expected)
+			}
+			// Explicit assertion that non-positive durations are clamped to 1ns, NOT 1ms
+			if tt.input <= 0 {
+				if got == time.Millisecond {
+					t.Errorf("ClampLatencyForTest(%v) was clamped to time.Millisecond (1ms), must be time.Nanosecond (1ns)", tt.input)
+				}
+				if got != time.Nanosecond {
+					t.Errorf("ClampLatencyForTest(%v) = %v; must be strictly time.Nanosecond", tt.input, got)
+				}
+			}
+		})
 	}
 }
