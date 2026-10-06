@@ -18,6 +18,11 @@ func (m *Model) RenderFooterForTest() string {
 	return m.renderFooter()
 }
 
+// RenderCandidateTableForTest exposes renderCandidateTable for testing.
+func (m *Model) RenderCandidateTableForTest() string {
+	return m.renderCandidateTable()
+}
+
 // SetStatusMessageForTest sets a status message on Model for testing.
 func (m *Model) SetStatusMessageForTest(msg string) {
 	m.statusMessage = msg

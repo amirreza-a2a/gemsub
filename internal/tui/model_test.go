@@ -48,16 +48,38 @@ func setupTestModel(t *testing.T) (*tui.Model, *store.Store, *events.EventBus, *
 }
 
 func TestModel_TerminalSizeFallback(t *testing.T) {
-	m, _, _, _ := setupTestModel(t)
+	m, st, _, _ := setupTestModel(t)
 
-	// 1. Initial size is 80x24 (normal)
+	// Populate candidate with long target to test narrow-terminal truncation
+	st.PutWithTransition(store.Result{
+		Link:     "vless://long-uuid-for-testing@very-long-domain-name-that-exceeds-width.example.com:443#VeryLongRemarkFieldExceedingTerminalWidth",
+		Status:   store.StatusPassed,
+		Latency:  50 * time.Millisecond,
+		Jitter:   12 * time.Millisecond,
+		TestedAt: time.Now(),
+	})
+
+	// Refresh model snapshot
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(*tui.Model)
+
+	// 1. Initial size is 80x24 (normal, minimum supported size)
 	viewNormal := m.View()
 	if strings.Contains(viewNormal, "Terminal window too small") {
 		t.Errorf("expected normal view at 80x24, got small fallback: %s", viewNormal)
 	}
+	if !strings.Contains(viewNormal, "JIT") {
+		t.Errorf("expected JIT column in normal view at 80x24, got: %s", viewNormal)
+	}
+	// At 80x24, endpointWidth = 80 - 56 = 24. A target longer than 24 must be truncated with ellipsis "…"
+	if !strings.Contains(viewNormal, "…") {
+		t.Errorf("expected long endpoint to be truncated with ellipsis at 80x24, got: %s", viewNormal)
+	}
 
 	// 2. Resize to 79x24 (width too small)
-	updated, _ := m.Update(tea.WindowSizeMsg{Width: 79, Height: 24})
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: 79, Height: 24})
 	m = updated.(*tui.Model)
 	viewSmall := m.View()
 	expectedMsg := "Terminal window too small (minimum: 80x24). Please enlarge."
@@ -79,6 +101,106 @@ func TestModel_TerminalSizeFallback(t *testing.T) {
 	viewBack := m.View()
 	if strings.Contains(viewBack, expectedMsg) {
 		t.Errorf("expected normal view after enlarging, got fallback: %s", viewBack)
+	}
+
+	// 5. Narrow terminal floor degradation on candidate table:
+	// Verify renderCandidateTable directly when width forces the 15-character floor (e.g. width 70 -> 70 - 56 = 14 < 15, clamped to 15)
+	m.SetWidthForTest(70)
+	tableNarrow := m.RenderCandidateTableForTest()
+	if !strings.Contains(tableNarrow, "JIT") {
+		t.Errorf("expected JIT column in table at narrow width 70, got: %s", tableNarrow)
+	}
+	if !strings.Contains(tableNarrow, "…") {
+		t.Errorf("expected truncated endpoint at narrow width 70, got: %s", tableNarrow)
+	}
+
+	// Extreme narrow test (width 50 -> 50 - 56 = -6 < 15, clamped to 15 floor): must not panic
+	m.SetWidthForTest(50)
+	tableFloor := m.RenderCandidateTableForTest()
+	if !strings.Contains(tableFloor, "JIT") {
+		t.Errorf("expected JIT column in table at floor width 50, got: %s", tableFloor)
+	}
+}
+
+func TestModel_CandidateTable_JITColumnAndAlignment(t *testing.T) {
+	m, st, _, _ := setupTestModel(t)
+
+	// Populate two candidates: one with jitter, one without
+	st.PutWithTransition(store.Result{
+		Link:     "vless://c1@1.1.1.1:443#WithJitter",
+		Status:   store.StatusPassed,
+		Latency:  50 * time.Millisecond,
+		Jitter:   25 * time.Millisecond,
+		TestedAt: time.Now(),
+	})
+	st.PutWithTransition(store.Result{
+		Link:     "vless://c2@2.2.2.2:443#WithoutJitter",
+		Status:   store.StatusPassed,
+		Latency:  40 * time.Millisecond,
+		Jitter:   0,
+		TestedAt: time.Now(),
+	})
+
+	// Toggle filter to trigger model refresh
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(*tui.Model)
+
+	view := m.View()
+
+	// 1. Verify header contains JIT positioned between LAT and HISTORY
+	latIdx := strings.Index(view, "LAT")
+	jitIdx := strings.Index(view, "JIT")
+	histIdx := strings.Index(view, "HISTORY")
+	if latIdx == -1 || jitIdx == -1 || histIdx == -1 {
+		t.Fatalf("expected LAT, JIT, and HISTORY columns in header, got view:\n%s", view)
+	}
+	if !(latIdx < jitIdx && jitIdx < histIdx) {
+		t.Errorf("expected column order LAT < JIT < HISTORY; got latIdx=%d, jitIdx=%d, histIdx=%d", latIdx, jitIdx, histIdx)
+	}
+
+	// 2. Verify row formatting
+	if !strings.Contains(view, "25ms") {
+		t.Errorf("expected table row to contain '25ms' under JIT column, got view:\n%s", view)
+	}
+	if !strings.Contains(view, "---") {
+		t.Errorf("expected table row without jitter to contain '---' under JIT column, got view:\n%s", view)
+	}
+}
+
+func TestModel_CandidateInspection_LatestJitter(t *testing.T) {
+	m, st, _, _ := setupTestModel(t)
+
+	st.PutWithTransition(store.Result{
+		Link:     "vless://c1@1.1.1.1:443#InspectionTarget",
+		Status:   store.StatusPassed,
+		Latency:  100 * time.Millisecond,
+		Jitter:   25 * time.Millisecond,
+		TestedAt: time.Now(),
+	})
+
+	// Refresh model
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(*tui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(*tui.Model)
+
+	// Press Enter to open candidate inspection detail view
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(*tui.Model)
+
+	viewDetail := m.View()
+	if !strings.Contains(viewDetail, "CANDIDATE INSPECTION") {
+		t.Fatalf("expected CANDIDATE INSPECTION view, got:\n%s", viewDetail)
+	}
+
+	// Verify Latest line contains Lat= and Jitter=25ms
+	if !strings.Contains(viewDetail, "Lat=100ms") {
+		t.Errorf("expected 'Lat=100ms' on Latest line, got:\n%s", viewDetail)
+	}
+	if !strings.Contains(viewDetail, "Jitter=25ms") {
+		t.Errorf("expected 'Jitter=25ms' on Latest line, got:\n%s", viewDetail)
 	}
 }
 
@@ -259,10 +381,12 @@ func TestModel_CountryFlagRendering(t *testing.T) {
 	})
 
 	m := tui.New(ad)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(*tui.Model)
 
 	// 1. ASCII mode: table and detail render [DE] Germany
 	ad.SetFlagMode(country.ModeASCII)
-	updated, _ := m.Update(tui.TickMsg(time.Now()))
+	updated, _ = m.Update(tui.TickMsg(time.Now()))
 	m = updated.(*tui.Model)
 
 	viewASCII := m.View()

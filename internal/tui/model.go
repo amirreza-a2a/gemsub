@@ -1420,8 +1420,8 @@ func (m *Model) renderCandidateTable() string {
 	selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("236")).Bold(true)
 
 	// Column header
-	headerStr := fmt.Sprintf("  %-4s %-6s %-7s %-6s %-7s %-12s %s",
-		"SERV", "PROTO", "STATUS", "SCORE", "LAT", "HISTORY", "ENDPOINT / REMARK")
+	headerStr := fmt.Sprintf("  %-4s %-6s %-7s %-6s %-7s %-6s %-12s %s",
+		"SERV", "PROTO", "STATUS", "SCORE", "LAT", "JIT", "HISTORY", "ENDPOINT / REMARK")
 	var sb strings.Builder
 	sb.WriteString(bold.Render(headerStr))
 	sb.WriteString("\n")
@@ -1438,7 +1438,7 @@ func (m *Model) renderCandidateTable() string {
 		end = m.totalRows
 	}
 
-	endpointWidth := m.width - 49
+	endpointWidth := m.width - 56
 	if endpointWidth < 15 {
 		endpointWidth = 15
 	}
@@ -1482,13 +1482,14 @@ func (m *Model) renderCandidateTable() string {
 			cursor = "> "
 		}
 
-		line := fmt.Sprintf("%s%-4s %-6s %-7s %-6s %-7s %-12s %s",
+		line := fmt.Sprintf("%s%-4s %-6s %-7s %-6s %-7s %-6s %-12s %s",
 			cursor,
 			servChar,
 			row.Protocol,
 			statusColor.Render(fmt.Sprintf("%-7s", row.Status)),
 			row.ScoreFormatted,
 			row.LatencyFormatted,
+			row.JitterFormatted,
 			row.HistoryGlyphs,
 			target,
 		)
@@ -1571,8 +1572,8 @@ func (m *Model) renderDetail() string {
 	sb.WriteString(fmt.Sprintf("  Transport: Status=%s  Latency=%s  Evidence=%s\n", transStatusStr, transLatStr, evidenceStr))
 	sb.WriteString(fmt.Sprintf("  Score:     %s  |  Proven: %t (Lat: %s)  |  AbsentCycles: %d\n",
 		m.detail.ScoreFormatted, m.detail.HasPassed, m.detail.ProvenLatencyFormatted, m.detail.AbsentCycles))
-	sb.WriteString(fmt.Sprintf("  Latest:    Status=%s  Category=%s  Code=%d  Lat=%v  Attempts=%d\n",
-		m.detail.Status, m.detail.Category, m.detail.StatusCode, m.detail.Latency, m.detail.Attempts))
+	sb.WriteString(fmt.Sprintf("  Latest:    Status=%s  Category=%s  Code=%d  Lat=%v  Jitter=%v  Attempts=%d\n",
+		m.detail.Status, m.detail.Category, m.detail.StatusCode, m.detail.Latency, m.detail.Jitter, m.detail.Attempts))
 	if m.detail.Reason != "" {
 		sb.WriteString(fmt.Sprintf("  Reason:    %s\n", m.detail.Reason))
 	}
