@@ -98,3 +98,6 @@ This continues the existing hydration pattern already established in
   status (`passed` -> `verification`; `failed`/`inconclusive` -> `rejection`).
   Configuration validation strictly rejects rules where the verdict contradicts
   the declared phase (e.g. `passed` inside `rejection`).
+  Each `match` block defines exactly one operator key: `equals`, `contains_any`,
+  `regex`, `regex_extract_in`, or `in_range`. Zero, multiple, or unknown operator
+  keys are strictly rejected.
