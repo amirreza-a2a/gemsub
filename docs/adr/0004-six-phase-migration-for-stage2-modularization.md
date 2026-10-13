@@ -22,6 +22,15 @@ Claude and any Tier 2 services have been converted and validated.
    rule set consumed by the engine. Validate with golden tests
    against the existing `claude.ClassifyResponse` outputs. Switch
    the production code path to the engine-backed classifier.
+   *Amendment (Phase 2)*: In the unified pipeline, the accepted-status
+   gate (default `[200]`) evaluates *before* payload inspection (matching
+   Gemini). Under legacy Claude procedural logic, payload inspection ran
+   on any status before the default 200 check. Therefore, a non-common,
+   non-accepted status returning a region marker (e.g. HTTP 451) diverges
+   from legacy `ErrRegionBlocked` to `ErrTargetOther` ("unexpected HTTP
+   status 451"). This divergence is intentional, aligns Claude with
+   the unified pipeline, and will be pinned by a golden test fixture in
+   Phase 3.
 
 4. **Tier 2 service support.** Implement the config schema
    (`test.services.<name>`) and the live-only Store treatment for
@@ -68,6 +77,15 @@ and Tier 2 services second (phase 4), we:
   WIZ_global_data, location rejection, Cloudflare challenges,
   captive portals, DOM markers) produces identical verdicts from
   both the old function and the new rule set.
+  *Amendment (Phase 2)*: The rule engine enforces an **interception-first**
+  evaluation order across all services (`Status Codes → Interception Preemption → Negative Rejections → Positive Verifications`).
+  For Gemini, this represents a deliberate, intentional behavior change
+  from the legacy organic ordering (where region block phrases ran before
+  interception detection). A captive portal or Cloudflare challenge is
+  not authoritative about geographical region; if a response triggers
+  both, the engine emits `ErrTargetOther` (interception) rather than
+  `ErrRegionBlocked`. This behavior will be pinned by an explicit golden
+  test fixture in Phase 5.
 - The migration is not atomic. During phases 3–5, the codebase will
   contain both engine-backed and function-backed classifiers
   simultaneously. This is intentional: incremental migration reduces

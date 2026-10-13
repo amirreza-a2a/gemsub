@@ -90,3 +90,11 @@ This continues the existing hydration pattern already established in
 - User-defined Tier 2 services (e.g. `my-custom-api` above) are
   configured entirely in this map. They get the live-only Store
   treatment described in ADR-0003.
+- *Amendment (Phase 2 Rule Schema)*: A rule in `test.services.<name>.rules`
+  supports both single-signal shorthand (`{"signal": ..., "match": {...}}`)
+  and composite conditions (`{"condition": {"all_of": [...]}}`). Each rule
+  can declare an optional `"phase"` field (`"interception"`, `"rejection"`,
+  or `"verification"`). When omitted, `"phase"` defaults based on the verdict
+  status (`passed` -> `verification`; `failed`/`inconclusive` -> `rejection`).
+  Configuration validation strictly rejects rules where the verdict contradicts
+  the declared phase (e.g. `passed` inside `rejection`).
