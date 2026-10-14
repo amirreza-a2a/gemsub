@@ -52,15 +52,22 @@ Claude and any Tier 2 services have been converted and validated.
    rule set. Validate with golden tests achieving full parity with
    the existing `gemini.ClassifyResponse` / `gemini.Probe` outputs.
    Switch the production code path only after parity is confirmed.
-   *Amendment (Phase 2 - 1MB Regex Performance Baseline)*: Phase 2 pprof
-   benchmarks against a 1MB payload (`BenchmarkEvaluate_1MBBody` vs
-   `BenchmarkLegacyGemini_1MBBody`) established that scanning raw 1MB payloads
-   with unanchored regexes accounts for ~90% of evaluation latency (~45ms vs
-   ~14ms in legacy). Generic literal anchor derivation cannot be performed
-   safely across arbitrary regexes without risking false negatives. Phase 5
-   must not migrate Gemini to production until a verified prefilter or
-   literal-anchored condition pattern is established for large raw body
-   inspections.
+   *Amendment (Phase 2 - Verbatim Regex Parity and 1MB Performance Gate)*:
+   Benchmarking against identical 1MB payloads demonstrated that when Gemini's
+   regex patterns are ported VERBATIM (using `classifiercore.GeminiCountryCodePattern`
+   with `RegexExtractIn` and `classifiercore.GeminiLocationBlockPattern`), Go's
+   internal prefix search optimizations remain fully intact: `Evaluate` runs in
+   ~3.0ms (4x faster than legacy Gemini's ~12.3ms, which re-normalizes every probe),
+   allocating only 214 B/op vs 1.05 MB/op. An earlier synthetic benchmark that
+   stripped quotes from `LOCATION_REJECTED|no_access` defeated Go's prefix scanner,
+   artificially inflating latency to ~44ms.
+   Therefore, Phase 5 must port the legacy regex patterns VERBATIM (never rewrite
+   or simplify them). Furthermore, the Phase 5 parity suite must include this 1MB
+   benchmark with an explicit performance gate: `Evaluate` on a pre-built
+   `EvaluationContext` must execute within 50% of legacy latency (≤ 0.5× legacy
+   ns/op), and end-to-end `BuildAndEvaluate` must execute within 40% of legacy
+   latency across all payload variants (passing, worst-case non-matching, and
+   early-matching).
 
 6. **Legacy cleanup.** Remove the old classifier functions, collapse
    `test.target_url` / `test.block_phrases` / `test.claude` legacy

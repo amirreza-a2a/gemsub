@@ -21,6 +21,18 @@ import (
 // MaxInspectBytes bounds payload inspection to 1MB.
 const MaxInspectBytes = 1 << 20
 
+// GeminiCountryCodePattern matches the ISO country code inside the vXmutd field of WIZ_global_data.
+// This is the canonical verbatim pattern from gemini/probe.go:28.
+const GeminiCountryCodePattern = `"vXmutd"\s*:\s*"(?:\\.|[^"\\])*?\\?"([A-Z]{2})\\?"`
+
+// GeminiLocationBlockPattern matches explicit Gemini restriction flags in client state.
+// This is the canonical verbatim pattern from gemini/probe.go:31.
+const GeminiLocationBlockPattern = `"LOCATION_REJECTED"|"no_access"|"GEO_RESTRICTED"`
+
+// GeminiRestrictedCountries lists the ISO country codes restricted by Google AI services.
+// This is the canonical set from gemini/probe.go:35.
+var GeminiRestrictedCountries = []string{"IR", "RU", "CU", "SY", "KP", "BY"}
+
 // TitleRegex matches HTML document title case-insensitively.
 var TitleRegex = regexp.MustCompile(`(?i)<title[^>]*>([\s\S]*?)</title>`)
 

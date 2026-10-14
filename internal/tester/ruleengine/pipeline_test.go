@@ -773,7 +773,71 @@ func TestEvaluate_LiteralRuleSetWithInvalidRule_CannotBypassValidation(t *testin
 	}
 }
 
-func buildBenchmark1MBPayload() ([]byte, *http.Response) {
+func makeBenchmarkGeminiRuleSet(blockPhrases []string) *ruleengine.RuleSet {
+	originProof := ruleengine.AnyOf(
+		ruleengine.NewLeafCondition(ruleengine.HeaderSignal("Server"), ruleengine.MustRegex(`(?i)ESF|GSE|SFFE|GWS`)),
+		ruleengine.NewLeafCondition(ruleengine.CookieDomainSignal(), ruleengine.ContainsAny("google.com", "gemini.google.com")),
+	)
+	titleOrBrand := ruleengine.AnyOf(
+		ruleengine.NewLeafCondition(ruleengine.TitleSignal(), ruleengine.ContainsAny("gemini")),
+		ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny("gemini")),
+	)
+	appMarkers := ruleengine.AllOf(
+		ruleengine.NewLeafCondition(ruleengine.TitleSignal(), ruleengine.ContainsAny("gemini")),
+		ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny("bardchatui", "wiz_global_data", "google gemini")),
+	)
+	geminiPositiveVerification := ruleengine.AnyOf(
+		ruleengine.AllOf(originProof, titleOrBrand),
+		appMarkers,
+	)
+
+	rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+		Name:                     "gemini",
+		Mode:                     ruleengine.ModeStrict,
+		StrictModeFallbackReason: "target response missing verified Gemini origin and application markers (possible interception / false positive)",
+		Rules: []ruleengine.Rule{
+			// 1. Negative check: Country code verification from WIZ_global_data (verbatim)
+			{
+				Phase: "rejection",
+				Condition: ruleengine.NewLeafCondition(
+					ruleengine.RawBodySignal(),
+					ruleengine.MustRegexExtractIn(classifiercore.GeminiCountryCodePattern, classifiercore.GeminiRestrictedCountries),
+				),
+				Verdict: ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "restricted country detected in WIZ_global_data"},
+			},
+			// 2. Negative check: Explicit restriction flags (verbatim)
+			{
+				Phase: "rejection",
+				Condition: ruleengine.NewLeafCondition(
+					ruleengine.RawBodySignal(),
+					ruleengine.MustRegex(classifiercore.GeminiLocationBlockPattern),
+				),
+				Verdict: ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "gemini restriction flag detected (LOCATION_REJECTED / no_access)"},
+			},
+			// 3. Negative check: Static block phrases
+			{
+				Phase: "rejection",
+				Condition: ruleengine.NewLeafCondition(
+					ruleengine.NormalizedBodySignal(),
+					ruleengine.ContainsAny(blockPhrases...),
+				),
+				Verdict: ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "target returned regional restriction message"},
+			},
+			// 4. Positive verification
+			{
+				Phase:     "verification",
+				Condition: geminiPositiveVerification,
+				Verdict:   ruleengine.Verdict{Status: store.StatusPassed, Category: store.ErrNone, Reason: "ok"},
+			},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return rs
+}
+
+func buildBenchmark1MBPayload_Passing() ([]byte, *http.Response) {
 	snippet := "<div class=\"content\">Gemini isn\u2019t supported &amp; &#8217;available&#8217; in region \u201cXYZ\u201d.\n\t  Lots   of    spaces   and\tnewlines.\n</div>\n"
 	var sb strings.Builder
 	sb.WriteString("<!doctype html><html><head><title>Google Gemini</title></head><body><div id=\"bardchatui\">")
@@ -792,61 +856,57 @@ func buildBenchmark1MBPayload() ([]byte, *http.Response) {
 	return payload, resp
 }
 
-func BenchmarkEvaluate_1MBBody(b *testing.B) {
-	// Build Gemini's full verification rule set shape
-	originProof := ruleengine.AnyOf(
-		ruleengine.NewLeafCondition(ruleengine.HeaderSignal("Server"), ruleengine.MustRegex(`(?i)ESF|GSE|SFFE|GWS`)),
-		ruleengine.NewLeafCondition(ruleengine.CookieDomainSignal(), ruleengine.ContainsAny("google.com", "gemini.google.com")),
-	)
-	titleOrBrand := ruleengine.AnyOf(
-		ruleengine.NewLeafCondition(ruleengine.TitleSignal(), ruleengine.ContainsAny("gemini")),
-		ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny("gemini")),
-	)
-	appMarkers := ruleengine.AllOf(
-		ruleengine.NewLeafCondition(ruleengine.TitleSignal(), ruleengine.ContainsAny("gemini")),
-		ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny("bardchatui", "wiz_global_data", "google gemini")),
-	)
-	geminiPositiveVerification := ruleengine.AnyOf(
-		ruleengine.AllOf(originProof, titleOrBrand),
-		appMarkers,
-	)
-
-	rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
-		Name:                     "gemini",
-		Mode:                     ruleengine.ModeStrict,
-		StrictModeFallbackReason: "possible interception / false positive: positive verification signals absent",
-		Rules: []ruleengine.Rule{
-			// Negative checks
-			{
-				Phase:     "rejection",
-				Condition: ruleengine.NewLeafCondition(ruleengine.RawBodySignal(), ruleengine.MustRegex(`"2003":\s*"([A-Z]{2})"`)),
-				Verdict:   ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "restricted country"},
-			},
-			{
-				Phase:     "rejection",
-				Condition: ruleengine.NewLeafCondition(ruleengine.RawBodySignal(), ruleengine.MustRegex(`LOCATION_REJECTED|no_access`)),
-				Verdict:   ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "restriction flag"},
-			},
-			{
-				Phase: "rejection",
-				Condition: ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny(
-					"gemini isn't available", "not available in your country", "supported languages and countries",
-				)),
-				Verdict: ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "region restriction message"},
-			},
-			// Positive verification
-			{
-				Phase:     "verification",
-				Condition: geminiPositiveVerification,
-				Verdict:   ruleengine.Verdict{Status: store.StatusPassed, Category: store.ErrNone, Reason: "ok"},
-			},
-		},
-	})
-	if err != nil {
-		b.Fatalf("NewRuleSet error: %v", err)
+func buildBenchmark1MBPayload_WorstCase_NoMatch() ([]byte, *http.Response) {
+	snippet := "<div class=\"content\">Unrelated plain content for performance benchmark without any keywords.\n</div>\n"
+	var sb strings.Builder
+	sb.WriteString("<!doctype html><html><head><title>Unrelated Domain Landing</title></head><body>")
+	for sb.Len() < 1<<20 {
+		sb.WriteString(snippet)
 	}
+	sb.WriteString("</body></html>")
+	payload := []byte(sb.String())
 
-	bodyBytes, resp := buildBenchmark1MBPayload()
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Server": []string{"Apache"},
+		},
+	}
+	return payload, resp
+}
+
+func buildBenchmark1MBPayload_EarlyMatch() ([]byte, *http.Response) {
+	snippet := "<div class=\"content\">Filler payload stream content.\n</div>\n"
+	var sb strings.Builder
+	sb.WriteString("<!doctype html><html><head><title>Google Gemini</title></head><body>")
+	sb.WriteString("<div id=\"LOCATION_REJECTED\">\n")
+	for sb.Len() < 1<<20 {
+		sb.WriteString(snippet)
+	}
+	sb.WriteString("</div></body></html>")
+	payload := []byte(sb.String())
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Server": []string{"ESF"},
+		},
+	}
+	return payload, resp
+}
+
+// -----------------------------------------------------------------------------
+// Variant 1: Passing 1MB Payload
+// -----------------------------------------------------------------------------
+
+func BenchmarkEvaluate_1MBBody(b *testing.B) {
+	BenchmarkEvaluate_1MBBody_Passing(b)
+}
+
+func BenchmarkEvaluate_1MBBody_Passing(b *testing.B) {
+	blockPhrases := []string{"isn't currently supported in your country"}
+	rs := makeBenchmarkGeminiRuleSet(blockPhrases)
+	bodyBytes, resp := buildBenchmark1MBPayload_Passing()
 	ctx := ruleengine.BuildEvaluationContext(resp, bodyBytes, 25*time.Millisecond)
 
 	b.ResetTimer()
@@ -860,7 +920,11 @@ func BenchmarkEvaluate_1MBBody(b *testing.B) {
 }
 
 func BenchmarkLegacyGemini_1MBBody(b *testing.B) {
-	bodyBytes, resp := buildBenchmark1MBPayload()
+	BenchmarkLegacyGemini_1MBBody_Passing(b)
+}
+
+func BenchmarkLegacyGemini_1MBBody_Passing(b *testing.B) {
+	bodyBytes, resp := buildBenchmark1MBPayload_Passing()
 	blockPhrases := []string{"isn't currently supported in your country"}
 
 	b.ResetTimer()
@@ -873,58 +937,10 @@ func BenchmarkLegacyGemini_1MBBody(b *testing.B) {
 	}
 }
 
-func BenchmarkBuildAndEvaluate_1MBBody(b *testing.B) {
-	originProof := ruleengine.AnyOf(
-		ruleengine.NewLeafCondition(ruleengine.HeaderSignal("Server"), ruleengine.MustRegex(`(?i)ESF|GSE|SFFE|GWS`)),
-		ruleengine.NewLeafCondition(ruleengine.CookieDomainSignal(), ruleengine.ContainsAny("google.com", "gemini.google.com")),
-	)
-	titleOrBrand := ruleengine.AnyOf(
-		ruleengine.NewLeafCondition(ruleengine.TitleSignal(), ruleengine.ContainsAny("gemini")),
-		ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny("gemini")),
-	)
-	appMarkers := ruleengine.AllOf(
-		ruleengine.NewLeafCondition(ruleengine.TitleSignal(), ruleengine.ContainsAny("gemini")),
-		ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny("bardchatui", "wiz_global_data", "google gemini")),
-	)
-	geminiPositiveVerification := ruleengine.AnyOf(
-		ruleengine.AllOf(originProof, titleOrBrand),
-		appMarkers,
-	)
-
-	rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
-		Name:                     "gemini",
-		Mode:                     ruleengine.ModeStrict,
-		StrictModeFallbackReason: "possible interception / false positive: positive verification signals absent",
-		Rules: []ruleengine.Rule{
-			{
-				Phase:     "rejection",
-				Condition: ruleengine.NewLeafCondition(ruleengine.RawBodySignal(), ruleengine.MustRegex(`"2003":\s*"([A-Z]{2})"`)),
-				Verdict:   ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "restricted country"},
-			},
-			{
-				Phase:     "rejection",
-				Condition: ruleengine.NewLeafCondition(ruleengine.RawBodySignal(), ruleengine.MustRegex(`LOCATION_REJECTED|no_access`)),
-				Verdict:   ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "restriction flag"},
-			},
-			{
-				Phase: "rejection",
-				Condition: ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny(
-					"gemini isn't available", "not available in your country", "supported languages and countries",
-				)),
-				Verdict: ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "region restriction message"},
-			},
-			{
-				Phase:     "verification",
-				Condition: geminiPositiveVerification,
-				Verdict:   ruleengine.Verdict{Status: store.StatusPassed, Category: store.ErrNone, Reason: "ok"},
-			},
-		},
-	})
-	if err != nil {
-		b.Fatalf("NewRuleSet error: %v", err)
-	}
-
-	bodyBytes, resp := buildBenchmark1MBPayload()
+func BenchmarkBuildAndEvaluate_1MBBody_Passing(b *testing.B) {
+	blockPhrases := []string{"isn't currently supported in your country"}
+	rs := makeBenchmarkGeminiRuleSet(blockPhrases)
+	bodyBytes, resp := buildBenchmark1MBPayload_Passing()
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -933,6 +949,106 @@ func BenchmarkBuildAndEvaluate_1MBBody(b *testing.B) {
 		res := ruleengine.Evaluate(ctx, rs)
 		if res.Status != store.StatusPassed {
 			b.Fatalf("expected StatusPassed, got %v (%s)", res.Status, res.Reason)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Variant 2: Worst-Case No-Match (Full scan of all regexes and fallback)
+// -----------------------------------------------------------------------------
+
+func BenchmarkEvaluate_1MBBody_WorstCase_NoMatch(b *testing.B) {
+	blockPhrases := []string{"isn't currently supported in your country"}
+	rs := makeBenchmarkGeminiRuleSet(blockPhrases)
+	bodyBytes, resp := buildBenchmark1MBPayload_WorstCase_NoMatch()
+	ctx := ruleengine.BuildEvaluationContext(resp, bodyBytes, 25*time.Millisecond)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		res := ruleengine.Evaluate(ctx, rs)
+		if res.Status != store.StatusFailed {
+			b.Fatalf("expected StatusFailed, got %v (%s)", res.Status, res.Reason)
+		}
+	}
+}
+
+func BenchmarkLegacyGemini_1MBBody_WorstCase_NoMatch(b *testing.B) {
+	bodyBytes, resp := buildBenchmark1MBPayload_WorstCase_NoMatch()
+	blockPhrases := []string{"isn't currently supported in your country"}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		res := gemini.ClassifyResponse(resp, bodyBytes, blockPhrases)
+		if res.Status != store.StatusFailed {
+			b.Fatalf("expected StatusFailed, got %v (%s)", res.Status, res.Reason)
+		}
+	}
+}
+
+func BenchmarkBuildAndEvaluate_1MBBody_WorstCase_NoMatch(b *testing.B) {
+	blockPhrases := []string{"isn't currently supported in your country"}
+	rs := makeBenchmarkGeminiRuleSet(blockPhrases)
+	bodyBytes, resp := buildBenchmark1MBPayload_WorstCase_NoMatch()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		ctx := ruleengine.BuildEvaluationContext(resp, bodyBytes, 25*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, rs)
+		if res.Status != store.StatusFailed {
+			b.Fatalf("expected StatusFailed, got %v (%s)", res.Status, res.Reason)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Variant 3: Early Match (Rejection in first 100 bytes)
+// -----------------------------------------------------------------------------
+
+func BenchmarkEvaluate_1MBBody_EarlyMatch(b *testing.B) {
+	blockPhrases := []string{"isn't currently supported in your country"}
+	rs := makeBenchmarkGeminiRuleSet(blockPhrases)
+	bodyBytes, resp := buildBenchmark1MBPayload_EarlyMatch()
+	ctx := ruleengine.BuildEvaluationContext(resp, bodyBytes, 25*time.Millisecond)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		res := ruleengine.Evaluate(ctx, rs)
+		if res.Status != store.StatusFailed || res.Category != store.ErrRegionBlocked {
+			b.Fatalf("expected StatusFailed/ErrRegionBlocked, got %v/%v (%s)", res.Status, res.Category, res.Reason)
+		}
+	}
+}
+
+func BenchmarkLegacyGemini_1MBBody_EarlyMatch(b *testing.B) {
+	bodyBytes, resp := buildBenchmark1MBPayload_EarlyMatch()
+	blockPhrases := []string{"isn't currently supported in your country"}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		res := gemini.ClassifyResponse(resp, bodyBytes, blockPhrases)
+		if res.Status != store.StatusFailed || res.Category != store.ErrRegionBlocked {
+			b.Fatalf("expected StatusFailed/ErrRegionBlocked, got %v/%v (%s)", res.Status, res.Category, res.Reason)
+		}
+	}
+}
+
+func BenchmarkBuildAndEvaluate_1MBBody_EarlyMatch(b *testing.B) {
+	blockPhrases := []string{"isn't currently supported in your country"}
+	rs := makeBenchmarkGeminiRuleSet(blockPhrases)
+	bodyBytes, resp := buildBenchmark1MBPayload_EarlyMatch()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		ctx := ruleengine.BuildEvaluationContext(resp, bodyBytes, 25*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, rs)
+		if res.Status != store.StatusFailed || res.Category != store.ErrRegionBlocked {
+			b.Fatalf("expected StatusFailed/ErrRegionBlocked, got %v/%v (%s)", res.Status, res.Category, res.Reason)
 		}
 	}
 }
