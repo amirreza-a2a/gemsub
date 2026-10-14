@@ -39,12 +39,19 @@ func Evaluate(ctx *EvaluationContext, spec *RuleSet) Result {
 		}
 	}
 
-	// Auto-partition if created directly as a struct literal without NewRuleSet
-	if len(spec.Interceptions) == 0 && len(spec.Rejections) == 0 && len(spec.Verifications) == 0 && len(spec.Rules) > 0 {
-		_ = spec.initAndValidate()
-	}
-
 	clampedLatency := classifiercore.ClampLatency(ctx.MeasuredLatency)
+
+	if !spec.initialized {
+		return Result{
+			Status:     store.StatusFailed,
+			Category:   store.ErrConfig,
+			StatusCode: ctx.StatusCode,
+			Reason:     "uninitialized ruleset: must be constructed via NewRuleSet or unmarshaled from valid JSON",
+			Latency:    clampedLatency,
+			Retryable:  false,
+			RetryAfter: ctx.RetryAfter,
+		}
+	}
 
 	// Phase 1: Common HTTP Status Codes
 	if common, ok := classifiercore.ClassifyCommonHTTPStatus(ctx.StatusCode, ctx.Headers); ok {

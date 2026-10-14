@@ -22,7 +22,7 @@ Claude and any Tier 2 services have been converted and validated.
    rule set consumed by the engine. Validate with golden tests
    against the existing `claude.ClassifyResponse` outputs. Switch
    the production code path to the engine-backed classifier.
-   *Amendment (Phase 2)*: In the unified pipeline, the accepted-status
+   *Amendment (Phase 2 - Gating Divergence)*: In the unified pipeline, the accepted-status
    gate (default `[200]`) evaluates *before* payload inspection (matching
    Gemini). Under legacy Claude procedural logic, payload inspection ran
    on any status before the default 200 check. Therefore, a non-common,
@@ -31,6 +31,17 @@ Claude and any Tier 2 services have been converted and validated.
    status 451"). This divergence is intentional, aligns Claude with
    the unified pipeline, and will be pinned by a golden test fixture in
    Phase 3.
+   *Amendment (Phase 2 - Canonical Link Deduplication)*: `claude/classifier.go`
+   temporarily retains its procedural `hasCanonicalLinkRegionBlock` scanner
+   alongside `classifiercore.ExtractCanonicalLink`. The implementations differ:
+   the legacy scanner inspects the entire `<link>` tag byte slice for the
+   region slug, whereas `classifiercore.ExtractCanonicalLink` parses HTML attributes
+   and extracts only the `href` attribute value for `SignalCanonicalLink`.
+   Phase 3 must delete `hasCanonicalLinkRegionBlock` from `claude/classifier.go`.
+   Before deleting it, Phase 3 must add a differential test executing both
+   implementations over every existing Claude response fixture (including
+   `examples/stage2_inspector` and unit test fixtures) asserting identical
+   classification verdicts.
 
 4. **Tier 2 service support.** Implement the config schema
    (`test.services.<name>`) and the live-only Store treatment for
@@ -41,6 +52,15 @@ Claude and any Tier 2 services have been converted and validated.
    rule set. Validate with golden tests achieving full parity with
    the existing `gemini.ClassifyResponse` / `gemini.Probe` outputs.
    Switch the production code path only after parity is confirmed.
+   *Amendment (Phase 2 - 1MB Regex Performance Baseline)*: Phase 2 pprof
+   benchmarks against a 1MB payload (`BenchmarkEvaluate_1MBBody` vs
+   `BenchmarkLegacyGemini_1MBBody`) established that scanning raw 1MB payloads
+   with unanchored regexes accounts for ~90% of evaluation latency (~45ms vs
+   ~14ms in legacy). Generic literal anchor derivation cannot be performed
+   safely across arbitrary regexes without risking false negatives. Phase 5
+   must not migrate Gemini to production until a verified prefilter or
+   literal-anchored condition pattern is established for large raw body
+   inspections.
 
 6. **Legacy cleanup.** Remove the old classifier functions, collapse
    `test.target_url` / `test.block_phrases` / `test.claude` legacy

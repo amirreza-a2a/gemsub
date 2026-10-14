@@ -38,6 +38,13 @@ type RuleSet struct {
 	Interceptions []Rule `json:"-"`
 	Rejections    []Rule `json:"-"`
 	Verifications []Rule `json:"-"`
+
+	initialized bool
+}
+
+// Initialized reports whether the RuleSet has been properly validated and partitioned.
+func (rs *RuleSet) Initialized() bool {
+	return rs != nil && rs.initialized
 }
 
 // RuleSetConfig configures a new RuleSet instance.
@@ -79,6 +86,8 @@ func (rs *RuleSet) Validate() error {
 }
 
 func (rs *RuleSet) initAndValidate() error {
+	rs.initialized = false
+
 	if rs.Mode == "" {
 		rs.Mode = ModeStrict
 	}
@@ -148,6 +157,7 @@ func (rs *RuleSet) initAndValidate() error {
 		}
 	}
 
+	rs.initialized = true
 	return nil
 }
 

@@ -5,11 +5,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"gemsub/internal/store"
 	"gemsub/internal/tester/classifiercore"
+	"gemsub/internal/tester/gemini"
 	"gemsub/internal/tester/ruleengine"
 )
 
@@ -655,6 +657,141 @@ func TestEvaluate_LatencyClamping(t *testing.T) {
 	}
 }
 
+func TestEvaluate_ConcurrentSharedRuleSet_NoDataRace(t *testing.T) {
+	rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+		Name: "test-concurrent",
+		Mode: ruleengine.ModeStrict,
+		Rules: []ruleengine.Rule{
+			{
+				Phase:     "interception",
+				Condition: ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny("portal")),
+				Verdict:   ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrTargetOther, Reason: "portal"},
+			},
+			{
+				Phase:     "rejection",
+				Condition: ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny("blocked")),
+				Verdict:   ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "blocked"},
+			},
+			{
+				Phase:     "verification",
+				Condition: ruleengine.NewLeafCondition(ruleengine.TitleSignal(), ruleengine.ContainsAny("gemini")),
+				Verdict:   ruleengine.Verdict{Status: store.StatusPassed, Category: store.ErrNone, Reason: "ok"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRuleSet error: %v", err)
+	}
+
+	const goroutines = 50
+	const iterations = 100
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for g := 0; g < goroutines; g++ {
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				var resp *http.Response
+				var body []byte
+				switch (id + i) % 4 {
+				case 0:
+					resp = &http.Response{StatusCode: 200, Header: http.Header{}}
+					body = []byte("<html><head><title>Gemini</title></head><body>ok</body></html>")
+				case 1:
+					resp = &http.Response{StatusCode: 200, Header: http.Header{}}
+					body = []byte("<html><body>blocked in region</body></html>")
+				case 2:
+					resp = &http.Response{StatusCode: 200, Header: http.Header{}}
+					body = []byte("<html><body>captive portal challenge</body></html>")
+				case 3:
+					resp = &http.Response{StatusCode: 503, Header: http.Header{}}
+					body = []byte("service unavailable")
+				}
+				ctx := ruleengine.BuildEvaluationContext(resp, body, 10*time.Millisecond)
+				res := ruleengine.Evaluate(ctx, rs)
+				if res.Latency <= 0 {
+					t.Errorf("expected positive latency, got %v", res.Latency)
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+}
+
+func TestEvaluate_UninitializedRuleSet_RejectedWithErrConfig(t *testing.T) {
+	resp := &http.Response{StatusCode: 200, Header: http.Header{}}
+	ctx := ruleengine.BuildEvaluationContext(resp, []byte("body"), 10*time.Millisecond)
+
+	// Bare struct literal that was never initialized:
+	literalRS := &ruleengine.RuleSet{
+		Name: "uninitialized-literal",
+		Mode: ruleengine.ModePermissive,
+	}
+
+	res := ruleengine.Evaluate(ctx, literalRS)
+	if res.Status != store.StatusFailed {
+		t.Errorf("Status = %v, want StatusFailed", res.Status)
+	}
+	if res.Category != store.ErrConfig {
+		t.Errorf("Category = %v, want ErrConfig", res.Category)
+	}
+	if !strings.Contains(res.Reason, "uninitialized") {
+		t.Errorf("Reason = %q, want mention of uninitialized", res.Reason)
+	}
+}
+
+func TestEvaluate_LiteralRuleSetWithInvalidRule_CannotBypassValidation(t *testing.T) {
+	resp := &http.Response{StatusCode: 200, Header: http.Header{}}
+	ctx := ruleengine.BuildEvaluationContext(resp, []byte("body"), 10*time.Millisecond)
+
+	// Literal with an invalid rule (passed verdict inside a rejection phase)
+	// that would bypass NewRuleSet validation if lazy init were permitted:
+	invalidRS := &ruleengine.RuleSet{
+		Name: "invalid-literal",
+		Mode: ruleengine.ModeStrict,
+		Rules: []ruleengine.Rule{
+			{
+				Phase:     "rejection",
+				Condition: ruleengine.NewLeafCondition(ruleengine.TitleSignal(), ruleengine.Equals("ok")),
+				Verdict:   ruleengine.Verdict{Status: store.StatusPassed, Category: store.ErrNone, Reason: "ok"},
+			},
+		},
+	}
+
+	res := ruleengine.Evaluate(ctx, invalidRS)
+	if res.Status != store.StatusFailed {
+		t.Errorf("Status = %v, want StatusFailed", res.Status)
+	}
+	if res.Category != store.ErrConfig {
+		t.Errorf("Category = %v, want ErrConfig (validation bypass prevented)", res.Category)
+	}
+	if len(invalidRS.Rejections) != 0 || len(invalidRS.Verifications) != 0 {
+		t.Errorf("Evaluate mutated RuleSet buckets: Rejections=%d, Verifications=%d",
+			len(invalidRS.Rejections), len(invalidRS.Verifications))
+	}
+}
+
+func buildBenchmark1MBPayload() ([]byte, *http.Response) {
+	snippet := "<div class=\"content\">Gemini isn\u2019t supported &amp; &#8217;available&#8217; in region \u201cXYZ\u201d.\n\t  Lots   of    spaces   and\tnewlines.\n</div>\n"
+	var sb strings.Builder
+	sb.WriteString("<!doctype html><html><head><title>Google Gemini</title></head><body><div id=\"bardchatui\">")
+	for sb.Len() < 1<<20 {
+		sb.WriteString(snippet)
+	}
+	sb.WriteString("</div></body></html>")
+	payload := []byte(sb.String())
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Server": []string{"ESF"},
+		},
+	}
+	return payload, resp
+}
+
 func BenchmarkEvaluate_1MBBody(b *testing.B) {
 	// Build Gemini's full verification rule set shape
 	originProof := ruleengine.AnyOf(
@@ -709,27 +846,90 @@ func BenchmarkEvaluate_1MBBody(b *testing.B) {
 		b.Fatalf("NewRuleSet error: %v", err)
 	}
 
-	// 1MB payload simulating a successful Gemini response
-	bodyBuilder := strings.Builder{}
-	bodyBuilder.Grow(1024 * 1024)
-	bodyBuilder.WriteString("<!DOCTYPE html><html><head><title>Google Gemini</title></head><body>")
-	for bodyBuilder.Len() < 1024*1024-50 {
-		bodyBuilder.WriteString("<div class=\"content\">Google Gemini AI Assistant response stream padding data...</div>\n")
-	}
-	bodyBuilder.WriteString("</body></html>")
-	bodyBytes := []byte(bodyBuilder.String())
-
-	resp := &http.Response{
-		StatusCode: 200,
-		Header: http.Header{
-			"Server": []string{"GSE"},
-		},
-	}
+	bodyBytes, resp := buildBenchmark1MBPayload()
 	ctx := ruleengine.BuildEvaluationContext(resp, bodyBytes, 25*time.Millisecond)
 
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
+		res := ruleengine.Evaluate(ctx, rs)
+		if res.Status != store.StatusPassed {
+			b.Fatalf("expected StatusPassed, got %v (%s)", res.Status, res.Reason)
+		}
+	}
+}
+
+func BenchmarkLegacyGemini_1MBBody(b *testing.B) {
+	bodyBytes, resp := buildBenchmark1MBPayload()
+	blockPhrases := []string{"isn't currently supported in your country"}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		res := gemini.ClassifyResponse(resp, bodyBytes, blockPhrases)
+		if res.Status != store.StatusPassed {
+			b.Fatalf("expected StatusPassed, got %v (%s)", res.Status, res.Reason)
+		}
+	}
+}
+
+func BenchmarkBuildAndEvaluate_1MBBody(b *testing.B) {
+	originProof := ruleengine.AnyOf(
+		ruleengine.NewLeafCondition(ruleengine.HeaderSignal("Server"), ruleengine.MustRegex(`(?i)ESF|GSE|SFFE|GWS`)),
+		ruleengine.NewLeafCondition(ruleengine.CookieDomainSignal(), ruleengine.ContainsAny("google.com", "gemini.google.com")),
+	)
+	titleOrBrand := ruleengine.AnyOf(
+		ruleengine.NewLeafCondition(ruleengine.TitleSignal(), ruleengine.ContainsAny("gemini")),
+		ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny("gemini")),
+	)
+	appMarkers := ruleengine.AllOf(
+		ruleengine.NewLeafCondition(ruleengine.TitleSignal(), ruleengine.ContainsAny("gemini")),
+		ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny("bardchatui", "wiz_global_data", "google gemini")),
+	)
+	geminiPositiveVerification := ruleengine.AnyOf(
+		ruleengine.AllOf(originProof, titleOrBrand),
+		appMarkers,
+	)
+
+	rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+		Name:                     "gemini",
+		Mode:                     ruleengine.ModeStrict,
+		StrictModeFallbackReason: "possible interception / false positive: positive verification signals absent",
+		Rules: []ruleengine.Rule{
+			{
+				Phase:     "rejection",
+				Condition: ruleengine.NewLeafCondition(ruleengine.RawBodySignal(), ruleengine.MustRegex(`"2003":\s*"([A-Z]{2})"`)),
+				Verdict:   ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "restricted country"},
+			},
+			{
+				Phase:     "rejection",
+				Condition: ruleengine.NewLeafCondition(ruleengine.RawBodySignal(), ruleengine.MustRegex(`LOCATION_REJECTED|no_access`)),
+				Verdict:   ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "restriction flag"},
+			},
+			{
+				Phase: "rejection",
+				Condition: ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny(
+					"gemini isn't available", "not available in your country", "supported languages and countries",
+				)),
+				Verdict: ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "region restriction message"},
+			},
+			{
+				Phase:     "verification",
+				Condition: geminiPositiveVerification,
+				Verdict:   ruleengine.Verdict{Status: store.StatusPassed, Category: store.ErrNone, Reason: "ok"},
+			},
+		},
+	})
+	if err != nil {
+		b.Fatalf("NewRuleSet error: %v", err)
+	}
+
+	bodyBytes, resp := buildBenchmark1MBPayload()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		ctx := ruleengine.BuildEvaluationContext(resp, bodyBytes, 25*time.Millisecond)
 		res := ruleengine.Evaluate(ctx, rs)
 		if res.Status != store.StatusPassed {
 			b.Fatalf("expected StatusPassed, got %v (%s)", res.Status, res.Reason)
