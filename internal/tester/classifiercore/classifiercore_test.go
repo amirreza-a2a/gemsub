@@ -298,3 +298,117 @@ func TestClampLatency(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractCanonicalLink(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantHref  string
+		wantFound bool
+	}{
+		{
+			name:      "standard rel then href double quotes",
+			body:      `<html><head><link rel="canonical" href="https://example.com/canonical"></head></html>`,
+			wantHref:  "https://example.com/canonical",
+			wantFound: true,
+		},
+		{
+			name:      "href before rel",
+			body:      `<html><head><link href="https://example.com/canonical" rel="canonical"></head></html>`,
+			wantHref:  "https://example.com/canonical",
+			wantFound: true,
+		},
+		{
+			name:      "single quotes on both attributes",
+			body:      `<link rel='canonical' href='https://example.com/single-quote'>`,
+			wantHref:  "https://example.com/single-quote",
+			wantFound: true,
+		},
+		{
+			name:      "unquoted attributes",
+			body:      `<link rel=canonical href=https://example.com/unquoted>`,
+			wantHref:  "https://example.com/unquoted",
+			wantFound: true,
+		},
+		{
+			name:      "mixed quotes",
+			body:      `<link rel="canonical" href='https://example.com/mixed'>`,
+			wantHref:  "https://example.com/mixed",
+			wantFound: true,
+		},
+		{
+			name:      "whitespace around equals and inside tag",
+			body:      `<link   rel  =  "canonical"   href  =  "https://example.com/whitespace"  >`,
+			wantHref:  "https://example.com/whitespace",
+			wantFound: true,
+		},
+		{
+			name:      "case variations in tag and attribute names with original casing in href",
+			body:      `<LINK REL="CANONICAL" HREF="https://example.com/CaseSensitivePath">`,
+			wantHref:  "https://example.com/CaseSensitivePath",
+			wantFound: true,
+		},
+		{
+			name:      "self-closing tag",
+			body:      `<link rel="canonical" href="https://example.com/self-closing" />`,
+			wantHref:  "https://example.com/self-closing",
+			wantFound: true,
+		},
+		{
+			name: "preceded by other link tags",
+			body: `<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="/favicon.ico">
+<link rel="canonical" href="https://example.com/target">`,
+			wantHref:  "https://example.com/target",
+			wantFound: true,
+		},
+		{
+			name:      "first of multiple canonical links",
+			body:      `<link rel="canonical" href="https://example.com/first"><link rel="canonical" href="https://example.com/second">`,
+			wantHref:  "https://example.com/first",
+			wantFound: true,
+		},
+		{
+			name:      "claude app-unavailable-in-region canonical link",
+			body:      `<link rel="canonical" href="https://claude.ai/app-unavailable-in-region">`,
+			wantHref:  "https://claude.ai/app-unavailable-in-region",
+			wantFound: true,
+		},
+		{
+			name:      "no canonical link",
+			body:      `<html><head><title>No canonical</title></head><body>hello</body></html>`,
+			wantHref:  "",
+			wantFound: false,
+		},
+		{
+			name:      "link tag missing href",
+			body:      `<link rel="canonical">`,
+			wantHref:  "",
+			wantFound: false,
+		},
+		{
+			name:      "link tag with non-canonical rel",
+			body:      `<link rel="alternate" href="https://example.com/alt">`,
+			wantHref:  "",
+			wantFound: false,
+		},
+		{
+			name:      "empty body",
+			body:      "",
+			wantHref:  "",
+			wantFound: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotHref, gotFound := classifiercore.ExtractCanonicalLink([]byte(tc.body))
+			if gotFound != tc.wantFound {
+				t.Fatalf("ExtractCanonicalLink() found = %v, want %v", gotFound, tc.wantFound)
+			}
+			if gotHref != tc.wantHref {
+				t.Errorf("ExtractCanonicalLink() href = %q, want %q", gotHref, tc.wantHref)
+			}
+		})
+	}
+}

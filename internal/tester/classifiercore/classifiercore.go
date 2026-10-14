@@ -7,6 +7,7 @@
 package classifiercore
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -131,4 +132,116 @@ func DetectInterception(normalizedBody string) (store.ErrorCategory, string, boo
 		}
 	}
 	return store.ErrNone, "", false
+}
+
+// ExtractCanonicalLink scans an HTML body for a <link rel="canonical" href="..."> element.
+// It is tolerant of attribute ordering (rel before href or href before rel), single/double
+// quotes, unquoted values, whitespace around =, and case variations.
+// Returns the extracted href value (preserving its original casing) and true if found,
+// or ("", false) if absent.
+func ExtractCanonicalLink(body []byte) (string, bool) {
+	lower := bytes.ToLower(body)
+	start := 0
+	for {
+		idx := bytes.Index(lower[start:], []byte("<link"))
+		if idx == -1 {
+			break
+		}
+		tagStart := start + idx
+		afterLink := tagStart + len("<link")
+		if afterLink < len(lower) && !isHTMLSpace(lower[afterLink]) && lower[afterLink] != '/' && lower[afterLink] != '>' {
+			start = afterLink
+			continue
+		}
+
+		tagEnd := bytes.IndexByte(lower[tagStart:], '>')
+		if tagEnd == -1 {
+			break
+		}
+
+		tagLower := lower[tagStart : tagStart+tagEnd+1]
+		tagOrig := body[tagStart : tagStart+tagEnd+1]
+
+		relVal, relFound := extractTagAttribute(tagLower, tagLower, "rel")
+		if relFound {
+			isCanonical := false
+			for _, part := range strings.Fields(relVal) {
+				if part == "canonical" {
+					isCanonical = true
+					break
+				}
+			}
+			if isCanonical {
+				if hrefVal, hrefFound := extractTagAttribute(tagLower, tagOrig, "href"); hrefFound {
+					return hrefVal, true
+				}
+			}
+		}
+
+		start = tagStart + tagEnd + 1
+	}
+	return "", false
+}
+
+func isHTMLSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f'
+}
+
+func extractTagAttribute(tagLower, tagOrig []byte, attrName string) (string, bool) {
+	needle := []byte(attrName)
+	p := 0
+	for {
+		idx := bytes.Index(tagLower[p:], needle)
+		if idx == -1 {
+			return "", false
+		}
+		pos := p + idx
+		// Check preceding boundary: must be preceded by whitespace (attributes follow tag name or other attributes)
+		if pos > 0 && !isHTMLSpace(tagLower[pos-1]) {
+			p = pos + len(needle)
+			continue
+		}
+
+		after := pos + len(needle)
+		for after < len(tagLower) && isHTMLSpace(tagLower[after]) {
+			after++
+		}
+		if after >= len(tagLower) || tagLower[after] != '=' {
+			p = after
+			continue
+		}
+
+		after++ // skip '='
+		for after < len(tagLower) && isHTMLSpace(tagLower[after]) {
+			after++
+		}
+		if after >= len(tagLower) {
+			return "", false
+		}
+
+		quote := tagLower[after]
+		if quote == '"' || quote == '\'' {
+			valStart := after + 1
+			closingIdx := bytes.IndexByte(tagLower[valStart:], quote)
+			if closingIdx == -1 {
+				return "", false
+			}
+			valEnd := valStart + closingIdx
+			return string(tagOrig[valStart:valEnd]), true
+		}
+
+		// Unquoted attribute value: terminated by whitespace, '>', or '/>'
+		valStart := after
+		valEnd := valStart
+		for valEnd < len(tagLower) && !isHTMLSpace(tagLower[valEnd]) && tagLower[valEnd] != '>' {
+			if tagLower[valEnd] == '/' && valEnd+1 < len(tagLower) && tagLower[valEnd+1] == '>' {
+				break
+			}
+			valEnd++
+		}
+		if valEnd > valStart {
+			return string(tagOrig[valStart:valEnd]), true
+		}
+		return "", false
+	}
 }
