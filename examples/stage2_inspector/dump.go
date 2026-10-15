@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,4 +67,31 @@ func main() {
 	}
 
 	fmt.Printf("Response saved to %s (%d bytes)\n", outputFile, len(body))
+
+	finalURL := ""
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+
+	meta := struct {
+		StatusCode  int    `json:"status_code"`
+		Status      string `json:"status"`
+		FinalURL    string `json:"final_url"`
+		ContentType string `json:"content_type"`
+	}{
+		StatusCode:  resp.StatusCode,
+		Status:      resp.Status,
+		FinalURL:    finalURL,
+		ContentType: contentType,
+	}
+
+	metaBytes, err := json.MarshalIndent(meta, "", "  ")
+	if err == nil {
+		metaFile := "response.meta.json"
+		if err := os.WriteFile(metaFile, append(metaBytes, '\n'), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "Error saving metadata to file: %v\n", err)
+		} else {
+			fmt.Printf("Metadata saved to %s\n", metaFile)
+		}
+	}
 }

@@ -16,6 +16,9 @@
 /test-config.json
 gemini_response.html
 examples/stage2_inspector/response.html
+examples/stage2_inspector/response.meta.json
+examples/stage2_inspector/response.json
+examples/stage2_inspector/response.txt
 
 # GoReleaser build artifacts
 /dist/
