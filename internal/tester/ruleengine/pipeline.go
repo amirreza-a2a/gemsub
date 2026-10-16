@@ -49,16 +49,11 @@ func Evaluate(ctx *EvaluationContext, spec *RuleSet) Result {
 			Reason:     "uninitialized ruleset: must be constructed via NewRuleSet or unmarshaled from valid JSON",
 			Latency:    clampedLatency,
 			Retryable:  false,
-			RetryAfter: ctx.RetryAfter,
 		}
 	}
 
 	// Phase 1: Common HTTP Status Codes
 	if common, ok := classifiercore.ClassifyCommonHTTPStatus(ctx.StatusCode, ctx.Headers); ok {
-		retryAfter := common.RetryAfter
-		if retryAfter == nil && ctx.RetryAfter != nil {
-			retryAfter = ctx.RetryAfter
-		}
 		return Result{
 			Status:     common.Status,
 			Category:   common.Category,
@@ -66,7 +61,7 @@ func Evaluate(ctx *EvaluationContext, spec *RuleSet) Result {
 			Reason:     common.Reason,
 			Latency:    clampedLatency,
 			Retryable:  common.Retryable,
-			RetryAfter: retryAfter,
+			RetryAfter: common.RetryAfter,
 		}
 	}
 
@@ -90,7 +85,6 @@ func Evaluate(ctx *EvaluationContext, spec *RuleSet) Result {
 			Reason:     fmt.Sprintf("unexpected HTTP status %d", ctx.StatusCode),
 			Latency:    clampedLatency,
 			Retryable:  false,
-			RetryAfter: ctx.RetryAfter,
 		}
 	}
 
@@ -103,7 +97,6 @@ func Evaluate(ctx *EvaluationContext, spec *RuleSet) Result {
 			Reason:     reason,
 			Latency:    clampedLatency,
 			Retryable:  false,
-			RetryAfter: ctx.RetryAfter,
 		}
 	}
 
@@ -116,7 +109,6 @@ func Evaluate(ctx *EvaluationContext, spec *RuleSet) Result {
 				Reason:     rule.Verdict.Reason,
 				Latency:    clampedLatency,
 				Retryable:  false,
-				RetryAfter: ctx.RetryAfter,
 			}
 		}
 	}
@@ -131,7 +123,6 @@ func Evaluate(ctx *EvaluationContext, spec *RuleSet) Result {
 				Reason:     rule.Verdict.Reason,
 				Latency:    clampedLatency,
 				Retryable:  false,
-				RetryAfter: ctx.RetryAfter,
 			}
 		}
 	}
@@ -150,7 +141,6 @@ func Evaluate(ctx *EvaluationContext, spec *RuleSet) Result {
 				Reason:     reason,
 				Latency:    clampedLatency,
 				Retryable:  false,
-				RetryAfter: ctx.RetryAfter,
 			}
 		}
 	}
@@ -163,7 +153,6 @@ func Evaluate(ctx *EvaluationContext, spec *RuleSet) Result {
 			Reason:     "ok",
 			Latency:    clampedLatency,
 			Retryable:  false,
-			RetryAfter: ctx.RetryAfter,
 		}
 	}
 
@@ -175,6 +164,5 @@ func Evaluate(ctx *EvaluationContext, spec *RuleSet) Result {
 		Reason:     spec.EffectiveStrictFallbackReason(),
 		Latency:    clampedLatency,
 		Retryable:  false,
-		RetryAfter: ctx.RetryAfter,
 	}
 }

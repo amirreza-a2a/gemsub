@@ -27,17 +27,15 @@ type EvaluationContext struct {
 	NormalizedBody     string
 	CanonicalLink      string
 	CanonicalLinkFound bool
-	RetryAfter         *time.Duration
 	MeasuredLatency    time.Duration
 }
 
 // BuildEvaluationContext constructs an immutable EvaluationContext from an HTTP response,
 // payload body, and measured latency.
 //
-// Normalization of the body, extraction of the HTML title, extraction of the canonical link,
-// and parsing of Retry-After headers are performed exactly once during construction,
-// ensuring the pipeline executes zero re-normalization during rule evaluation.
-// Payloads exceeding classifiercore.MaxInspectBytes (1MB) are capped.
+// Normalization of the body, extraction of the HTML title, and extraction of the canonical link
+// are performed exactly once during construction, ensuring the pipeline executes zero
+// re-normalization during rule evaluation. Payloads exceeding classifiercore.MaxInspectBytes (1MB) are capped.
 func BuildEvaluationContext(resp *http.Response, body []byte, measuredLatency time.Duration) *EvaluationContext {
 	if len(body) > classifiercore.MaxInspectBytes {
 		body = body[:classifiercore.MaxInspectBytes]
@@ -58,9 +56,6 @@ func BuildEvaluationContext(resp *http.Response, body []byte, measuredLatency ti
 		ctx.Cookies = resp.Cookies()
 		if resp.Request != nil {
 			ctx.FinalURL = resp.Request.URL
-		}
-		if resp.Header != nil {
-			ctx.RetryAfter = textutil.ParseRetryAfter(resp.Header.Get("Retry-After"))
 		}
 	}
 

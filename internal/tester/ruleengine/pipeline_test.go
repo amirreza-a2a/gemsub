@@ -53,9 +53,6 @@ func TestBuildEvaluationContext(t *testing.T) {
 	if !ctx.CanonicalLinkFound || ctx.CanonicalLink != "https://example.com/canonical" {
 		t.Errorf("CanonicalLink = %q (found %v), want 'https://example.com/canonical'", ctx.CanonicalLink, ctx.CanonicalLinkFound)
 	}
-	if ctx.RetryAfter == nil || *ctx.RetryAfter != 60*time.Second {
-		t.Errorf("RetryAfter = %v, want 60s", ctx.RetryAfter)
-	}
 	if ctx.MeasuredLatency != 15*time.Millisecond {
 		t.Errorf("MeasuredLatency = %v, want 15ms", ctx.MeasuredLatency)
 	}
@@ -373,6 +370,7 @@ func TestEvaluate_Phase1_CommonHTTPStatus(t *testing.T) {
 	}{
 		{
 			code:       403,
+			header:     http.Header{"Retry-After": []string{"120"}},
 			wantStatus: store.StatusFailed,
 			wantCat:    store.ErrTargetDenied,
 			wantRetry:  false,
@@ -387,12 +385,14 @@ func TestEvaluate_Phase1_CommonHTTPStatus(t *testing.T) {
 		},
 		{
 			code:       503,
+			header:     http.Header{"Retry-After": []string{"120"}},
 			wantStatus: store.StatusInconclusive,
 			wantCat:    store.ErrTargetError,
 			wantRetry:  true,
 		},
 		{
 			code:       500,
+			header:     http.Header{"Retry-After": []string{"120"}},
 			wantStatus: store.StatusInconclusive,
 			wantCat:    store.ErrTargetError,
 			wantRetry:  false,
@@ -436,6 +436,8 @@ func TestEvaluate_Phase1_CommonHTTPStatus(t *testing.T) {
 				if res.RetryAfter == nil || *res.RetryAfter != *tc.wantRetryDur {
 					t.Errorf("RetryAfter = %v, want %v", res.RetryAfter, *tc.wantRetryDur)
 				}
+			} else if res.RetryAfter != nil {
+				t.Errorf("RetryAfter = %v, want nil", res.RetryAfter)
 			}
 			if res.Latency <= 0 {
 				t.Errorf("Latency = %v, want > 0", res.Latency)
@@ -771,6 +773,248 @@ func TestEvaluate_LiteralRuleSetWithInvalidRule_CannotBypassValidation(t *testin
 		t.Errorf("Evaluate mutated RuleSet buckets: Rejections=%d, Verifications=%d",
 			len(invalidRS.Rejections), len(invalidRS.Verifications))
 	}
+}
+
+func TestEvaluate_RetryAfterScoping(t *testing.T) {
+	retry120 := http.Header{"Retry-After": []string{"120"}}
+
+	t.Run("429 Too Many Requests carries RetryAfter", func(t *testing.T) {
+		rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+			Name: "test-429",
+			Mode: ruleengine.ModePermissive,
+		})
+		if err != nil {
+			t.Fatalf("NewRuleSet error: %v", err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     retry120,
+		}
+		ctx := ruleengine.BuildEvaluationContext(resp, []byte("rate limited"), 10*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, rs)
+
+		if res.Status != store.StatusInconclusive {
+			t.Errorf("Status = %v, want StatusInconclusive", res.Status)
+		}
+		if res.Category != store.ErrTargetRateLimited {
+			t.Errorf("Category = %v, want ErrTargetRateLimited", res.Category)
+		}
+		if res.StatusCode != http.StatusTooManyRequests {
+			t.Errorf("StatusCode = %d, want 429", res.StatusCode)
+		}
+		if !res.Retryable {
+			t.Errorf("Retryable = false, want true")
+		}
+		if res.RetryAfter == nil || *res.RetryAfter != 120*time.Second {
+			t.Errorf("RetryAfter = %v, want 120s", res.RetryAfter)
+		}
+	})
+
+	t.Run("403 Forbidden with Retry-After header yields nil RetryAfter", func(t *testing.T) {
+		rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+			Name: "test-403",
+			Mode: ruleengine.ModePermissive,
+		})
+		if err != nil {
+			t.Fatalf("NewRuleSet error: %v", err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusForbidden,
+			Header:     retry120,
+		}
+		ctx := ruleengine.BuildEvaluationContext(resp, []byte("forbidden"), 10*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, rs)
+
+		if res.Category != store.ErrTargetDenied {
+			t.Errorf("Category = %v, want ErrTargetDenied", res.Category)
+		}
+		if res.RetryAfter != nil {
+			t.Errorf("RetryAfter = %v, want nil", res.RetryAfter)
+		}
+	})
+
+	t.Run("500 Internal Server Error with Retry-After header yields nil RetryAfter", func(t *testing.T) {
+		rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+			Name: "test-500",
+			Mode: ruleengine.ModePermissive,
+		})
+		if err != nil {
+			t.Fatalf("NewRuleSet error: %v", err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Header:     retry120,
+		}
+		ctx := ruleengine.BuildEvaluationContext(resp, []byte("server error"), 10*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, rs)
+
+		if res.Category != store.ErrTargetError {
+			t.Errorf("Category = %v, want ErrTargetError", res.Category)
+		}
+		if res.RetryAfter != nil {
+			t.Errorf("RetryAfter = %v, want nil", res.RetryAfter)
+		}
+	})
+
+	t.Run("503 Service Unavailable with Retry-After header yields nil RetryAfter", func(t *testing.T) {
+		rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+			Name: "test-503",
+			Mode: ruleengine.ModePermissive,
+		})
+		if err != nil {
+			t.Fatalf("NewRuleSet error: %v", err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     retry120,
+		}
+		ctx := ruleengine.BuildEvaluationContext(resp, []byte("service unavailable"), 10*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, rs)
+
+		if res.Category != store.ErrTargetError {
+			t.Errorf("Category = %v, want ErrTargetError", res.Category)
+		}
+		if res.RetryAfter != nil {
+			t.Errorf("RetryAfter = %v, want nil", res.RetryAfter)
+		}
+	})
+
+	t.Run("200 OK with Retry-After header yields nil RetryAfter", func(t *testing.T) {
+		rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+			Name: "test-200",
+			Mode: ruleengine.ModePermissive,
+		})
+		if err != nil {
+			t.Fatalf("NewRuleSet error: %v", err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     retry120,
+		}
+		ctx := ruleengine.BuildEvaluationContext(resp, []byte("clean 200 response"), 10*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, rs)
+
+		if res.Status != store.StatusPassed {
+			t.Errorf("Status = %v, want StatusPassed", res.Status)
+		}
+		if res.RetryAfter != nil {
+			t.Errorf("RetryAfter = %v, want nil", res.RetryAfter)
+		}
+	})
+
+	t.Run("Unexpected status with Retry-After header yields nil RetryAfter", func(t *testing.T) {
+		rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+			Name: "test-unexpected",
+			Mode: ruleengine.ModePermissive,
+		})
+		if err != nil {
+			t.Fatalf("NewRuleSet error: %v", err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusNotFound, // 404
+			Header:     retry120,
+		}
+		ctx := ruleengine.BuildEvaluationContext(resp, []byte("not found"), 10*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, rs)
+
+		if res.Category != store.ErrTargetOther {
+			t.Errorf("Category = %v, want ErrTargetOther", res.Category)
+		}
+		if res.RetryAfter != nil {
+			t.Errorf("RetryAfter = %v, want nil", res.RetryAfter)
+		}
+	})
+
+	t.Run("Custom rejection with Retry-After header yields nil RetryAfter", func(t *testing.T) {
+		rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+			Name: "test-rejection",
+			Mode: ruleengine.ModePermissive,
+			Rules: []ruleengine.Rule{
+				{
+					Condition: ruleengine.NewLeafCondition(ruleengine.NormalizedBodySignal(), ruleengine.ContainsAny("blocked")),
+					Verdict:   ruleengine.Verdict{Status: store.StatusFailed, Category: store.ErrRegionBlocked, Reason: "blocked"},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewRuleSet error: %v", err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     retry120,
+		}
+		ctx := ruleengine.BuildEvaluationContext(resp, []byte("blocked account"), 10*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, rs)
+
+		if res.Category != store.ErrRegionBlocked {
+			t.Errorf("Category = %v, want ErrRegionBlocked", res.Category)
+		}
+		if res.RetryAfter != nil {
+			t.Errorf("RetryAfter = %v, want nil", res.RetryAfter)
+		}
+	})
+
+	t.Run("Interception preemption with Retry-After header yields nil RetryAfter", func(t *testing.T) {
+		rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+			Name: "test-interception",
+			Mode: ruleengine.ModePermissive,
+		})
+		if err != nil {
+			t.Fatalf("NewRuleSet error: %v", err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     retry120,
+		}
+		ctx := ruleengine.BuildEvaluationContext(resp, []byte("cf-chl-bypass challenge"), 10*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, rs)
+
+		if res.Category != store.ErrTargetOther {
+			t.Errorf("Category = %v, want ErrTargetOther", res.Category)
+		}
+		if res.RetryAfter != nil {
+			t.Errorf("RetryAfter = %v, want nil", res.RetryAfter)
+		}
+	})
+
+	t.Run("Strict mode fallback with Retry-After header yields nil RetryAfter", func(t *testing.T) {
+		rs, err := ruleengine.NewRuleSet(ruleengine.RuleSetConfig{
+			Name: "test-strict",
+			Mode: ruleengine.ModeStrict,
+		})
+		if err != nil {
+			t.Fatalf("NewRuleSet error: %v", err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     retry120,
+		}
+		ctx := ruleengine.BuildEvaluationContext(resp, []byte("unverified response"), 10*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, rs)
+
+		if res.Category != store.ErrTargetOther {
+			t.Errorf("Category = %v, want ErrTargetOther", res.Category)
+		}
+		if res.RetryAfter != nil {
+			t.Errorf("RetryAfter = %v, want nil", res.RetryAfter)
+		}
+	})
+
+	t.Run("Uninitialized RuleSet with Retry-After header yields nil RetryAfter", func(t *testing.T) {
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     retry120,
+		}
+		ctx := ruleengine.BuildEvaluationContext(resp, []byte("body"), 10*time.Millisecond)
+		res := ruleengine.Evaluate(ctx, &ruleengine.RuleSet{})
+
+		if res.Category != store.ErrConfig {
+			t.Errorf("Category = %v, want ErrConfig", res.Category)
+		}
+		if res.RetryAfter != nil {
+			t.Errorf("RetryAfter = %v, want nil", res.RetryAfter)
+		}
+	})
 }
 
 func makeBenchmarkGeminiRuleSet(blockPhrases []string) *ruleengine.RuleSet {
