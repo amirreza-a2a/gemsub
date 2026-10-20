@@ -178,10 +178,10 @@ Phase 4 formalizes the complete infrastructure required for user-defined Stage 2
    - Generalizes `executeAttempt` to fan out across a slice of `ServiceProbe` implementations (`geminiProbe`, `claudeProbe`, and `ruleEngineProbe`).
    - Decouples `failedServicesResult` to accept `serviceNames []string`.
    - Enforces a dedicated `tier2Sem` concurrency semaphore of **40** applying *strictly to Tier 2 probes*. Tier 1 probes (Gemini and Claude) are never queued behind the semaphore.
-   - Enforces an explicit `tier2Budget` (default: **3s**, range: 1s..10s) derived from the cycle's parent `ctx` (never `context.Background()`), guaranteeing shutdown/cancel propagation.
+   - Enforces an explicit `tier2Budget` (default: **5s**, range: 1s..10s) derived from the cycle's parent `ctx` (never `context.Background()`), guaranteeing shutdown/cancel propagation. Config validation requires that each service timeout satisfies `timeout <= tier2Budget`.
    - Permit acquisition timeout is bounded (e.g. 1s). If permits are exhausted, Tier 2 aborts and is omitted from `Result.Services` ("not measured"), leaving store hysteresis completely untouched.
    - Peak transient in-flight memory is estimated at **~22 MB** (down from 856 MB), to be confirmed by benchmark in Ticket 2.
-   - Top-level `Result.Status`, `Category`, `Score`, and attempt retries remain strictly Gemini-derived throughout Phase 4. Candidate attempt duration is bounded by $\min(\text{Tier1Latency} + \text{tier2Budget}, \text{cfg.Timeout} + \text{tier2Budget})$.
+   - Top-level `Result.Status`, `Category`, `Score`, and attempt retries remain strictly Gemini-derived throughout Phase 4. Because Tier 1 and Tier 2 execute concurrently in parallel goroutines within the attempt, candidate attempt duration is bounded by $\max(\text{Tier1Latency}, \text{tier2Budget})$ (subject to the outer attempt `cfg.Timeout`).
 
 3. **Transport-Only Store Ingestion & Delivery for `skip_stage2`**:
    - When `skip_stage2: true`, `Store` executes a transport-only ingestion path updating transport evidence and real status codes without pushing samples to `rec.History`. `Store.Passing()` returns empty; `/gemini` and `/claude` return 503.
