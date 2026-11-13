@@ -182,24 +182,27 @@ Phase 4 formalizes the complete infrastructure required for user-defined Stage 2
    - Permit acquisition timeout is bounded (e.g. 1s). If permits are exhausted, Tier 2 aborts and is omitted from `Result.Services` ("not measured"), leaving store hysteresis completely untouched.
    - Peak transient in-flight memory is estimated at **~22 MB** (down from 856 MB), to be confirmed by benchmark in Ticket 2.
    - Top-level `Result.Status`, `Category`, `Score`, and attempt retries remain strictly Gemini-derived throughout Phase 4. Because Tier 1 and Tier 2 execute concurrently in parallel goroutines within the attempt, candidate attempt duration is bounded by $\max(\text{Tier1Latency}, \text{tier2Budget})$ (subject to the outer attempt `cfg.Timeout`).
+   - *Alternative evaluated*: A second-Box pass where Tier 1 finishes on Box 1 and only if Gemini passes does Box 2 spin up (~3.6ms) for Tier 2 probes. This would yield 0ms Tier 1 duration impact but requires duplicate Box allocations per passing candidate; parallel execution under `tier2Budget` with parent cancellation was chosen for efficiency and simpler attempt lifecycle.
 
 3. **Transport-Only Store Ingestion & Delivery for `skip_stage2`**:
-   - When `skip_stage2: true`, `Store` executes a transport-only ingestion path updating transport evidence and real status codes without pushing samples to `rec.History`. `Store.Passing()` returns empty; `/gemini` and `/claude` return 503.
+   - When `skip_stage2: true`, `Store` executes `PutTransportOnly(r Result)` updating transport evidence, real HTTP status codes, and `TransportObservations` without pushing samples to `rec.History`. `Store.Passing()` returns empty; `/gemini` and `/claude` return 503.
    - Subserver base route (`/` or `/sub`) automatically serves `"generic"` (`Store.NetworkPassing()`) under `skip_stage2`, preventing client disruption.
-   - `meta.json` records `"stage2_skipped": true` and per-projection `generated_at` timestamps to make staleness machine-readable.
+   - `meta.json` records `"stage2_skipped": true` and per-projection last-changed timestamps to make staleness machine-readable.
    - `config.Validate()` rejects `services.gemini.enabled = false` while Stage 2 is active.
 
 4. **One-Way Config Hydration, Cloning, and Safety Limits (`internal/config`)**:
-   - Service names enforce `^[a-z0-9][a-z0-9-]{0,31}$` and reject reserved names, including Windows device names (`con`, `prn`, `aux`, `nul`, `com1`–`com9`, `lpt1`–`lpt9`) and internal routes (`generic`, `gemini`, `claude`, `healthz`, `sub`, `metrics`, `api`, `all`, `vless`, `vmess`, `trojan`, `meta`, `git`).
-   - Strict mode requires at least one verification rule; fails fast otherwise.
-   - Hydration resolves into `Test.ResolvedServices` (`json:"-"`). Legacy fields are not written back to JSON.
+   - Service names enforce `^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$` (max 32 chars). `"gemini"` and `"claude"` are the only allowed built-in keys; custom service names cannot match system routes (`generic`, `healthz`, `sub`, `metrics`, `api`, `all`, `vless`, `vmess`, `trojan`, `meta`, `git`, `.git`) or Windows device names (`con`, `prn`, `aux`, `nul`, `com1`–`com9`, `lpt1`–`lpt9`).
+   - Built-in services accept only `enabled`, `url`, `timeout`, `dial_timeout`, and `max_body_bytes`; other fields are rejected with an explicit error until Phase 3/5.
+   - Strict mode requires at least one verification rule after partitioning; fails fast otherwise.
+   - Hydration resolves into `Test.ResolvedServices` (`json:"-"`), including `BlockPhrases` for Gemini. Legacy fields are not written back to JSON.
    - `TestConfig.Clone()` deep-copies raw mutable maps (`Services`, `ResolvedServices`, `AcceptedStatusCodes`, `Headers`, `Rules`), while compiled regex and rule trees remain immutable shared instances.
    - Resource limits: Maximum of 8 user-defined services, 1MB max body cap, and timeouts bounded between 1s and 30s.
 
 5. **Dynamic Delivery, Readiness Gating, and Pruning Safety (`publisher` & `subserver`)**:
    - **Readiness Invariant**: A service is not ready until `loadedFromSnapshot || completedCyclesThisRun >= 1`.
    - **Publisher**: Emits `<service>/*.txt` and tracks created directories in `meta.json` `"managed_services"`. Skips publishing any service where `ready == false`, never committing empty lists due to cold start.
-   - **Safe Pruning**: By default (`prune_removed_services: false`), removed service directories are left untouched on disk and marked deprecated in `meta.json`. When pruning is enabled, removal requires 5 consecutive absent cycles (tracked strictly in local store state, never creating intermediate churn commits in `meta.json`) before deleting files with explicit path checking.
+   - **Byte-Identical Output Rule**: Existing setups (no custom services, `skip_stage2: false`) produce byte-identical subscription files AND `meta.json` (new keys are `omitempty` and omitted; no per-cycle timestamps).
+   - **Safe Pruning**: Configured via `publishing.prune_removed_services` (default `false`) and `publishing.prune_grace_cycles` (default `5`, valid `1..100`). By default, removed service directories are left untouched on disk and marked deprecated in `meta.json`. When pruning is enabled, removal requires 5 consecutive absent cycles (tracked strictly in local store state, never creating intermediate churn commits in `meta.json`) before deleting files with explicit path checking.
    - **Subserver**: Dynamically routes `<base>/<service>` and `?projection=<service>`. Returns `HTTP 503 Service Unavailable` with `Retry-After: 30` during cold start, and `HTTP 404` for decommissioned services.
 
 6. **Tier 1 Migration Note (Phase 3 & Phase 5 Fetcher Wiring)**:

@@ -61,3 +61,23 @@ _Avoid_: view, subscription list, output
 **BoundedHistory**:
 A fixed-capacity circular buffer of `ProbeSample` entries per candidate, providing strict O(1) memory per candidate regardless of system uptime. The history is authoritative for reliability scoring and pass/fail derivation.
 _Avoid_: history ring, sample buffer, probe log
+
+**Probation**:
+A transient qualification phase for a Tier 2 candidate before it is deemed established. While in probation, the low 7 bits of `Hysteresis` count consecutive passing cycles. The candidate is not servable until the pass streak reaches `MinObservationsForServing` (default 1). Any failure or inconclusive outcome during probation resets the streak to zero.
+_Avoid_: trial period, warm-up, ramp-up
+
+**Established**:
+The operational state of a Tier 2 candidate that has successfully passed probation by completing `MinObservationsForServing` consecutive passing observations (indicated by the MSB bit 7 of `Hysteresis` being set). Once established, the candidate is eligible for servability, and the low 7 bits switch from counting passes to counting consecutive failures.
+_Avoid_: verified candidate, permanent, promoted
+
+**Not measured**:
+A Stage 2 probe outcome where a specific target service was not tested or was aborted due to local engine constraints (such as semaphore permit acquisition timeout or attempt context cancellation), represented by omitting the service entry from `Result.Services`. The Store treats omitted services as a strict no-op, leaving existing candidate records and hysteresis counters completely untouched.
+_Avoid_: skipped, unmeasured, ignored
+
+**Transport-only ingestion**:
+Ingestion of a Stage 1 probe result into the Store without application-level service probing (e.g. when `test.skip_stage2` is enabled). Updates candidate presence, transport evidence, real HTTP status code, and `TransportObservations`, but pushes no sample to `BoundedHistory`, computes no reliability score, and does not set `HasPassed`.
+_Avoid_: network-only put, raw ingestion, bypass put
+
+**Readiness**:
+A per-service operational latch (`Store.ServiceReady(name)`) indicating whether the service has completed at least one full cycle during the current process run or was loaded from a snapshot containing valid data for that service. Unready services are protected from premature delivery: the Publisher leaves their subscription files untouched (never committing empty lists), and the Subserver responds with HTTP 503.
+_Avoid_: availability, warm state, service health

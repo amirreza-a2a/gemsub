@@ -101,3 +101,18 @@ This continues the existing hydration pattern already established in
   Each `match` block defines exactly one operator key: `equals`, `contains_any`,
   `regex`, `regex_extract_in`, or `in_range`. Zero, multiple, or unknown operator
   keys are strictly rejected.
+- *Amendment (Phase 4 Config Validation, Raw/Resolved Separation, and Pruning Schema)*:
+  1. **Raw vs. Resolved Separation**: `ServiceConfig` stores raw, serializable configuration
+     using `Rules []json.RawMessage` to preserve exact user JSON across `Save()` cycles.
+     Validation compiles rules into `ResolvedService` containing typed durations, `http.Header`,
+     and `*ruleengine.RuleSet`, stored in `TestConfig.ResolvedServices` (`json:"-"`).
+  2. **Scoping**: Built-ins (`gemini`, `claude`) accept only `enabled`, `url`, `timeout`,
+     `dial_timeout`, and `max_body_bytes` (1MB default); other fields are rejected. Custom
+     services (max 8) enforce `timeout <= tier2_budget` (default 5s), default 256KB body cap,
+     and require at least one verification rule after partitioning when `mode: "strict"`.
+  3. **Name Validation**: Custom service names must match `^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$`
+     and cannot match system routes or Windows device names (`con`, `prn`, `aux`, `nul`, `com1-9`, `lpt1-9`).
+  4. **Strict Decoding**: Unknown fields in `test.services` are rejected via `DisallowUnknownFields()`.
+  5. **Pruning Configuration**: `publishing.prune_removed_services` (bool, default `false`)
+     and `publishing.prune_grace_cycles` (int, default `5`, range `1..100`) control directory pruning
+     of decommissioned services.

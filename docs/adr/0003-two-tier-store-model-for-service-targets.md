@@ -77,24 +77,40 @@ The two-tier model preserves the memory invariant:
   benchmarks from issue #35's analysis (commit `690509b`) and verify
   that the memory cost is acceptable at the target candidate scale.
 
-### Amendment (Phase 4 - Bounded Hysteresis, Complete Deduplication, and Fast Persistence)
+### Amendment (Phase 4 - Bounded Hysteresis with Probation, Complete Deduplication, and Fast Persistence)
 
-The live-only model for Tier 2 services is refined to support single-cycle flap dampening, memory efficiency, and crash recovery without violating the O(1) per-candidate storage invariant:
+The live-only model for Tier 2 services is refined to support single-cycle flap dampening, cold-start probation, transport observation tracking, and crash recovery without violating the O(1) per-candidate storage invariant:
 
-1. **Store-Owned Bit-Packed Flap Hysteresis**:
-   - `store.TargetResult` incorporates an inline `Hysteresis uint8` field (0 heap allocation overhead):
-     - **Bit 7 (MSB, `0x80`)**: `hadPassed` flag (records whether the candidate has passed at least once).
-     - **Bits 0–6 (`0x7F`)**: `consecutiveFailures` counter (0–127).
-   - Servability rule: `AbsentCycles == 0 && (res.Status == StatusPassed || (res.HadPassed() && res.Failures() <= tolerance))` with `tolerance = 1`.
-   - All hysteresis state transitions execute in `Store.PutWithTransition`. Definitive policy categories (`ErrRegionBlocked`, `ErrTargetDenied`) bypass hysteresis and evict the candidate immediately (`failures = 127`). Inconclusive outcomes count as failures subject to the 1-cycle tolerance.
+1. **Store-Owned Bit-Packed Flap Hysteresis with Probation**:
+   - `store.TargetResult` incorporates an inline `Hysteresis uint8` field (`json:"-"`, 0 heap allocation overhead):
+     - **Probation Phase (Bit 7 == 0)**: While unestablished, Bits 0–6 count consecutive passing cycles. The candidate becomes established when this pass streak reaches `cfg.MinObservationsForServing` (default 1). Any failure or inconclusive outcome during probation resets the streak to 0.
+     - **Established Phase (Bit 7 == 1)**: Once established, Bit 7 remains set, and Bits 0–6 switch to counting consecutive failure cycles (0–127, saturating at 127).
+   - Servability rule for Tier 2 services in `servabilityGateLockedFor`:
+     `AbsentCycles == 0 && established && (res.Status == StatusPassed || failures <= tolerance)` with `tolerance = 1`.
+   - Transitions execute strictly in `Store.PutWithTransition` under the store lock using the candidate's prior entry.
+   - Definitive policy categories (`ErrRegionBlocked`, `ErrTargetDenied`) reset `Hysteresis = 0` (unestablished, streak 0), evicting the candidate immediately in Cycle 1. Inconclusive outcomes count as failures subject to the 1-cycle tolerance.
    - Stage 1 transport failures write failure records into each service's `TargetResult`, subjecting transport blips to the same 1-cycle tolerance without checking a separate `TransportOK` gate.
-   - **Local Congestion ("Not Measured") Contract**: When a service probe is omitted from `Result.Services` (e.g. aborted due to local semaphore congestion), `Store.PutWithTransition` treats it as a strict no-op: the candidate's existing entry and hysteresis counter remain untouched.
+   - **Local Congestion ("Not Measured") Contract**: When a service probe is omitted from `Result.Services` (e.g. aborted due to local semaphore congestion or attempt cancellation), `Store.PutWithTransition` treats it as a strict no-op: the candidate's existing entry and hysteresis counter remain untouched.
 
-2. **Complete In-Memory Deduplication by Deletion**:
-   - `rec.Latest.Services` is removed from stored records across all store methods (`PutWithTransition`, `Load`, and `Clone`), routing all service lookups through `rec.Services`. `Result.Services` remains strictly transient transport data between the tester and store. This eliminates map aliasing in `Clone()` and reclaims **41.18 MB (45.46%)** of heap allocations across 56,799 candidates.
+2. **TransportObservations for Transport-Only Servability**:
+   - `CandidateRecord.TransportObservations uint8` (saturating at 255) is added to record cumulative transport observations. Incremented on every ingestion carrying transport evidence (both `PutWithTransition` and `PutTransportOnly`), initialized from `History.Count` when loading legacy snapshots, and persisted additively.
+   - `networkHealthyStateLocked` Gate 3 evaluates `rec.TransportObservations >= cfg.MinObservationsForServing` instead of `rec.History.Count`, allowing transport-only (`test.skip_stage2`) candidates to enter `Store.NetworkPassing()` while `Store.Passing()` remains strictly empty.
 
-3. **Fast Snapshot Persistence & Pruning**:
-   - `writeSnapshotJSON` serializes dynamic Tier 2 entries under an optional `"tier2"` record key (`"tier2":{"svc":{"s":"passed","h":128}}`).
-   - `fastDecodeSnapshot` parses `"tier2"` directly. Implementation is gated on `Load Duration <= 1.25x Baseline` in the same test run, avoiding `json.Unmarshal` fallback.
-   - Decommissioned services are pruned via a decoupled `activeServices []string` Store API without importing `internal/config`.
-   - Pruning grace counters (`servicePruneAbsence map[string]int`) are tracked strictly in local state (e.g. Store snapshot), preventing intermediate churn commits in the published repository.
+3. **Tier Routing in Servability and Projections**:
+   - `servabilityGateLockedFor`, `PassingFor`, and `PassingForRanked` route strictly by tier:
+     - Built-in Tier 1 services (`gemini`, `claude`) preserve existing scoring, history gates, and ranking byte-for-byte.
+     - Registered Tier 2 services evaluate Gate 1 (source presence) plus the Tier 2 probation/hysteresis gate.
+     - Unregistered service names return empty projections and fail servability immediately.
+     - `PassingForRanked` for Tier 2 services returns deterministic alphabetical links matching `PassingFor` (no historical scoring).
+
+4. **Service Readiness Latch (`ServiceReady`)**:
+   - `Store.ServiceReady(name) bool` reports true if the service was loaded from a snapshot containing valid data for that service OR if at least one full cycle (`FinishCycle`) completed during the current process run. Tier 1 readiness behavior is preserved.
+
+5. **Complete In-Memory Deduplication by Deletion**:
+   - `rec.Latest.Services` is permanently removed from stored candidate records across all store methods (`PutWithTransition`, `Load`, V1 migration, and `Clone`), routing all service lookups through `rec.Services`. `Result.Services` remains strictly transient transport data between the tester and store. This eliminates map aliasing in `Clone()` and reclaims **41.18 MB (45.46%)** of heap allocations across 56,799 candidates.
+
+6. **Fast Snapshot Persistence & Local Pruning Grace Tracking**:
+   - `writeSnapshotJSON` serializes dynamic Tier 2 entries under an optional `"tier2"` record key (`"tier2":{"svc":{"s":"passed","h":128}}`) using `appendJSONString`.
+   - `fastDecodeSnapshot` parses `"tier2"` directly with `ok == true` (avoiding `json.Unmarshal` fallback).
+   - Decommissioned services are pruned via a decoupled `SetActiveServices([]string)` Store API without importing `internal/config`.
+   - Local absence counters (`serviceAbsentCycles map[string]int`) are tracked strictly in local store state (`Snapshot`), avoiding intermediate churn commits in the published Git repository.
